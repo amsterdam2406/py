@@ -27,27 +27,91 @@ function createSignupModal() {
       <span class="close">&times;</span>
       <h2>Create Employee Account</h2>
       <form id="signup-form">
-        <input type="text" id="full_name" placeholder="Full Name" required>
-        <input type="email" id="email" placeholder="Email" required>
-        <input type="text" id="location" placeholder="Location" required>
-        <select id="role" required>
-          <option value="">Select Role</option>
-          <option value="staff">Staff</option>
-          <option value="guard">Guard</option>
-        </select>
-        <input type="number" id="salary" placeholder="Salary">
-        <input type="text" id="phone" placeholder="Phone">
-        <input type="text" id="bank_name" placeholder="Bank Name">
-        <input type="text" id="account_number" placeholder="Account Number">
-        <input type="text" id="account_holder" placeholder="Account Holder">
-        <input type="text" id="username" placeholder="Username" required>
-        <input type="password" id="password" placeholder="Password" required>
-        <button type="submit">Create Account</button>
+        <div class="form-row">
+          <div class="form-group">
+            <label>Full Name</label>
+            <input type="text" id="full_name" placeholder="Enter full name" required>
+          </div>
+          <div class="form-group">
+            <label>Email Address</label>
+            <input type="email" id="email" placeholder="employee@company.com" required>
+          </div>
+        </div>
+        <div class="form-row">
+          <div class="form-group">
+            <label>Department/Location</label>
+            <input type="text" id="location" placeholder="e.g., Main Gate, Lagos Branch" required>
+          </div>
+          <div class="form-group">
+            <label>Employee Type</label>
+            <select id="role" required>
+              <option value="">Select Role</option>
+              <option value="staff">Staff (Admin/Office)</option>
+              <option value="guard">Security Guard</option>
+            </select>
+          </div>
+        </div>
+        <div class="form-row">
+          <div class="form-group">
+            <label>Monthly Salary (₦)</label>
+            <input type="number" id="salary" placeholder="50000" min="0" step="1000">
+          </div>
+          <div class="form-group">
+            <label>Phone Number</label>
+            <input type="tel" id="phone" placeholder="08012345678">
+          </div>
+        </div>
+        <h3>Bank Account Details</h3>
+        <div class="form-row">
+          <div class="form-group">
+            <label>Bank Name</label>
+            <select id="bank_name">
+              <option value="">Select Bank</option>
+              <option value="Access Bank">Access Bank</option>
+              <option value="GTBank">GTBank</option>
+              <option value="First Bank">First Bank</option>
+              <option value="UBA">UBA</option>
+              <option value="Zenith Bank">Zenith Bank</option>
+            </select>
+          </div>
+          <div class="form-group">
+            <label>Account Number</label>
+            <input type="text" id="account_number" placeholder="1234567890" maxlength="10">
+          </div>
+        </div>
+        <div class="form-group">
+          <label>Account Name</label>
+          <input type="text" id="account_holder" placeholder="Auto-filled after verification" readonly>
+        </div>
+        <div class="form-row">
+          <div class="form-group">
+            <label>Username</label>
+            <input type="text" id="username" placeholder="Choose username" required>
+          </div>
+          <div class="form-group">
+            <label>Password</label>
+            <input type="password" id="password" placeholder="Minimum 8 characters" required minlength="8">
+          </div>
+        </div>
+        <button type="submit">
+          <i class="fas fa-user-plus"></i> Create My Account
+        </button>
       </form>
     </div>
   `;
   document.body.appendChild(modal);
-  modal.querySelector('.close').onclick = () => modal.style.display = 'none';
+  modal.querySelector('.close').onclick = () => {
+    modal.style.display = 'none';
+    document.body.classList.remove('modal-open');
+  };
+  // Load CSS if not present
+  if (!document.getElementById('self-signup-styles')) {
+    const link = document.createElement('link');
+    link.id = 'self-signup-styles';
+    link.rel = 'stylesheet';
+    link.href = '{% static "frontend/self_signup.css" %}';
+    document.head.appendChild(link);
+  }
   document.getElementById('signup-form').onsubmit = handleSignup;
   return modal;
 }

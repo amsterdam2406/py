@@ -3549,6 +3549,18 @@ const EXPOSED_FUNCTIONS = {
     blobToDataUrl,
 };
 
+function openChangePasswordModal() {
+    const modal = document.getElementById('changePasswordModal');
+    if (!modal) {
+        showToast('Change password modal not found', 'error');
+        return;
+    }
+    document.getElementById('oldPassword').value = '';
+    document.getElementById('newPassword').value = '';
+    document.getElementById('confirmPassword').value = '';
+    modal.classList.add('active');
+}
+
 function showChangePasswordModal() {
     openChangePasswordModal();
 }
