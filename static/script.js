@@ -3549,9 +3549,15 @@ const EXPOSED_FUNCTIONS = {
     blobToDataUrl,
 };
 
+function showChangePasswordModal() {
+    openChangePasswordModal();
+}
+
 // Expose all functions to window
 Object.keys(EXPOSED_FUNCTIONS).forEach(key => {
     window[key] = EXPOSED_FUNCTIONS[key];
 });
+window.showChangePasswordModal = showChangePasswordModal;
+window.openChangePasswordModal = openChangePasswordModal;
 
 console.log('All functions exported to window object:', Object.keys(EXPOSED_FUNCTIONS));

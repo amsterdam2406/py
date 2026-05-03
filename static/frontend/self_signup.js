@@ -4,9 +4,16 @@ document.addEventListener('DOMContentLoaded', () => {
   if (signupBtn) {
     signupBtn.addEventListener('click', showSignupModal);
   }
+  // Add global function for direct onclick calls from index.html
+  window.showSelfSignupModal = showSelfSignupModal;
 });
 
 function showSignupModal() {
+  const modal = document.getElementById('signup-modal') || createSignupModal();
+  modal.style.display = 'block';
+}
+
+function showSelfSignupModal() {
   const modal = document.getElementById('signup-modal') || createSignupModal();
   modal.style.display = 'block';
 }
