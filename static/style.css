@@ -754,6 +754,39 @@ body {
     color: var(--primary-color);
 }
 
+/* Image Preview Overlay */
+.image-preview-overlay {
+    position: fixed;
+    top: 0; left: 0; width: 100%; height: 100%;
+    background: rgba(0,0,0,0.9);
+    display: none;
+    z-index: 10000;
+    justify-content: center;
+    align-items: center;
+}
+
+.image-preview-overlay.active {
+    display: flex;
+}
+
+.preview-content {
+    position: relative;
+    max-width: 90%;
+    max-height: 90%;
+}
+
+.preview-content img {
+    width: 100%;
+    height: auto;
+    border-radius: 8px;
+}
+
+.close-preview {
+    position: absolute;
+    top: -40px; right: 0;
+    color: white; font-size: 35px; cursor: pointer;
+}
+
 /* Account Creation */
 .account-creation-form {
     background: white;
@@ -808,9 +841,6 @@ body {
 
 /* Toast */
 .toast {
-    position: fixed;
-    bottom: 20px;
-    right: 20px;
     background: white;
     padding: 15px 20px;
     border-radius: 8px;
@@ -1128,19 +1158,24 @@ body {
 /* Toast Notifications */
 .toast-container {
     position: fixed;
-    top: 20px;
+    bottom: 20px;
     right: 20px;
     z-index: 9999;
-    max-width: 400px;
+    width: auto;
+    max-width: 450px;
+    display: flex;
+    flex-direction: column;
+    align-items: flex-end;
 }
 
 .toast {
-    background: white;
+    background: #ffffff !important;
+    color: #000000 !important;
     border-radius: 8px;
     padding: 16px 20px;
     margin-bottom: 10px;
-    box-shadow: var(--shadow-lg);
-    border-left: 4px solid var(--primary-color);
+    box-shadow: 0 5px 15px rgba(0,0,0,0.2);
+    border: 1px solid #eeeeee;
     display: flex;
     align-items: center;
     justify-content: space-between;
@@ -1156,19 +1191,19 @@ body {
 }
 
 .toast.success {
-    border-left-color: var(--success-color);
+    border: 2px solid #28a745;
 }
 
 .toast.error {
-    border-left-color: var(--danger-color);
+    border: 2px solid #dc3545;
 }
 
 .toast.warning {
-    border-left-color: var(--warning-color);
+    border: 2px solid #dc3545;
 }
 
 .toast.info {
-    border-left-color: var(--info-color);
+    border: 2px solid #28a745;
 }
 
 .toast-content {

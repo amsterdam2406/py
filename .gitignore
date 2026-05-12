@@ -1,83 +1,39 @@
-
-.env 
-# Environment
-.env
-
-# Virtual environments
-venv/
-venv-/
-.venv/
-env/
-
-# Python caches
-__pycache__/
-*.pyc
-
-# Local DB
-db.sqlite3
-
-# Logs
+# Django
 *.log
+local_settings.py
+db.sqlite3
+db.sqlite3-journal
+media/
+staticfiles/
+__pycache__/
+*.py[cod]
+*$py.class
 
-# Frontend build & deps
-node_modules/
+# Environments and sensitive data
+.env
+.venv
+env/
+venv/
+ENV/
+.python-version
+
+# Project Specific - Files you don't want to track yet
+static/self_signup.js
+static/frontend/self_signup.js
+static/frontend/self_signup.css
+
+# System files
+.DS_Store
+Thumbs.db
+
+# Build artifacts
 dist/
 build/
 
-# IDE / OS
-.vscode/
-.DS_Store
-Thumbs.db
-
-# Python tooling
-.tox/
-.pytest_cache/
-.mypy_cache/
-.coverage
-htmlcov/
 
 # dedc att
 backend_admin\fotasco_payroll\payroll\attendance_deductions.py"
-staticfiles/
-staticfiles
-staticfile
-staticfile/
 
-media/
-.env
-__pycache__/
-*.pyc
-db.sqlite3
-
-# Python
-__pycache__/
-*.pyc
-*.pyo
-*.pyd
-
-# Virtual environment
-venv/
-env/
-
-# Django
-db.sqlite3
-/media/
-staticfiles/
-
-# Environment variables
-.env
-
-# Logs
-*.log
-
-# OS files
-.DS_Store
-Thumbs.db
-
-# IDE
-.vscode/
-.idea/key.pem 
-cert.pemcert.pem 
-
-templates/index.html
-static/frontend/script.js
+git rm --cached static/frontend/self_signup.js
+git rm --cached static/frontend/self_signup.css
+1

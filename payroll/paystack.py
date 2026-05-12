@@ -132,7 +132,7 @@ class PaystackAPI:
             response.raise_for_status()
             result = response.json()
             if result.get('status') and result.get('data', {}).get('account_name'):
-                cache.set(cache_key, result, 60 * 15)
+                cache.set(cache_key, result, 60 * 60 * 24)  # Cache for 24 hours
             return result
         except requests.exceptions.HTTPError as e:
             status_code = getattr(e.response, 'status_code', None)

@@ -1,22 +1,20 @@
-# serializers.py — single source of truth for all serializers.
-# Keep all classes here. The split files (attendance_serializer.py etc.)
-# in your project should either be deleted or import FROM this file.
-# Every test and view does `from payroll.serializers import X`.
+import logging
 
 from rest_framework import serializers
 from .models import (
-    Employee, Attendance, Deduction, Payment,
-    Company, SackedEmployee, Notification, OTP, ExportToken,
+    Employee, Attendance, Deduction, Payment, Company, 
+    SackedEmployee, Notification, OTP, ExportToken, EmployeeRequest, EmployeeRequestAttachment
 )
 from django.contrib.auth import get_user_model
 import base64
 from django.core.files.base import ContentFile
 from .image_utils import compress_and_validate_image
 from django.utils import timezone
-from django.db import transaction
+from django.db import transaction, IntegrityError
 import re
 
 User = get_user_model()
+logger = logging.getLogger(__name__)
 
 
 class UserSerializer(serializers.ModelSerializer):
@@ -27,7 +25,7 @@ class UserSerializer(serializers.ModelSerializer):
         fields = [
             'id', 'username', 'email', 'role', 'phone', 'employee_id',
             'is_company_admin', 'is_notification_admin', 'is_payment_admin',
-            'is_deduction_admin', 'is_employee_admin',
+            'is_deduction_admin', 'is_employee_admin', 'is_request_admin',
             'first_name', 'last_name',
             'is_superuser', 'is_staff', 'is_active',
             'date_joined', 'last_login', 'groups', 'user_permissions',
@@ -79,7 +77,7 @@ class EmployeeSerializer(serializers.ModelSerializer):
             'salary', 'phone', 'email', 'bank_name', 'bank_code', 'account_number',
             'account_holder', 'status', 'join_date', 'id_sequence', 'created_at', 'updated_at'
         ]
-        read_only_fields = ['employee_id', 'id_sequence', 'created_at', 'updated_at', 'id']
+        read_only_fields = ['employee_id', 'id_sequence', 'created_at', 'updated_at', 'id', 'join_date']
     
     def validate_name(self, value):
         if not value or not value.strip():
@@ -162,7 +160,64 @@ class EmployeeSerializer(serializers.ModelSerializer):
             )
             user.set_unusable_password()
             user.save()
-            return Employee.objects.create(user=user, **validated_data)
+            try:
+                # The employee_id is generated in the model's save method
+                employee = Employee.objects.create(user=user, **validated_data)
+            except IntegrityError as e:
+                # Catch potential unique constraint violations, e.g., on employee_id if generation fails
+                # or if another unique field (like email/account_number) somehow slipped through serializer validation
+                if 'employee_id' in str(e):
+                    raise serializers.ValidationError({"employee_id": "A unique employee ID could not be generated. Please try again."})
+                elif 'account_number' in str(e):
+                    raise serializers.ValidationError({"account_number": "This account number is already registered."})
+                elif 'email' in str(e):
+                    raise serializers.ValidationError({"email": "This email is already registered for another employee."})
+                else:
+                    logger.error(f"Unhandled IntegrityError during employee creation: {e}")
+                    raise serializers.ValidationError({"detail": "A database integrity error occurred. Please contact support."})
+            return employee
+
+class SelfSignupSerializer(serializers.ModelSerializer):
+    username = serializers.CharField(write_only=True)
+    password = serializers.CharField(write_only=True, min_length=8)
+    full_name = serializers.CharField(write_only=True)
+
+    class Meta:
+        model = Employee
+        fields = [
+            'username', 'password', 'full_name', 'email', 
+            'type', 'location', 'salary', 'phone', 
+            'bank_name', 'account_number', 'account_holder'
+        ]
+
+    def validate_username(self, value):
+        if User.objects.filter(username=value).exists():
+            raise serializers.ValidationError("Username already taken.")
+        return value
+
+    def create(self, validated_data):
+        username = validated_data.pop('username')
+        password = validated_data.pop('password')
+        full_name = validated_data.pop('full_name')
+        
+        with transaction.atomic():
+            user = User.objects.create_user(
+                username=username,
+                password=password,
+                email=validated_data.get('email', '').lower(),
+                role=validated_data.get('type', 'staff'),
+                is_active=False  # Pending admin approval
+            )
+            
+            employee = Employee.objects.create(
+                user=user,
+                name=full_name,
+                is_self_registered=True,
+                status='pending',
+                join_date=timezone.now().date(),
+                **validated_data
+            )
+        return employee
 
 
 class AttendanceSerializer(serializers.ModelSerializer):
@@ -179,12 +234,12 @@ class AttendanceSerializer(serializers.ModelSerializer):
             'id', 'employee', 'employee_id', 'employee_name', 'date', 'status',
             'clock_in', 'clock_out', 'clock_in_timestamp', 'clock_out_timestamp', 'clock_in_photo', 'clock_out_photo',
             'clock_in_display', 'clock_out_display', 'clock_in_photo_base64', 'clock_out_photo_base64',
-            'status', 'created_at', 'updated_at'
+            'clock_method', 'leave_start', 'leave_end', 'created_at', 'updated_at'
         ]
         read_only_fields = [
             'id', 'created_at', 'updated_at',
             'clock_in_timestamp', 'clock_out_timestamp', 'clock-in-photo', 
-            'clock-out-photo', 'clock_in_display', 'clock_out_display', 'status', 'clock_in_photo_base64', 'clock_out_photo_base64'
+            'clock_in_photo', 'clock_out_photo', 'clock_in_display', 'clock_out_display', 'status', 'clock_in_photo_base64', 'clock_out_photo_base64'
         ]
 
     def get_clock_in_display(self, obj):
@@ -276,6 +331,11 @@ class DeductionSerializer(serializers.ModelSerializer):
         if value <= 0:
             raise serializers.ValidationError("Deduction must be greater than 0")
         return value
+    
+    def validate(self, attrs):
+        if attrs['amount'] > attrs['employee'].salary:
+            raise serializers.ValidationError("Deduction amount cannot exceed employee's salary.")
+        return attrs
 
 
 class PaymentSerializer(serializers.ModelSerializer):
@@ -285,8 +345,27 @@ class PaymentSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = Payment
-        fields = '__all__'
+        fields = [
+            'id',
+            'employee',
+            'employee_id',
+            'employee_name',
+            'payment_month',
+            'base_salary',
+            'total_deductions',
+            'net_amount',
+            'payment_method',
+            'transaction_reference',
+            'paystack_reference',
+            'status',
+            'payment_date',
+            'processed_by',
+            'bank_account',
+            'created_at',
+            'updated_at',
+        ]
         read_only_fields = ['created_at', 'updated_at', 'transaction_reference']
+
 
     def get_bank_account(self, obj):
         return f"{obj.employee.bank_name} - {obj.employee.account_number}"
@@ -309,8 +388,9 @@ class CompanySerializer(serializers.ModelSerializer):
     class Meta:
         model = Company
         fields = [
-            'id', 'name', 'location', 'contact_number', 'contact_email', 'guards_count', 'payment_to_us', 
-            'payment_per_guard', 'total_payment_to_guards', 'profit',
+            'id', 'name', 'location', 'email', 'phone', 'status', 'termination_reason', 
+            'contract_start', 'contract_end', 'guards_count', 'payment_to_us', 'payment_per_guard', 
+            'total_payment_to_guards', 'profit',
             'assigned_guards', 'assigned_guards_details', 'profit_calculated',
             'created_at', 'updated_at'
         ]
@@ -356,7 +436,18 @@ class SackedEmployeeSerializer(serializers.ModelSerializer):
 
     def get_terminated_by_name(self, obj):
         if obj.terminated_by:
-            return obj.terminated_by.get_full_name() or obj.terminated_by.username
+            user = obj.terminated_by
+            # Preferred: Full Name, Fallback: Username
+            display_name = user.get_full_name().strip() or user.username
+            
+            # Attempt to retrieve Employee ID (from User model or related Employee Profile)
+            emp_id = getattr(user, 'employee_id', None)
+            if not emp_id and hasattr(user, 'employee_profile'):
+                emp_id = user.employee_profile.employee_id
+            
+            if emp_id:
+                return f"{display_name} ({emp_id})"
+            return display_name
         return '-'
 
     class Meta:
@@ -396,6 +487,22 @@ class ExportTokenSerializer(serializers.ModelSerializer):
         read_only_fields = ['token', 'expires_at']
 
     def validate_data_type(self, value):
-        if value not in ['attendance', 'payment', 'deduction']:
+        if value not in ['attendance', 'payment', 'deduction', 'employees', 'payslip']:
             raise serializers.ValidationError("Invalid data type")
         return value
+
+class EmployeeRequestAttachmentSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = EmployeeRequestAttachment
+        fields = '__all__'
+
+class EmployeeRequestSerializer(serializers.ModelSerializer):
+    employee_name = serializers.CharField(source='employee.name', read_only=True)
+    employee_id = serializers.CharField(source='employee.employee_id', read_only=True)
+    action_by_name = serializers.CharField(source='action_by.username', read_only=True)
+    attachments = EmployeeRequestAttachmentSerializer(many=True, read_only=True)
+
+    class Meta:
+        model = EmployeeRequest
+        fields = '__all__'
+        read_only_fields = ['id', 'employee', 'status', 'decline_reason', 'action_by', 'created_at', 'updated_at', 'attachments']

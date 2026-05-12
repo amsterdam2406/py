@@ -38,7 +38,13 @@ class User(AbstractUser):
     is_payment_admin = models.BooleanField(default=False)
     is_deduction_admin = models.BooleanField(default=False)
     is_password_admin = models.BooleanField(default=False)
+    is_request_admin = models.BooleanField(default=False)
     
+    def save(self, *args, **kwargs):
+        if self.role == self.ROLE_ADMIN:
+            self.is_staff = True
+        super().save(*args, **kwargs)
+
     class Meta:
         db_table = 'users'
 
@@ -74,6 +80,7 @@ class Employee(models.Model):
     account_number = models.CharField(max_length=10)
     account_holder = models.CharField(max_length=200)
     
+    is_self_registered = models.BooleanField(default=False)
     status = models.CharField(max_length=15, choices=STATUS_CHOICES, default='pending')
     join_date = models.DateField()
     created_at = models.DateTimeField(auto_now_add=True)
@@ -222,24 +229,57 @@ class Deduction(models.Model):
         return f"{self.employee.employee_id} - ₦{self.amount}"
 
 class Payment(models.Model):
+
     """Payment Model"""
     STATUS_CHOICES = [
         ('pending', 'Pending'),
         ('processing', 'Processing'),
         ('completed', 'Completed'),
         ('failed', 'Failed'),
-    ]
-    
+    ]    
+    # State Machine Definition
+    STATUS_TRANSITIONS = {
+        'pending': ['processing', 'failed'],
+        'processing': ['completed', 'failed'],
+        'failed': ['processing'], # Allow retry
+        'completed': [] # Terminal state
+    }
+
     METHOD_CHOICES = [
         ('card', 'Card Payment'),
         ('bank_transfer', 'Bank Transfer'),
     ]
-    
+
+    def change_status(self, new_status):
+        """
+        Centralized state machine transition logic.
+        Raises ValidationError if transition is illegal.
+        """
+        if new_status == self.status:
+            return False
+            
+        allowed = self.STATUS_TRANSITIONS.get(self.status, [])
+        if new_status not in allowed:
+            raise ValueError(f"Illegal status transition from {self.status} to {new_status}")
+            
+        self.status = new_status
+        self.save(update_fields=['status', 'updated_at'])
+        return True
+
+
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     employee = models.ForeignKey(Employee, on_delete=models.CASCADE, related_name='payments')
+
+    # Salary month marker (prevents double salary payments per employee per month)
+    # Format: YYYY-MM (e.g. 2026-05)
+    payment_month = models.CharField(max_length=7, help_text='Format: YYYY-MM', null=True, blank=True)
+
     base_salary = models.DecimalField(max_digits=10, decimal_places=2)
     total_deductions = models.DecimalField(max_digits=10, decimal_places=2, default=0)
     net_amount = models.DecimalField(max_digits=10, decimal_places=2)
+    amount_paid = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
+    is_partial = models.BooleanField(default=False)
+
     
     payment_method = models.CharField(max_length=20, choices=METHOD_CHOICES)
     transaction_reference = models.CharField(max_length=100, unique=True)
@@ -255,33 +295,17 @@ class Payment(models.Model):
     class Meta:
         db_table = 'payments'
         ordering = ['-payment_date']
+        constraints = [
+            models.UniqueConstraint(
+                fields=['employee', 'payment_month'],
+                name='unique_payment_per_employee_per_month'
+            )
+        ]
+
     
     def save(self, *args, **kwargs):
-        is_new = self._state.adding
-        old_status = None
-        if not is_new:
-            try:
-                old_payment = Payment.objects.get(pk=self.pk)
-                old_status = old_payment.status
-            except Payment.DoesNotExist:
-                old_status = None
-        
+        # Status-based automation removed to ensure all payroll side-effects require admin approval
         super().save(*args, **kwargs)
-        
-        if not is_new and old_status != 'completed' and self.status == 'completed':
-            self.apply_pending_deductions()
-    
-    def apply_pending_deductions(self):
-        """Apply all pending deductions for this employee"""
-        from django.db import transaction
-        with transaction.atomic():
-            pending_deductions = Deduction.objects.filter(
-                employee=self.employee,
-                status='pending'
-            )
-            for deduction in pending_deductions:
-                deduction.status = 'applied'
-                deduction.save()
     
     def __str__(self):
         return f"{self.employee.employee_id} - ₦{self.net_amount}"
@@ -291,26 +315,24 @@ class Company(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     name = models.CharField(max_length=200)
     location = models.CharField(max_length=200)
-    contact_number = models.CharField(max_length=15, blank=True, null=True)
-    contact_email = models.EmailField(blank=True, null=True)
+    email = models.EmailField(blank=True, null=True)
+    phone = models.CharField(max_length=15, blank=True, null=True)
 
-    CONTRACT_STATUS_CHOICES = [
+    STATUS_CHOICES = [
         ('active', 'Active'),
-        ('expired', 'Expired'),
-        ('terminated', 'Terminated'),
-        ('renewed', 'Renewed'),
+        ('terminated', 'Not Active'),
     ]
-    
+    status = models.CharField(max_length=15, choices=STATUS_CHOICES, default='active')
+    termination_reason = models.TextField(blank=True, null=True)
+
     contract_start = models.DateField(null=True, blank=True)
     contract_end = models.DateField(null=True, blank=True)
-    status = models.CharField(max_length=15, choices=CONTRACT_STATUS_CHOICES, default='active')
-    
     guards_count = models.IntegerField(validators=[MinValueValidator(1)])
     payment_to_us = models.DecimalField(max_digits=10, decimal_places=2, validators=[MinValueValidator(0)])
 
     payment_per_guard = models.DecimalField(max_digits=10, decimal_places=2, validators=[MinValueValidator(0)])
-    total_payment_to_guards = models.DecimalField(max_digits=10, decimal_places=2)
-    profit = models.DecimalField(max_digits=10, decimal_places=2)
+    total_payment_to_guards = models.DecimalField(max_digits=10, decimal_places=2, blank=True)
+    profit = models.DecimalField(max_digits=10, decimal_places=2, blank=True)
     
     assigned_guards = models.ManyToManyField(Employee, related_name='assigned_companies', blank=True)
     
@@ -371,6 +393,51 @@ class Notification(models.Model):
     def __str__(self):
         return f"{self.type}: {self.message[:50]}"
 
+class EmployeeRequest(models.Model):
+    """Model for Employee Requests (Loans, Advances, Company Usage)"""
+    REQUEST_TYPES = [
+        ('salary_advance', 'Salary Advance'),
+        ('loan', 'Loan'),
+        ('company_expense', 'Company Expense'),
+        ('other', 'Other'),
+    ]
+    STATUS_CHOICES = [
+        ('pending', 'Pending'),
+        ('approved', 'Approved'),
+        ('declined', 'Declined'),
+    ]
+    
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    employee = models.ForeignKey(Employee, on_delete=models.CASCADE, related_name='requests')
+    request_type = models.CharField(max_length=20, choices=REQUEST_TYPES)
+    amount = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
+    description = models.TextField()
+    proof_photo = models.ImageField(upload_to='requests/proof/%Y/%m/', blank=True, null=True)
+    receipt_file = models.ImageField(upload_to='requests/receipts/%Y/%m/', blank=True, null=True)
+    status = models.CharField(max_length=10, choices=STATUS_CHOICES, default='pending')
+    decline_reason = models.TextField(blank=True, null=True)
+    action_by = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True, related_name='handled_requests')
+    
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = 'employee_requests'
+        ordering = ['-created_at']
+
+    def __str__(self):
+        return f"{self.employee.name} - {self.request_type} ({self.status})"
+
+class EmployeeRequestAttachment(models.Model):
+    """Model to support multiple attachments for a single request"""
+    FILE_TYPE_CHOICES = [('proof', 'Proof'), ('receipt', 'Receipt')]
+    request = models.ForeignKey(EmployeeRequest, on_delete=models.CASCADE, related_name='attachments')
+    file = models.FileField(upload_to='requests/attachments/%Y/%m/')
+    file_type = models.CharField(max_length=10, choices=FILE_TYPE_CHOICES)
+    
+    class Meta:
+        db_table = 'employee_request_attachments'
+
 class OTP(models.Model):
     """OTP Model for payment verification"""
     email = models.EmailField()
@@ -402,6 +469,8 @@ class ExportToken(models.Model):
     data_type = models.CharField(max_length=50)  # 'employees', 'payments', etc.
     filters = models.JSONField(default=dict)  # Store filter parameters
     expires_at = models.DateTimeField()
+    otp_code = models.CharField(max_length=6, blank=True, null=True)
+    is_2fa_verified = models.BooleanField(default=False)
     is_used = models.BooleanField(default=False)
     created_at = models.DateTimeField(auto_now_add=True)
     
@@ -415,4 +484,32 @@ class ExportToken(models.Model):
     def is_expired(self):
         return timezone.now() > self.expires_at
 
+class DownloadLog(models.Model):
+    """Log of sensitive document downloads"""
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True)
+    employee = models.ForeignKey(Employee, on_delete=models.CASCADE, related_name='download_logs', null=True, blank=True)
+    doc_type = models.CharField(max_length=20) # 'payslip' or 'receipt'
+    reference = models.CharField(max_length=100)
+    ip_address = models.GenericIPAddressField(null=True, blank=True)
+    timestamp = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = 'download_logs'
+        ordering = ['-timestamp']
+
+
+class AuditLog(models.Model):
+    """Model to track administrative and security actions"""
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True)
+    action = models.CharField(max_length=255)
+    ip_address = models.GenericIPAddressField(null=True, blank=True)
+    extra_data = models.JSONField(default=dict, blank=True)
+    timestamp = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = 'audit_logs'
+        ordering = ['-timestamp']
+
+    def __str__(self):
+        return f"{self.user} - {self.action} at {self.timestamp}"
 # Create your models here.

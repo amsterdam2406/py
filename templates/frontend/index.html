@@ -9,6 +9,30 @@
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
     <script type="text/javascript" src="https://cdn.jsdelivr.net/npm/@emailjs/browser@4/dist/email.min.js"></script>
     <link rel="stylesheet" href="{% static 'style.css' %}">
+    <style>
+        .nav-user { display: flex; align-items: center; gap: 15px; margin-left: auto; padding-right: 20px; }
+        #currentUserName { color: #333333; font-weight: 700; font-size: 1rem; }
+        .user-menu-dropdown { position: relative; display: inline-block; }
+        .dropdown-content.show { display: block; }
+        .dropbtn-custom { background: #28a745; border: none; color: #fff; padding: 10px 18px; border-radius: 6px; cursor: pointer; display: flex; align-items: center; gap: 8px; transition: 0.3s; font-weight: 600; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+        .dropbtn-custom:hover { background: #218838; transform: translateY(-1px); }
+        .dropdown-content { display: none; position: absolute; right: 0; background-color: #ffffff; min-width: 180px; box-shadow: 0 8px 16px rgba(0,0,0,0.2); z-index: 1000; border-radius: 4px; margin-top: 5px; border: 1px solid #eeeeee; overflow: hidden; }
+        .dropdown-content button { color: #333333; padding: 12px 16px; text-decoration: none; display: block; width: 100%; text-align: left; border: none; background: none; cursor: pointer; font-size: 0.9rem; transition: 0.2s; border-bottom: 1px solid #f5f5f5; }
+        .dropdown-content button:last-child { border-bottom: none; }
+        .dropdown-content button:hover { background-color: #f8f9fa; color: #117e62; }
+        .dropdown-content button i { margin-right: 10px; width: 16px; text-align: center; color: #666; }
+        .dropdown-content .logout-item { color: #dc3545; }
+        .dropdown-content .logout-item:hover { background-color: #fff5f5; color: #bd2130; }
+        .dropdown-content .logout-item i { color: inherit; }
+
+        /* Mobile Responsiveness Fixes */
+        @media (max-width: 768px) {
+            .stats-grid { grid-template-columns: 1fr; gap: 10px; }
+            .sidebar { transform: translateX(-100%); transition: 0.3s; }
+            .sidebar.active { transform: translateX(0); }
+            .main-content { margin-left: 0; width: 100%; padding: 15px; }
+        }
+    </style>
 </head>
 <body>
     <!-- Login Page -->
@@ -21,7 +45,7 @@
                 <h1>Fotasco Security Services</h1>
                 <p>Management System</p>
             </div> 
-            <form id="loginForm" method="POST" action="javascript:void(0);" onsubmit="handleLogin(event); return false;">
+            <form id="loginForm" method="POST">
                 {% csrf_token %}
                 <div class="form-group">
                     <label for="loginUsername"><i class="fas fa-user"></i> Username</label>
@@ -34,16 +58,14 @@
                 <button type="submit" id="loginBtn" class="btn btn-primary btn-block">
                     <i class="fas fa-sign-in-alt"></i> Login
                 </button>
-                <div class="form-footer">
-                    <a href="#" onclick="showSelfSignupModal(); return false;" class="signup-link">
-                        <i class="fas fa-user-plus"></i> New employee? Create account
-                    </a>
+                <div style="text-align:center; margin-top: 14px;">
+                    <button type="button" onclick="showSelfSignupModal()" class="btn btn-sm btn-outline-primary" style="border: 1px solid rgba(255,255,255,0.35); color: #fff;">
+                        <i class="fas fa-user-plus"></i> Self Signup
+                    </button>
                 </div>
             </form>
-
         </div>
     </div>
-
     <!-- Main Dashboard -->
     <div id="dashboardPage" class="page-container hidden">
         <!-- Top Navigation -->
@@ -57,12 +79,16 @@
             </div>
             <div class="nav-user">
                 <span id="currentUserName"></span>
-                <button type="button" onclick="showChangePasswordModal()" class="btn btn-sm btn-warning me-2">
-                    <i class="fas fa-key"></i> Change Password
-                </button>
-                <button type="button" onclick="logout()" class="btn btn-sm btn-danger">
-                    <i class="fas fa-sign-out-alt"></i> Logout
-                </button>
+                <div class="user-menu-dropdown">
+                    <button type="button" class="dropbtn-custom" onclick="toggleUserMenu(event)">
+                        <i class="fas fa-user-circle fa-lg"></i><i class="fas fa-caret-down"></i>
+                    </button>
+                    <div class="dropdown-content">
+                        <button type="button" onclick="showRequestModal()"><i class="fas fa-paper-plane"></i> Make Request</button>
+                        <button type="button" onclick="showChangePasswordModal()"><i class="fas fa-key"></i> Change Password</button>
+                        <button type="button" onclick="logout()" class="logout-item"><i class="fas fa-sign-out-alt"></i> Logout</button>
+                    </div>
+                </div>
             </div>
         </nav>
 
@@ -96,6 +122,9 @@
                 <li><a href="javascript:void(0)" onclick="showSection('history')">
                     <i class="fas fa-history"></i> <span>Payment History</span>
                 </a></li>
+                <li><a href="javascript:void(0)" onclick="showSection('requests')">
+                    <i class="fas fa-envelope-open-text"></i> <span>Requests</span>
+                </a></li>
                 <li><a href="javascript:void(0)" onclick="showSection('sacked')">
                     <i class="fas fa-user-slash"></i> <span>Sacked</span>
                 </a></li>
@@ -110,6 +139,11 @@
             <!-- Dashboard Section -->
             <section class="content-section active" id="dashboard">
                 <h2><i class="fas fa-home"></i> Dashboard Overview</h2>
+                <div id="pendingApprovalsAlert" class="alert alert-warning hidden" style="background: #fff3cd; color: #856404; padding: 15px; border-radius: 8px; margin-bottom: 20px; display: flex; justify-content: space-between; align-items: center; border: 1px solid #ffeeba;">
+                    <span><i class="fas fa-exclamation-circle"></i> There are <strong id="pendingCount">0</strong> self-registered employees awaiting approval.</span>
+                    <button class="btn btn-sm btn-warning" onclick="showSection('employees')">Process Now</button>
+                </div>
+                
                 <div class="stats-grid">
                     <div class="stat-card">
                         <div class="stat-icon bg-blue">
@@ -155,15 +189,47 @@
                 </div>
             </section>
 
+            <!-- Requests Section -->
+            <section class="content-section" id="requests">
+                <div class="section-header">
+                    <h2><i class="fas fa-envelope-open-text"></i> Employee Requests</h2>
+                    <button onclick="showRequestModal()" class="btn btn-primary">
+                        <i class="fas fa-plus"></i> New Request
+                    </button>
+                </div>
+                <div class="table-responsive">
+                    <table class="data-table">
+                        <thead>
+                            <tr>
+                                <th>Date</th>
+                                <th>Employee</th>
+                                <th>Type</th>
+                                <th>Amount</th>
+                                <th>Proof</th>
+                                <th>Receipt</th>
+                                <th>Status</th>
+                                <th>Actions</th>
+                            </tr>
+                        </thead>
+                        <tbody id="requestsTableBody"></tbody>
+                    </table>
+                </div>
+            </section>
+
             <!-- Employees Section -->
             <div id="admin-controls-employee">
                 <div id="employee-section">
                     <section class="content-section" id="employees">
                         <div class="section-header">
                             <h2><i class="fas fa-users"></i> Employee Management</h2>
-                            <button id="addEmployeeBtn" onclick="showAddEmployeeModal()" class="btn btn-primary">
-                                <i class="fas fa-plus"></i> Add Employee
-                            </button>
+                            <div class="btn-group">
+                                <button onclick="bulkApproveEmployees()" class="btn btn-success">
+                                    <i class="fas fa-check-double"></i> Bulk Approve
+                                </button>
+                                <button id="addEmployeeBtn" onclick="showAddEmployeeModal()" class="btn btn-primary">
+                                    <i class="fas fa-plus"></i> Add Employee
+                                </button>
+                            </div>
                         </div>
 
                         <div class="filter-bar">
@@ -183,10 +249,11 @@
                             <table class="data-table">
                                 <thead>
                                     <tr>
+                                        <th><input type="checkbox" onclick="toggleAllEmployees(this)"></th>
                                         <th>Employee ID</th>
                                         <th>Name</th>
                                         <th>Type</th>
-                                        <th>Location</th>
+                                        <th>Dept</th>
                                         <th>Bank</th>
                                         <th>Salary</th>
                                         <th>Status</th>
@@ -328,6 +395,7 @@
                             <table class="data-table">
                                 <thead>
                                     <tr>
+                                        <th></th>
                                         <th>Employee ID</th>
                                         <th>Name</th>
                                         <th>Bank Account</th>
@@ -387,10 +455,15 @@
                                 <thead>
                                     <tr>
                                         <th>Company Name</th>
+                                        <th>Email</th>
+                                        <th>Phone</th>
                                         <th>Location</th>
-                                        <th>Guards Assigned</th>
-                                        <th>Amount Paid to Us</th>
-                                        <th>Amount Paid to Guards</th>
+                                        <th>Status</th>
+                                        <th>Start Date</th>
+                                        <th>End Date</th>
+                                        <th>Guards</th>
+                                        <th>Payment Us</th>
+                                        <th>Total to Guards</th>
                                         <th>Profit</th>
                                         <th>Actions</th>
                                     </tr>
@@ -436,7 +509,7 @@
 
                                 <div class="form-row">
                                     <div class="form-group">
-                                        <label for="accountLocation">Department/Location</label>
+                                        <label for="accountLocation">Location/Role</label>
                                         <input type="text" id="accountLocation" class="form-control" required>
                                     </div>
                                     <div class="form-group">
@@ -550,6 +623,7 @@
                                         <th>Type</th>
                                         <th>Date Sacked</th>
                                         <th>Offense/Reason</th>
+                                        <th>Action By</th>
                                         <th>Actions</th>
                                     </tr>
                                 </thead>
@@ -563,13 +637,74 @@
                 <section class="content-section" id="notifications">
                     <div class="section-header">
                         <h2><i class="fas fa-bell"></i> Notifications</h2>
-                        <button onclick="clearAllNotifications()" class="btn btn-secondary">
-                            <i class="fas fa-trash"></i> Clear All
+                        <button onclick="markAllNotificationsAsRead()" class="btn btn-secondary">
+                            <i class="fas fa-check-double"></i> Mark all as read
                         </button>
                     </div>
                     <div id="notificationsList" class="notifications-list"></div>
                 </section>
             </main>
+        </div>
+
+        <!-- Request Modal -->
+        <div id="requestModal" class="modal">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h3>New Employee Request</h3>
+                    <span class="close" onclick="closeModal('requestModal')">&times;</span>
+                </div>
+                <form id="requestForm">
+                    <div class="form-group">
+                        <label for="reqType">Request Type</label>
+                        <select id="reqType" class="form-control" required>
+                            <option value="salary_advance">Salary Advance</option>
+                            <option value="loan">Loan</option>
+                            <option value="company_expense">Company Expense (Purchases)</option>
+                            <option value="other">Other</option>
+                        </select>
+                    </div>
+                    <div class="form-group">
+                        <label for="reqAmount">Amount (₦)</label>
+                        <input type="number" id="reqAmount" class="form-control" placeholder="0.00">
+                    </div>
+                    <div class="form-group">
+                        <label for="reqDescription">Description/Reason</label>
+                        <textarea id="reqDescription" class="form-control" rows="3" maxlength="500" required oninput="updateCharCount(this)"></textarea>
+                        <small class="text-muted" id="charCounter">0 / 500 characters</small>
+                    </div>
+                    <div class="form-group">
+                        <button type="button" onclick="startRequestCamera()" class="btn btn-sm btn-outline-primary mb-2">
+                            <i class="fas fa-camera"></i> Enable Camera for Proof
+                        </button>
+                        <button type="button" onclick="clearCapturedPhotos()" class="btn btn-sm btn-outline-danger mb-2">
+                            <i class="fas fa-trash"></i> Clear All Photos
+                        </button>
+                    </div>
+                    <div id="requestCameraSection">
+                        <label>Capture Proof (For Expenses)</label>
+                        <video id="reqVideo" autoplay muted playsinline style="width: 100%; border-radius: 8px; margin-bottom: 10px;"></video>
+                        <div id="reqCapturedImage"></div>
+                        <button type="button" onclick="captureRequestPhoto()" class="btn btn-sm btn-info mb-2">
+                            <i class="fas fa-camera"></i> Take Photo
+                        </button>
+                    </div>
+                    <div class="form-group">
+                        <label for="reqReceipt">Upload Receipts (Multiple allowed)</label>
+                        <input type="file" id="reqReceipt" class="form-control" accept="image/*" multiple>
+                    </div>
+                    <button type="submit" class="btn btn-primary btn-block" id="submitRequestBtn">Submit Request</button>
+                </form>
+            </div>
+        </div>
+
+        <!-- Decline Reason Modal -->
+        <div id="declineReasonModal" class="modal">
+            <div class="modal-content modal-sm">
+                <h3>Decline Request</h3>
+                <textarea id="declineReasonText" class="form-control" placeholder="Reason for declining..." rows="3"></textarea>
+                <button onclick="submitDeclineRequest()" class="btn btn-danger btn-block mt-3">Confirm Decline</button>
+                <button onclick="closeModal('declineReasonModal')" class="btn btn-secondary btn-block">Cancel</button>
+            </div>
         </div>
 
         <!-- MODALS -->
@@ -581,7 +716,7 @@
                     <h3>Add New Employee</h3>
                     <span class="close" onclick="closeModal('addEmployeeModal')">&times;</span>
                 </div>
-                <form id="addEmployeeForm" onsubmit="handleCreateEmployee(event)">
+                <form id="addEmployeeForm" action="javascript:void(0);">
                     <div class="form-group">
                         <label for="newEmployeeType">Employee Type</label>
                         <select id="newEmployeeType" class="form-control" required>
@@ -602,7 +737,7 @@
                         <input type="text" id="newEmployeePhone" class="form-control" required>
                     </div>
                     <div class="form-group">
-                        <label for="newEmployeeLocation">Location</label>
+                        <label for="newEmployeeLocation">Location/Role</label>
                         <input type="text" id="newEmployeeLocation" class="form-control" required>
                     </div>
                     <div class="form-group">
@@ -614,11 +749,6 @@
                         <label for="newEmployeeBankName">Bank Name</label>
                         <select id="newEmployeeBankName" class="form-control" required>
                             <option value="">Select Bank</option>
-                            <option value="Access Bank">Access Bank</option>
-                            <option value="GTBank">GTBank</option>
-                            <option value="First Bank">First Bank</option>
-                            <option value="UBA">UBA</option>
-                            <option value="Zenith Bank">Zenith Bank</option>
                         </select>
                     </div>
                     <div class="form-group">
@@ -658,6 +788,11 @@
                             <option value="in">Clock In</option>
                             <option value="out">Clock Out</option>
                         </select>
+                    </div>
+                    <div class="form-group">
+                        <label class="checkbox-label">
+                            <input type="checkbox" id="markWithoutSelfie" onchange="toggleCamera()"> Mark without selfie (Boxmark)
+                        </label>
                     </div>
                     <div class="camera-section">
                         <video id="cameraVideo" autoplay muted playsinline></video>
@@ -846,7 +981,7 @@
         <div id="addCompanyModal" class="modal">
             <div class="modal-content">
                 <div class="modal-header">
-                    <h3>Add Company/Client</h3>
+                    <h3 id="companyModalTitle">Add Company/Client</h3>
                     <span class="close" onclick="closeModal('addCompanyModal')">&times;</span>
                 </div>
                 <form id="addCompanyForm">
@@ -855,8 +990,32 @@
                         <input type="text" id="companyName" class="form-control" required>
                     </div>
                     <div class="form-group">
+                        <label for="companyEmail">Email</label>
+                        <input type="email" id="companyEmail" class="form-control">
+                    </div>
+                    <div class="form-group">
+                        <label for="companyPhone">Phone</label>
+                        <input type="text" id="companyPhone" class="form-control">
+                    </div>
+                    <!-- <div class="form-group">
+                        <label for="companyEmail">Contact Email</label>
+                        <input type="email" id="companyEmail" class="form-control">
+                    </div>
+                    <div class="form-group">
+                        <label for="companyPhone">Contact Phone</label>
+                        <input type="tel" id="companyPhone" class="form-control">
+                    </div> -->
+                    <div class="form-group">
                         <label for="companyLocation">Location/Address</label>
                         <input type="text" id="companyLocation" class="form-control" required>
+                    </div>
+                    <div class="form-group">
+                        <label for="companyStartDate">Contract Start Date</label>
+                        <input type="date" id="companyStartDate" class="form-control">
+                    </div>
+                    <div class="form-group">
+                        <label for="companyEndDate">Contract End Date</label>
+                        <input type="date" id="companyEndDate" class="form-control">
                     </div>
                     <div class="form-group">
                         <label for="companyGuardsCount">Number of Guards Needed</label>
@@ -878,7 +1037,7 @@
                         </div>
                         <select id="companyAssignedGuards" name="assigned_guards" multiple style="display:none;"></select>
                     </div>
-                    <button type="submit" class="btn btn-primary btn-block">Add Company</button>
+                    <button type="submit" id="saveCompanyBtn" class="btn btn-primary btn-block">Add Company</button>
                 </form>
             </div>
         </div>
@@ -913,11 +1072,13 @@
         <div id="exportPasswordModal" class="modal">
             <div class="modal-content modal-sm">
                 <div class="modal-header">
-                    <h3>Enter Password to Export</h3>
+                    <h3>Authentication Required</h3>
                 </div>
-                <form class="otp-content" onsubmit="event.preventDefault(); confirmExport();">
+                <form id="exportPasswordForm" class="otp-content" action="javascript:void(0);">
+                    <!-- Hidden username for password manager association -->
+                    <input type="text" id="exportUsername" name="username" style="display:none;" autocomplete="username">
                     <p id="exportPasswordPrompt">Enter password to export data</p>
-                    <input type="password" id="exportPassword" class="form-control" placeholder="Enter password" autocomplete="current-password" required>
+                    <input type="password" id="exportPassword" name="password" class="form-control" placeholder="Enter login password" autocomplete="current-password" required>
                     <button type="submit" class="btn btn-primary btn-block">Confirm Export</button>
                     <button type="button" onclick="closeModal('exportPasswordModal')" class="btn btn-secondary btn-block">Cancel</button>
                 </form>
@@ -946,7 +1107,7 @@
                     <h3>Change Password</h3>
                     <span class="close" onclick="closeModal('changePasswordModal')">&times;</span>
                 </div>
-                <form id="changePasswordForm" onsubmit="handleChangePassword(event)">
+                <form id="changePasswordForm" action="javascript:void(0);">
                     <div class="form-group">
                         <label for="oldPassword">Current Password</label>
                         <input type="password" id="oldPassword" class="form-control" required autocomplete="current-password">
@@ -964,8 +1125,48 @@
                 </form>
             </div>
         </div>
+
+        <!-- Self Signup Modal -->
+        <div id="selfSignupModal" class="modal">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h3>Employee Self Signup</h3>
+                    <span class="close" onclick="closeModal('selfSignupModal')">&times;</span>
+                </div>
+                <form id="selfSignupForm" onsubmit="handleSelfSignup(event)">
+                    <div class="form-group">
+                        <label>Full Name</label>
+                        <input type="text" id="signupFullName" class="form-control" required>
+                    </div>
+                    <div class="form-group">
+                        <label>Email</label>
+                        <input type="email" id="signupEmail" class="form-control" required>
+                    </div>
+                    <div class="form-group">
+                        <label>Username</label>
+                        <input type="text" id="signupUsername" class="form-control" required>
+                    </div>
+                    <div class="form-group">
+                        <label>Password</label>
+                        <input type="password" id="signupPassword" class="form-control" required>
+                    </div>
+                    <div class="form-group">
+                        <label>Role</label>
+                        <select id="signupRole" class="form-control" required>
+                            <option value="guard">Guard</option>
+                            <option value="staff">Staff</option>
+                        </select>
+                    </div>
+                    <div class="form-group">
+                        <label>Preferred Location</label>
+                        <input type="text" id="signupLocation" class="form-control" required>
+                    </div>
+                    <input type="hidden" id="signupSalary" value="0">
+                    <button type="submit" class="btn btn-primary btn-block">Sign Up</button>
+                </form>
+            </div>
+        </div>
         
-        <!-- Global Loading Spinner -->
         <div id="globalSpinner" class="spinner-overlay hidden">
             <div class="spinner"></div>
         </div>
@@ -974,8 +1175,8 @@
         <div id="toastContainer" class="toast-container"></div>
         
         <script src="https://cdnjs.cloudflare.com/ajax/libs/html2pdf.js/0.10.1/html2pdf.bundle.min.js"></script>
-        <script src="{% static 'frontend/self_signup.js' %}"></script>
         <script src="{% static 'script.js' %}"></script>
+        <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+        <script src="{% static 'self_signup.js' %}"></script>
     </body>
 </html>
-

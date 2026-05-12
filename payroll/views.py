@@ -1,52 +1,77 @@
-import hmac
-import hashlib
-import requests
-import logging
-from django.contrib.auth import get_user_model
-from django.shortcuts import render
-from django.conf import settings
-from django.db.models import Sum
-from django.db import transaction
-from django.utils import timezone
-from datetime import datetime, timedelta
-from django.core.exceptions import ValidationError
-from django.core.mail import send_mail
-from rest_framework.views import APIView
-from rest_framework import viewsets, status, serializers
-from rest_framework.decorators import action, api_view, permission_classes
-from rest_framework.response import Response
-from rest_framework.permissions import IsAuthenticated, AllowAny
-from decimal import Decimal
-import csv
-import uuid
 import base64
-import secrets
+import csv
+import hashlib
+import hmac
+import io
+import logging
+import os
 import random
+import secrets
 import string
-from django.http import HttpResponse, JsonResponse
+import uuid
+import zipfile
+from datetime import datetime, timedelta
+from decimal import Decimal, InvalidOperation
+from django.contrib.auth import get_user_model
+from django.conf import settings
+from django.core.mail import EmailMessage, EmailMultiAlternatives
+from django.core.exceptions import ValidationError
+from django.contrib.auth.tokens import default_token_generator
+from django.utils.http import urlsafe_base64_encode, urlsafe_base64_decode
+from django.utils.encoding import force_bytes, force_str
 from django.core.files.base import ContentFile
+from django.core.mail import send_mail
+from django.db import transaction
+from django.db.models import Q, Sum
+from django.core.cache import cache
+from django.http import HttpResponse, JsonResponse
+from django.shortcuts import render
+from django.template.loader import render_to_string
+from django.utils import timezone
 from django.views.decorators.csrf import csrf_exempt
-from django.db.models import Q
+import requests
+from rest_framework import serializers, status, viewsets
+from rest_framework.authentication import BasicAuthentication, SessionAuthentication
+from rest_framework.decorators import action, api_view, permission_classes, throttle_classes
+from rest_framework.permissions import AllowAny, IsAuthenticated
+from rest_framework.response import Response
+from rest_framework.throttling import ScopedRateThrottle
+from rest_framework.views import APIView
+from rest_framework_simplejwt.authentication import JWTAuthentication
+
+try:
+    from reportlab.lib import colors
+    from reportlab.lib.pagesizes import letter
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+except ImportError:
+    colors = None
+    letter = None
+    getSampleStyleSheet = None
+    ParagraphStyle = None
+    SimpleDocTemplate = None
+    Table = None
+    TableStyle = None
+    Paragraph = None
+    Spacer = None
 from .models import (
     Employee, Attendance, Deduction, Payment,
-    Company, SackedEmployee, Notification, OTP, ExportToken
+    Company, SackedEmployee, Notification, OTP, ExportToken, EmployeeRequest, EmployeeRequestAttachment, DownloadLog
 )
+from . import auth_views
 from .serializers import (
     UserSerializer, EmployeeSerializer, AttendanceSerializer,
     DeductionSerializer, PaymentSerializer, CompanySerializer,
-    SackedEmployeeSerializer, NotificationSerializer
+    SackedEmployeeSerializer, NotificationSerializer, EmployeeRequestSerializer,
+    SelfSignupSerializer
 )
 from .paystack import PaystackAPI, NIGERIAN_BANKS
 from .permissions import (
     IsAdmin, CanCreateEmployee, IsSackAdmin, IsPayrollAdmin,
     IsDeductionAdmin, CanEditNotification, CanViewAndEditCompany
 )
-from payroll.throttles import AttendanceThrottle, PaymentThrottle, BulkPaymentThrottle, ExportThrottle
-from rest_framework.authentication import SessionAuthentication, BasicAuthentication
-from rest_framework_simplejwt.authentication import JWTAuthentication
-from rest_framework.throttling import ScopedRateThrottle
-from rest_framework.decorators import api_view, permission_classes
-import json
+from payroll.throttles import AttendanceThrottle, PaymentThrottle, BulkPaymentThrottle, ExportThrottle, BankVerifyThrottle
+from .utils import log_audit, get_client_ip
 
 User = get_user_model()
 logger = logging.getLogger(__name__)
@@ -67,9 +92,87 @@ def get_employee_bank_code(employee):
     return None
 
 
+class DownloadLogSerializer(serializers.ModelSerializer):
+    employee_name = serializers.ReadOnlyField(source='employee.name')
+    employee_id = serializers.ReadOnlyField(source='employee.employee_id')
+    user_username = serializers.ReadOnlyField(source='user.username')
+
+    class Meta:
+        model = DownloadLog
+        fields = [
+            'id', 'user', 'user_username', 'employee', 'employee_name', 
+            'employee_id', 'doc_type', 'reference', 'ip_address', 'timestamp'
+        ]
+
 # ─────────────────────────────────────────
 # PAYSTACK BANK UTILITIES
 # ─────────────────────────────────────────
+@api_view(['POST'])
+@permission_classes([AllowAny])
+def forgot_password_request(request):
+    """Send password reset link to user email"""
+    email = request.data.get('email')
+    if not email:
+        return Response({'error': 'Email is required'}, status=400)
+    
+    user = User.objects.filter(email__iexact=email).first()
+    if user:
+        token = default_token_generator.make_token(user)
+        uid = urlsafe_base64_encode(force_bytes(user.pk))
+        # This link points back to your frontend with action params
+        reset_link = f"{settings.FRONTEND_URL}/?action=reset-password&uid={uid}&token={token}"
+        
+        subject = 'Fotasco Payroll - Password Reset Request'
+        from_email = settings.DEFAULT_FROM_EMAIL
+        
+        # Plain text version for non-HTML clients
+        text_content = (
+            f"Hello {user.username or user.first_name or 'User'},\n\n"
+            f"You requested a password reset for your Fotasco Payroll account. "
+            f"Please click the link below to set a new password:\n\n{reset_link}\n\n"
+            f"This link will expire in 24 hours. If you did not request this, please ignore this email."
+        )
+        
+        context = {
+            'user_display_name': user.username or user.first_name or 'User',
+            'reset_link': reset_link,
+            'current_year': datetime.now().year
+        }
+        html_content = render_to_string('emails/password_reset.html', context)
+
+        try:
+            msg = EmailMultiAlternatives(subject, text_content, from_email, [email])
+            msg.attach_alternative(html_content, "text/html")
+            msg.send(fail_silently=False)
+        except Exception as e:
+            logger.error(f"Email sending failed: {e}")
+            return Response({'error': 'Failed to send reset email. Please try again later.'}, status=500)
+            
+    return Response({'message': 'If an account exists with that email, a password reset link has been sent.'})
+
+@api_view(['POST'])
+@permission_classes([AllowAny])
+def reset_password_confirm(request):
+    """Complete the password reset using the token and uid"""
+    uidb64 = request.data.get('uid')
+    token = request.data.get('token')
+    new_password = request.data.get('new_password')
+    
+    if not all([uidb64, token, new_password]):
+        return Response({'error': 'Missing required fields'}, status=400)
+        
+    try:
+        uid = force_str(urlsafe_base64_decode(uidb64))
+        user = User.objects.get(pk=uid)
+    except (TypeError, ValueError, OverflowError, User.DoesNotExist):
+        user = None
+
+    if user is not None and default_token_generator.check_token(user, token):
+        user.set_password(new_password)
+        user.save()
+        return Response({'message': 'Password has been reset successfully.'})
+    
+    return Response({'error': 'The reset link is invalid or has expired.'}, status=400)
 
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
@@ -82,6 +185,7 @@ def paystack_banks(request):
 
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])
+@throttle_classes([BankVerifyThrottle])
 def paystack_verify_account(request):
     """Verify bank account number"""
     account_number = request.data.get('account_number')
@@ -92,6 +196,23 @@ def paystack_verify_account(request):
             {'error': 'account_number and bank_code required'},
             status=status.HTTP_400_BAD_REQUEST
         )
+
+    # Check for existing active employees to save Paystack API calls and prevent duplicates
+    duplicate = Employee.objects.filter(
+        account_number=account_number,
+        status__in=['active', 'pending']
+    ).first()
+
+    if duplicate:
+        return Response({
+            'status': True,
+            'message': 'Account already verified and registered in system',
+            'data': {
+                'account_name': duplicate.account_holder,
+                'account_number': duplicate.account_number,
+                'bank_name': duplicate.bank_name
+            }
+        }, status=status.HTTP_200_OK)
 
     paystack = PaystackAPI()
     result = paystack.verify_account(account_number, bank_code)
@@ -105,6 +226,123 @@ def paystack_verify_account(request):
 
     return Response(result)
 
+
+@api_view(['POST'])
+@permission_classes([IsAdmin])
+def clear_paystack_cache(request):
+    """
+    Clear all cached Paystack bank account resolutions.
+    Requires django-redis for delete_pattern support.
+    """
+    try:
+        # This pattern matches keys created in paystack.py
+        # Key format: paystack:resolve:{bank_code}:{account_number}
+        cache.delete_pattern("paystack:resolve:*")
+        log_audit(request.user, "Cleared all Paystack bank resolution caches", request)
+        return Response({'status': True, 'message': 'Bank resolution cache cleared successfully'})
+    except Exception as e:
+        logger.error(f"Failed to clear cache: {e}")
+        return Response({'status': False, 'message': str(e)}, status=500)
+
+def draw_watermark(canvas, doc):
+    """Draw low-opacity logo watermark on PDF"""
+    canvas.saveState()
+    canvas.setFillAlpha(0.05)
+    logo_path = os.path.join(settings.BASE_DIR, 'static', 'no_bggg.png')
+    if os.path.exists(logo_path):
+        canvas.drawImage(logo_path, 150, 250, width=300, height=300, mask='auto')
+    canvas.restoreState()
+
+def generate_receipt_pdf_buffer(payment):
+    """Refactored PDF generator for reuse in views and emails"""
+    employee = payment.employee
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(buffer, pagesize=letter)
+    styles = getSampleStyleSheet()
+    elements = []
+
+    # Custom Receipt Header
+    header_style = ParagraphStyle('Header', parent=styles['Heading1'], alignment=1, textColor=colors.HexColor("#117e62"))
+    elements.append(Paragraph("FOTASCO SECURITY SERVICES", header_style))
+    elements.append(Paragraph("OFFICIAL PAYMENT RECEIPT", styles['Heading2']))
+    elements.append(Spacer(1, 20))
+
+    # Metadata
+    meta_data = [
+        ["Receipt No:", f"REC-{payment.transaction_reference[:8].upper()}"],
+        ["Date Issued:", payment.payment_date.strftime('%d %b %Y')],
+        ["Payment Ref:", payment.transaction_reference]
+    ]
+    meta_table = Table(meta_data, colWidths=[100, 400])
+    meta_table.setStyle(TableStyle([('FONTNAME', (0,0), (0,-1), 'Helvetica-Bold')]))
+    elements.append(meta_table)
+    elements.append(Spacer(1, 20))
+
+    # Breakdown Table
+    payment_data = [
+        ["Description", "Amount"],
+        [f"Salary Payment - {payment.payment_month or 'Custom'}", f"NGN {payment.base_salary:,.2f}"],
+        ["Total Deductions", f"NGN ({payment.total_deductions:,.2f})"],
+        [Paragraph("<b>TOTAL PAID</b>", styles['Normal']), Paragraph(f"<b>NGN {payment.net_amount:,.2f}</b>", styles['Normal'])]
+    ]
+    pt = Table(payment_data, colWidths=[350, 150])
+    pt.setStyle(TableStyle([
+        ('BACKGROUND', (0,0), (1,0), colors.HexColor("#117e62")),
+        ('TEXTCOLOR', (0,0), (1,0), colors.whitesmoke),
+        ('ALIGN', (1,0), (1,-1), 'RIGHT'),
+        ('GRID', (0,0), (-1,-1), 0.5, colors.grey),
+        ('LINEBELOW', (0,-1), (-1,-1), 2, colors.HexColor("#117e62")),
+    ]))
+    elements.append(pt)
+    elements.append(Spacer(1, 20))
+
+    # Stamp and T&C
+    stamp_path = os.path.join(settings.BASE_DIR, 'static', 'stamp.png')
+    if os.path.exists(stamp_path):
+        from reportlab.platypus import Image
+        elements.append(Image(stamp_path, width=100, height=100))
+    
+    elements.append(Spacer(1, 10))
+    elements.append(Paragraph("<b>Terms & Conditions:</b>", styles['Normal']))
+    tc_style = ParagraphStyle('TC', parent=styles['Normal'], fontSize=8, textColor=colors.grey)
+    elements.append(Paragraph("1. This receipt confirms the electronic transfer of funds for the stated period.", tc_style))
+    elements.append(Paragraph("2. Any discrepancies regarding this payment must be reported to HR within 48 hours.", tc_style))
+    elements.append(Paragraph("3. This document is a valid proof of payment for tax and accounting purposes.", tc_style))
+
+    elements.append(Spacer(1, 20))
+    elements.append(Paragraph("<i>This is a computer generated receipt, no signature is required.</i>", styles['Italic']))
+
+    doc.build(elements, onLaterPages=draw_watermark, onFirstPage=draw_watermark)
+    buffer.seek(0)
+    return buffer
+
+def send_payment_receipt_email(payment):
+    """Automated email delivery of receipts"""
+    try:
+        employee = payment.employee
+        if not employee.email:
+            logger.warning(f"Cannot send receipt: Employee {employee.employee_id} has no email.")
+            return
+
+        buffer = generate_receipt_pdf_buffer(payment)
+        subject = f"Payment Receipt: {payment.payment_month or 'Salary Payment'}"
+        
+        email = EmailMessage(
+            subject=subject,
+            body=f"Dear {employee.name},\n\nYour salary payment has been processed successfully. Please find your official receipt attached.\n\nTransaction Ref: {payment.transaction_reference}\n\nThank you,\nFotasco Security Services",
+            from_email=settings.DEFAULT_FROM_EMAIL,
+            to=[employee.email],
+        )
+        
+        # Attach PDF
+        filename = f"receipt_{payment.transaction_reference[:8]}.pdf"
+        email.attach(filename, buffer.getvalue(), 'application/pdf')
+        
+        # Send
+        email.send(fail_silently=True)
+        logger.info(f"Receipt email sent to {employee.email} for payment {payment.transaction_reference}")
+    except Exception as e:
+        logger.error(f"Error sending receipt email: {e}")
 
 # ─────────────────────────────────────────
 # PAYSTACK WEBHOOK HANDLER
@@ -124,6 +362,7 @@ def paystack_webhook(request):
     signature = request.headers.get('x-paystack-signature', '')
 
     # Verify webhook signature to confirm it's from Paystack
+    logger.debug(f"Received Paystack webhook. Event: {request.data.get('event')}, Reference: {request.data.get('data', {}).get('reference')}")
     computed = hmac.new(
         paystack_secret.encode('utf-8'),
         request.body,
@@ -131,6 +370,7 @@ def paystack_webhook(request):
     ).hexdigest()
 
     if not hmac.compare_digest(computed, signature):
+        logger.error(f"Invalid Paystack webhook signature received. Computed: {computed}, Received: {signature}")
         logger.warning("Invalid Paystack webhook signature received")
         return HttpResponse(status=400)
 
@@ -139,7 +379,7 @@ def paystack_webhook(request):
         event = payload.get('event')
         data = payload.get('data', {})
         reference = data.get('reference')
-
+        
         logger.info(f"Paystack webhook received: {event} for reference={reference}")
 
         if event == 'transfer.success':
@@ -161,7 +401,7 @@ def paystack_webhook(request):
         # Always return 200 to Paystack so it doesn't retry
         return HttpResponse(status=200)
 
-    except Exception as e:
+    except Exception as e: # This catches errors in processing, but Paystack still gets 200
         logger.error(f"Webhook processing error: {e}")
         # Still return 200 so Paystack doesn't keep retrying
         return HttpResponse(status=200)
@@ -170,24 +410,25 @@ def paystack_webhook(request):
 def _handle_transfer_success(data):
     """Mark payment as completed when transfer succeeds"""
     reference = data.get('reference')
-    try:
-        payment = Payment.objects.get(transaction_reference=reference)
+    # Use select_for_update to prevent race conditions during state transition
+    with transaction.atomic():
+        try:
+            payment = Payment.objects.select_for_update().get(transaction_reference=reference)
+            logger.info(f"Handling transfer.success for payment {payment.id}, current status: {payment.status}")
 
-        if payment.status == 'completed':
-            logger.info(f"Webhook: Payment {reference} already completed, skipping")
-            return
+            # change_status handles the save operation
+            if not payment.change_status('completed'):
+                return
 
-        with transaction.atomic():
-            payment.status = 'completed'
+            # Mark pending deductions as applied so they aren't deducted again next month
+            Deduction.objects.filter(employee=payment.employee, status='pending').update(status='applied')
+
             payment.paystack_reference = str(data.get('id', ''))
             payment.save()
-
-            # Mark all pending deductions as applied
-            Deduction.objects.filter(
-                employee=payment.employee,
-                status='pending'
-            ).update(status='applied')
-
+            
+            # Automate Receipt Email
+            send_payment_receipt_email(payment)
+            
             # Notify employee
             Notification.objects.create(
                 user=payment.employee.user,
@@ -198,72 +439,76 @@ def _handle_transfer_success(data):
                 type='success'
             )
 
-        logger.info(
-            f"Transfer successful for {payment.employee.name}: "
-            f"₦{payment.net_amount}"
-        )
+            logger.info(f"Transfer successful for {payment.employee.name} (Ref: {reference}): NGN {payment.net_amount}. New status: {payment.status}")
 
-    except Payment.DoesNotExist:
-        logger.error(f"Webhook transfer.success: Payment not found for reference={reference}")
-    except Exception as e:
-        logger.error(f"Webhook _handle_transfer_success error: {e}")
+        except ValueError as ve: # Catches illegal status transitions from change_status
+            logger.warning(f"Webhook transfer.success: Illegal status transition for payment {reference}: {ve}")
+        except Payment.DoesNotExist:
+            logger.error(f"Webhook transfer.success: Payment not found for reference={reference}")
 
 
 def _handle_transfer_failed(data):
     """Mark payment as failed when transfer fails"""
     reference = data.get('reference')
-    try:
-        payment = Payment.objects.get(transaction_reference=reference)
+    with transaction.atomic():
+        try:
+            payment = Payment.objects.select_for_update().get(transaction_reference=reference)
+            logger.info(f"Handling transfer.failed for payment {payment.id}, current status: {payment.status}")
+            
+            # change_status handles the save operation
+            if not payment.change_status('failed'):
+                return
+            
+            payment.save()
 
-        if payment.status in ['completed', 'failed']:
-            return
+            # Keep deductions as 'pending' unless they are cancelled manually by deduction admin.
 
-        payment.status = 'failed'
-        payment.save()
+            Notification.objects.create(
+                user=payment.employee.user,
+                message=(
+                    f"Salary payment of ₦{payment.net_amount:,.2f} failed. "
+                    f"Please contact HR for assistance."
+                ),
+                type='warning'
+            )
 
-        Notification.objects.create(
-            user=payment.employee.user,
-            message=(
-                f"Salary payment of ₦{payment.net_amount:,.2f} failed. "
-                f"Please contact HR for assistance."
-            ),
-            type='warning'
-        )
+            logger.error(f"Transfer failed for {payment.employee.name} (Ref: {reference}). New status: {payment.status}")
 
-        logger.error(
-            f"Transfer failed for {payment.employee.name}: "
-            f"reference={reference}"
-        )
-
-    except Payment.DoesNotExist:
-        logger.error(f"Webhook transfer.failed: Payment not found for reference={reference}")
-    except Exception as e:
-        logger.error(f"Webhook _handle_transfer_failed error: {e}")
+        except ValueError as ve: # Catches illegal status transitions from change_status
+            logger.warning(f"Webhook transfer.failed: Illegal status transition for payment {reference}: {ve}")
+        except Payment.DoesNotExist:
+            logger.error(f"Webhook transfer.failed: Payment not found for reference={reference}")
 
 
 def _handle_transfer_reversed(data):
     """Mark payment as failed when transfer is reversed"""
     reference = data.get('reference')
-    try:
-        payment = Payment.objects.get(transaction_reference=reference)
-        payment.status = 'failed'
-        payment.save()
+    with transaction.atomic():
+        try:
+            payment = Payment.objects.select_for_update().get(transaction_reference=reference)
+            logger.info(f"Handling transfer.reversed for payment {payment.id}, current status: {payment.status}")
 
-        Notification.objects.create(
-            user=payment.employee.user,
-            message=(
-                f"Salary payment of ₦{payment.net_amount:,.2f} was reversed. "
-                f"Please contact HR."
-            ),
-            type='warning'
-        )
+            # change_status handles the save operation
+            if not payment.change_status('failed'):
+                return
 
-        logger.error(f"Transfer reversed for reference={reference}")
+            payment.save()
 
-    except Payment.DoesNotExist:
-        logger.error(f"Webhook transfer.reversed: Payment not found for reference={reference}")
-    except Exception as e:
-        logger.error(f"Webhook _handle_transfer_reversed error: {e}")
+            Notification.objects.create(
+                user=payment.employee.user,
+                message=(
+                    f"Salary payment of ₦{payment.net_amount:,.2f} was reversed. "
+                    f"Please contact HR."
+                ),
+                type='warning'
+            )
+
+            logger.error(f"Transfer reversed for payment {payment.employee.name} (Ref: {reference}). New status: {payment.status}")
+
+        except ValueError as ve: # Catches illegal status transitions from change_status
+            logger.warning(f"Webhook transfer.reversed: Illegal status transition for payment {reference}: {ve}")
+        except Payment.DoesNotExist:
+            logger.error(f"Webhook transfer.reversed: Payment not found for reference={reference}")
 
 
 def _handle_charge_success(data):
@@ -274,19 +519,20 @@ def _handle_charge_success(data):
     reference = data.get('reference')
     try:
         payment = Payment.objects.get(transaction_reference=reference)
+        logger.info(f"Handling charge.success for payment {payment.id}, current status: {payment.status}")
 
         if payment.status == 'completed':
             return
 
+        # This path is for charge.success, not transfer.success, so it directly sets status
         with transaction.atomic():
             payment.status = 'completed'
+            
+            # Mark pending deductions as applied
+            Deduction.objects.filter(employee=payment.employee, status='pending').update(status='applied')
+
             payment.paystack_reference = data.get('reference', '')
             payment.save()
-
-            Deduction.objects.filter(
-                employee=payment.employee,
-                status='pending'
-            ).update(status='applied')
 
             Notification.objects.create(
                 user=payment.employee.user,
@@ -294,7 +540,7 @@ def _handle_charge_success(data):
                 type='success'
             )
 
-        logger.info(f"Charge successful for reference={reference}")
+        logger.info(f"Charge successful for payment {payment.employee.name} (Ref: {reference}). New status: {payment.status}")
 
     except Payment.DoesNotExist:
         logger.error(f"Webhook charge.success: Payment not found for reference={reference}")
@@ -310,7 +556,7 @@ def _handle_charge_success(data):
 def verify_payment_status(request, reference):
     """
     Frontend polls this endpoint to check if a payment is completed/failed.
-    Also calls Paystack API as fallback if still processing.
+    Automated background status updates removed to ensure strict admin control via webhooks or manual verification.
     """
     try:
         payment = Payment.objects.get(transaction_reference=reference)
@@ -319,48 +565,6 @@ def verify_payment_status(request, reference):
             {'status': False, 'message': 'Payment not found'},
             status=status.HTTP_404_NOT_FOUND
         )
-
-    # If still processing, double-check with Paystack API
-    if payment.status == 'processing':
-        paystack = PaystackAPI()
-        
-        # For bank transfers
-        if payment.payment_method == 'bank_transfer':
-            result = paystack.verify_transfer(reference)
-            transfer_data = result.get('data', {}) if isinstance(result.get('data'), dict) else {}
-            transfer_status = transfer_data.get('status', '')
-            
-            if result.get('status') is True and transfer_status == 'success':
-                with transaction.atomic():
-                    payment.status = 'completed'
-                    payment.paystack_reference = str(transfer_data.get('id', ''))
-                    payment.save()
-                    
-                    Deduction.objects.filter(
-                        employee=payment.employee, status='pending'
-                    ).update(status='applied')
-                    
-                    Notification.objects.create(
-                        user=payment.employee.user,
-                        message=f"Salary payment of ₦{payment.net_amount:,.2f} confirmed.",
-                        type='success'
-                    )
-            elif transfer_status in ['failed', 'reversed', 'cancelled']:
-                payment.status = 'failed'
-                payment.save()
-        else:
-            # Card payments
-            result = paystack.verify_transaction(reference)
-            paystack_status = (
-                result.get('data', {}).get('status')
-                if isinstance(result.get('data'), dict) else None
-            )
-            if result.get('status') is True and paystack_status == 'success':
-                payment.status = 'completed'
-                payment.save()
-            elif paystack_status in ['failed', 'abandoned']:
-                payment.status = 'failed'
-                payment.save()
 
     return Response({
         'status': True,
@@ -459,8 +663,8 @@ class EmployeeViewSet(viewsets.ModelViewSet):
     def get_queryset(self):
         user = self.request.user
         if user.is_superuser or user.role == 'admin':
-            return Employee.objects.filter(status='active').order_by('-created_at')
-        return Employee.objects.filter(user=user, status='active').order_by('-created_at')
+            return Employee.objects.filter(status__in=['active', 'pending']).order_by('-created_at')
+        return Employee.objects.filter(user=user).order_by('-created_at')
 
     def create(self, request, *args, **kwargs):
         print("Employee create payload:", request.data)
@@ -499,35 +703,182 @@ class EmployeeViewSet(viewsets.ModelViewSet):
         logger.info(f"{request.user.username} terminated {employee.name}. Offense: {offense}")
         return Response({'message': 'Employee terminated successfully'})
 
+    @action(detail=True, methods=['post'],
+            permission_classes=[IsAuthenticated, IsSackAdmin])
+    def resign(self, request, pk=None):
+        """Process employee resignation"""
+        employee = self.get_object()
+        reason = request.data.get('reason', 'Resigned')
+
+        with transaction.atomic():
+            SackedEmployee.objects.create(
+                employee=employee,
+                date_sacked=timezone.now().date(),
+                offense=f"Resigned: {reason}",
+                terminated_by=request.user
+            )
+            employee.status = 'resigned'
+            employee.save()
+
+            Notification.objects.create(
+                user=employee.user,
+                message=f"Resignation processed for {employee.name}. Reason: {reason}",
+                type='info'
+            )
+
+        logger.info(f"Admin {request.user.username} approved resignation for {employee.name}")
+        return Response({'message': 'Resignation processed successfully'})
+
+    @action(detail=True, methods=['post'], permission_classes=[IsAdmin])
+    def resend_confirmation(self, request, pk=None):
+        """Resend registration HTML emails to admin and employee"""
+        employee = self.get_object()
+        auth_views.send_registration_notifications(employee, request)
+        
+        log_audit(
+            request.user,
+            f"Admin resent registration confirmation email for employee {employee.name} (ID: {employee.employee_id})",
+            request,
+            extra={'employee_id': str(employee.id), 'employee_name': employee.name}
+        )
+        return Response({'message': 'Confirmation emails resent successfully'})
+
+    @action(detail=True, methods=['post'], permission_classes=[IsAdmin])
+    def approve(self, request, pk=None):
+        """Approve a self-registered employee"""
+        employee = self.get_object()
+        if employee.status != 'pending':
+            return Response({'error': 'Only pending employees can be approved'}, status=status.HTTP_400_BAD_REQUEST)
+
+        with transaction.atomic():
+            employee.status = 'active'
+            employee.save()
+            
+            user = employee.user
+            user.is_active = True
+            user.save()
+
+            Notification.objects.create(
+                user=user,
+                message=f"Welcome! Your account (ID: {employee.employee_id}) has been approved and is now active.",
+                type='success'
+            )
+
+        logger.info(f"Admin {request.user.username} approved employee {employee.employee_id}")
+        return Response({'message': 'Employee approved and account activated successfully'})
+
+    @action(detail=False, methods=['post'], permission_classes=[IsAdmin])
+    def bulk_approve(self, request):
+        """Approve multiple self-registered employees at once"""
+        ids = request.data.get('ids', [])
+        if not ids:
+            return Response({'error': 'No employee IDs provided'}, status=status.HTTP_400_BAD_REQUEST)
+        
+        with transaction.atomic():
+            employees = Employee.objects.filter(id__in=ids, status='pending')
+            count = employees.count()
+            for employee in employees:
+                employee.status = 'active'
+                employee.save()
+                
+                user = employee.user
+                user.is_active = True
+                user.save()
+
+                Notification.objects.create(
+                    user=user,
+                    message=f"Welcome! Your account (ID: {employee.employee_id}) has been approved.",
+                    type='success'
+                )
+        return Response({'message': f'Successfully approved {count} employees'})
+
     @action(detail=False, methods=['get'], permission_classes=[IsAuthenticated])
     def dashboard_stats(self, request):
         """Get dashboard statistics"""
-        active_employees = Employee.objects.filter(status='active')
+        # Unified logic: Stats only count 'active' employees. Sacked/Resigned IDs remain locked.
+        active_qs = Employee.objects.filter(status='active')
+        
+        # Location filtering
+        location = request.query_params.get('location')
+        if location:
+            active_qs = active_qs.filter(location=location)
 
-        total_staff = active_employees.filter(type='staff').count()
-        total_guards = active_employees.filter(type='guard').count()
+        total_staff = active_qs.filter(type='staff').count()
+        total_guards = active_qs.filter(type='guard').count()
+        total_self_registered = active_qs.filter(is_self_registered=True).count()
 
-        total_deductions = Deduction.objects.filter(
-            status='pending'
-        ).aggregate(Sum('amount'))['amount__sum'] or 0
+        # Calculate exact financial totals for the current month
+        deduction_qs = Deduction.objects.filter(status='pending')
+        if location:
+            deduction_qs = deduction_qs.filter(employee__location=location)
+        total_deductions = deduction_qs.aggregate(Sum('amount'))['amount__sum'] or 0
 
-        total_payments = 0
-        for emp in active_employees:
-            emp_deductions = Deduction.objects.filter(
-                employee=emp, status='pending'
-            ).aggregate(Sum('amount'))['amount__sum'] or 0
-            total_payments += float(emp.salary - emp_deductions)
+        # Attendance today
+        today = timezone.now().date()
+        attendance_qs = Attendance.objects.filter(date=today)
+        if location:
+            attendance_qs = attendance_qs.filter(employee__location=location)
+            
+        attendance_stats = {
+            'present': attendance_qs.filter(status='present').count(),
+            'absent': attendance_qs.filter(status='absent').count(),
+            'leave': attendance_qs.filter(status='leave').count(),
+        }
 
-        recent_employees = Employee.objects.order_by('-created_at')[:5]
-        recent_payments = Payment.objects.order_by('-created_at')[:5]
+        current_month = timezone.now().strftime('%Y-%m')
+        payment_qs = Payment.objects.filter(
+            payment_month=current_month,
+            status='completed'
+        )
+        if location:
+            payment_qs = payment_qs.filter(employee__location=location)
+        total_paid_this_month = payment_qs.aggregate(Sum('net_amount'))['net_amount__sum'] or 0
+
+        # Monthly Salary Summary (Last 6 Months)
+        salary_summary = []
+        curr_month = today.replace(day=1)
+        for i in range(5, -1, -1):
+            m = curr_month.month - i
+            y = curr_month.year
+            while m <= 0:
+                m += 12
+                y -= 1
+            
+            target_date = curr_month.replace(year=y, month=m)
+            month_str = target_date.strftime('%b')
+            month_key = target_date.strftime('%Y-%m')
+            
+            summary_payment_qs = Payment.objects.filter(payment_month=month_key, status='completed')
+            if location:
+                summary_payment_qs = summary_payment_qs.filter(employee__location=location)
+            amount = summary_payment_qs.aggregate(Sum('net_amount'))['net_amount__sum'] or 0
+            salary_summary.append({'month': month_str, 'amount': float(amount)})
+
+        recent_payments_qs = Payment.objects.all()
+        if location:
+            recent_payments_qs = recent_payments_qs.filter(employee__location=location)
 
         return Response({
             'total_staff': total_staff,
             'total_guards': total_guards,
+            'total_self_registered': total_self_registered,
             'total_deductions': total_deductions,
-            'total_payments': total_payments,
-            'recent_employees': EmployeeSerializer(recent_employees, many=True).data,
-            'recent_payments': PaymentSerializer(recent_payments, many=True).data
+            'total_payments': total_paid_this_month,
+            'attendance_today': attendance_stats,
+            'salary_summary': salary_summary,
+            'recent_employees': EmployeeSerializer(active_qs.order_by('-created_at')[:5], many=True).data,
+            'recent_payments': PaymentSerializer(recent_payments_qs.order_by('-created_at')[:5], many=True).data
+        })
+
+    @action(detail=True, methods=['get'], permission_classes=[IsAuthenticated])
+    def net_salary(self, request, pk=None):
+        """Get specific net salary for an employee after pending deductions"""
+        employee = self.get_object()
+        pending = Deduction.objects.filter(employee=employee, status='pending').aggregate(Sum('amount'))['amount__sum'] or 0
+        return Response({
+            'base_salary': float(employee.salary),
+            'pending_deductions': float(pending),
+            'net_salary': float(employee.salary - pending)
         })
 
     @action(detail=False, methods=['post'], permission_classes=[IsAuthenticated])
@@ -544,18 +895,29 @@ class EmployeeViewSet(viewsets.ModelViewSet):
             return Response({'error': 'Insufficient permissions'}, status=status.HTTP_403_FORBIDDEN)
 
         token = secrets.token_urlsafe(32)
+        otp = ''.join(random.choices(string.digits, k=6))
+        
         export_token = ExportToken.objects.create(
             user=user,
             token=token,
             data_type='employees',
             filters=filters,
-            expires_at=timezone.now() + timezone.timedelta(minutes=10)
+            expires_at=timezone.now() + timezone.timedelta(minutes=10),
+            otp_code=otp
         )
 
-        logger.info(f"Export token created for {user.username}")
-        return Response({'token': token, 'expires_at': export_token.expires_at})
+        send_mail(
+            'Export Verification Code',
+            f'Your 2FA code for employee data export is: {otp}. Valid for 10 minutes.',
+            settings.DEFAULT_FROM_EMAIL,
+            [user.email],
+            fail_silently=False,
+        )
 
-    @action(detail=False, methods=['get'], permission_classes=[AllowAny],
+        logger.info(f"Export token created and 2FA sent for {user.username}")
+        return Response({'token': token, '2fa_required': True})
+
+    @action(detail=False, methods=['get'], permission_classes=[IsAuthenticated],
             authentication_classes=[SessionAuthentication, BasicAuthentication])
     def export_csv(self, request):
         """Export employee data as CSV using token"""
@@ -564,7 +926,7 @@ class EmployeeViewSet(viewsets.ModelViewSet):
             return Response({'error': 'Token required'}, status=status.HTTP_400_BAD_REQUEST)
 
         try:
-            export_token = ExportToken.objects.get(token=token, is_used=False)
+            export_token = ExportToken.objects.get(token=token, is_used=False, user=request.user, is_2fa_verified=True)
             if export_token.is_expired():
                 return Response({'error': 'Token expired'}, status=status.HTTP_400_BAD_REQUEST)
 
@@ -607,11 +969,34 @@ class EmployeeViewSet(viewsets.ModelViewSet):
                     employee.join_date
                 ])
 
+            # Log the bulk employee export
+            DownloadLog.objects.create(
+                user=request.user,
+                employee=None,
+                doc_type='employee_csv',
+                reference=f"Token: {token[:8]}...",
+                ip_address=get_client_ip(request)
+            )
+
             logger.info(f"Employee export completed for {export_token.user.username}")
             return response
 
         except ExportToken.DoesNotExist:
-            return Response({'error': 'Invalid token'}, status=status.HTTP_400_BAD_REQUEST)
+            return Response({'error': 'Invalid or unverified token'}, status=status.HTTP_400_BAD_REQUEST)
+
+    @action(detail=False, methods=['post'], permission_classes=[IsAuthenticated])
+    def verify_2fa(self, request):
+        token = request.data.get('token')
+        otp = request.data.get('otp')
+        try:
+            export_token = ExportToken.objects.get(token=token, user=request.user, otp_code=otp)
+            if export_token.is_expired():
+                return Response({'error': 'Token expired'}, status=400)
+            export_token.is_2fa_verified = True
+            export_token.save()
+            return Response({'success': True})
+        except ExportToken.DoesNotExist:
+            return Response({'error': 'Invalid verification code'}, status=400)
 
 
 # ─────────────────────────────────────────
@@ -637,8 +1022,6 @@ class AttendanceViewSet(viewsets.ModelViewSet):
             return Attendance.objects.none()
 
     def get_permissions(self):
-        if self.action == 'process_absence_deductions':
-            return [IsAdmin()]
         return [IsAuthenticated()]
 
     def get_throttles(self):
@@ -708,7 +1091,7 @@ class AttendanceViewSet(viewsets.ModelViewSet):
 
         attendance.clock_method = 'boxmark'  # Default boxmark for no-photo
         attendance.save()
-        logger.info(f"{request.user.username} clocked in BOXMARK")
+        logger.info(f"Clock-in (BOXMARK) recorded for {employee.name} by {request.user.username}")
         return Response({'message': 'Clocked in (boxmark) successfully', 'status': 'present'})
     
     @action(detail=False, methods=['post'], permission_classes=[IsAuthenticated])
@@ -763,6 +1146,7 @@ class AttendanceViewSet(viewsets.ModelViewSet):
         attendance.clock_in_timestamp = timezone.now()
         attendance.clock_in = timezone.now().time()
         attendance.status = 'present'
+        attendance.clock_method = 'selfie'
         attendance.save()
         logger.info(f"{request.user.username} clocked in with photo")
         return Response({'message': 'Clocked in successfully', 'status': 'present'})
@@ -784,8 +1168,9 @@ class AttendanceViewSet(viewsets.ModelViewSet):
 
         attendance.clock_out_timestamp = timezone.now()
         attendance.clock_out = timezone.now().time()
+        attendance.clock_method = 'boxmark'
         attendance.save()
-        logger.info(f"{request.user.username} clocked out without photo")
+        logger.info(f"Clock-out (BOXMARK) recorded for {employee.name} by {request.user.username}")
         return Response({'message': 'Clocked out successfully'})
 
     @action(detail=False, methods=['post'], permission_classes=[IsAuthenticated])
@@ -819,6 +1204,7 @@ class AttendanceViewSet(viewsets.ModelViewSet):
         attendance.clock_out_timestamp = timezone.now()
         attendance.clock_out = timezone.now().time()
         attendance.status = 'present'
+        attendance.clock_method = 'selfie'
         attendance.save()
         logger.info(f"{request.user.username} clocked out with photo")
         return Response({'message': 'Clocked out successfully'})
@@ -856,10 +1242,18 @@ class AttendanceViewSet(viewsets.ModelViewSet):
             attendance, created = Attendance.objects.get_or_create(
                 employee=employee,
                 date=current,
-                defaults={'status': 'leave', 'clock_in': None, 'clock_out': None}
+                defaults={
+                    'status': 'leave', 
+                    'clock_in': None, 
+                    'clock_out': None,
+                    'leave_start': start,
+                    'leave_end': end
+                }
             )
             if not created and not attendance.clock_in_timestamp:
                 attendance.status = 'leave'
+                attendance.leave_start = start
+                attendance.leave_end = end
                 attendance.save()
 
             leave_records.append({'date': current.isoformat(), 'status': attendance.status})
@@ -872,77 +1266,6 @@ class AttendanceViewSet(viewsets.ModelViewSet):
         )
 
         return Response({'message': f'Leave marked for {len(leave_records)} days', 'records': leave_records})
-
-    @action(detail=False, methods=['post'], permission_classes=[IsAdmin])
-    def process_absence_deductions(self, request):
-        end_date = timezone.now().date()
-        start_date = end_date - timezone.timedelta(days=10)
-
-        employees = Employee.objects.filter(status='active')
-        processed_deductions = []
-        errors = []
-
-        for employee in employees:
-            try:
-                attendance_dates = set(
-                    Attendance.objects.filter(
-                        employee=employee,
-                        date__range=[start_date, end_date]
-                    ).values_list('date', flat=True)
-                )
-
-                all_dates = set()
-                current_date = start_date
-                while current_date <= end_date:
-                    if current_date.weekday() < 5:
-                        all_dates.add(current_date)
-                    current_date += timezone.timedelta(days=1)
-
-                absences = sorted(all_dates - attendance_dates)
-
-                max_consecutive = 0
-                consecutive = 0
-                prev_date = None
-
-                for absence_date in absences:
-                    if prev_date is None or (absence_date - prev_date).days == 1:
-                        consecutive += 1
-                        max_consecutive = max(max_consecutive, consecutive)
-                    else:
-                        consecutive = 1
-                    prev_date = absence_date
-
-                if max_consecutive >= 3:
-                    deduction_amount = (employee.salary / 30) * max_consecutive
-                    deduction_data = {
-                        'employee': employee,
-                        'amount': deduction_amount,
-                        'reason': f'Absence deduction: {max_consecutive} consecutive days absent',
-                        'status': 'pending',
-                        'date': timezone.now().date(),
-                    }
-                    try:
-                        Deduction.objects.create(**deduction_data, created_by=request.user)
-                    except TypeError:
-                        Deduction.objects.create(**deduction_data)
-
-                    processed_deductions.append({
-                        'employee': employee.name,
-                        'consecutive_absences': max_consecutive,
-                        'deduction_amount': deduction_amount
-                    })
-                    logger.info(f"Created absence deduction for {employee.name}: {deduction_amount}")
-
-            except Exception as e:
-                errors.append(f"Error processing {employee.name}: {str(e)}")
-                logger.error(f"Error processing absence deductions for {employee.name}: {e}")
-
-        return Response({
-            'message': f'Processed deductions for {len(processed_deductions)} employees',
-            'deductions': processed_deductions,
-            'errors': errors
-        })
-
 
 # ─────────────────────────────────────────
 # PAYMENT VIEWSET
@@ -1004,12 +1327,11 @@ class PaymentViewSet(viewsets.ModelViewSet):
             permission_classes=[IsAuthenticated, IsPayrollAdmin, IsAdmin])
     def initiate_payment(self, request):
         """
-        UPDATED: Now uses Paystack Transfers (salary payout)
-        instead of initialize_transaction (card collection).
-        Flow: create/reuse recipient → initiate transfer →
-        webhook confirms success.
+        Initiate salary payment (Full or Partial)
         """
         employee_id = request.data.get('employee_id')
+        custom_amount = request.data.get('custom_amount')
+
         if not employee_id:
             return Response({'error': 'Employee ID required'}, status=status.HTTP_400_BAD_REQUEST)
 
@@ -1033,12 +1355,43 @@ class PaymentViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST
             )
 
-        with transaction.atomic():
-            pending_deductions = Deduction.objects.filter(
-                employee=employee, status='pending'
-            ).aggregate(Sum('amount'))['amount__sum'] or 0
+        # RESTRICTION: Payroll admin cannot pay themselves without HR/Superuser approval
+        if str(employee.user.id) == str(request.user.id):
+            if not (request.user.is_superuser or getattr(request.user, 'is_hr_admin', False)):
+                return Response({'error': 'Self-payment requires HR Admin or Superuser approval'}, 
+                                status=status.HTTP_403_FORBIDDEN)
 
-            net_salary = employee.salary - pending_deductions
+        with transaction.atomic():
+            # Prevent double payment per employee per month (unless failed)
+            payment_month = None
+            is_partial = False
+            total_deductions = 0
+
+            if custom_amount:
+                try:
+                    net_salary = Decimal(str(custom_amount))
+                    is_partial = True
+                    if net_salary <= 0:
+                        raise ValueError
+                except (ValueError, InvalidOperation):
+                    return Response({'error': 'Invalid custom amount'}, status=status.HTTP_400_BAD_REQUEST)
+            else:
+                payment_month = timezone.now().strftime('%Y-%m')
+                existing = Payment.objects.filter(
+                    employee=employee,
+                    payment_month=payment_month,
+                ).exclude(status='failed').exists()
+
+                if existing:
+                    return Response(
+                        {'error': f'Full salary already initiated for {payment_month}'},
+                        status=status.HTTP_400_BAD_REQUEST
+                    )
+
+                total_deductions = Deduction.objects.filter(
+                    employee=employee, status='pending'
+                ).aggregate(Sum('amount'))['amount__sum'] or 0
+                net_salary = employee.salary - total_deductions
 
             if net_salary <= 0:
                 return Response(
@@ -1049,37 +1402,50 @@ class PaymentViewSet(viewsets.ModelViewSet):
             payment = Payment.objects.create(
                 employee=employee,
                 base_salary=employee.salary,
-                total_deductions=pending_deductions,
+                total_deductions=total_deductions,
                 net_amount=net_salary,
                 transaction_reference=str(uuid.uuid4()),
                 payment_date=timezone.now().date(),
+                payment_month=payment_month,
                 processed_by=request.user,
                 status='processing',
+                is_partial=is_partial,
                 payment_method='bank_transfer'
             )
 
-            paystack = PaystackAPI()
+
+            try:
+                paystack = PaystackAPI()
+            except Exception as e:
+                logger.error(f"Paystack API Init Error: {e}")
+                return Response({'error': 'Payment service is currently unavailable'}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
 
             # Step 1: Get or create recipient
             # Reuse stored recipient_code if available to avoid duplicates
             recipient_code = getattr(employee, 'paystack_recipient_code', None)
 
             if not recipient_code:
-                recipient_result = paystack.create_recipient(
-                    name=employee.name,
-                    account_number=employee.account_number,
-                    bank_code=bank_code
-                )
-
-                if not recipient_result.get('status'):
-                    payment.status = 'failed'
-                    payment.save()
-                    return Response(
-                        {'error': f"Failed to create recipient: {recipient_result.get('message')}"},
-                        status=status.HTTP_400_BAD_REQUEST
+                try:
+                    recipient_result = paystack.create_recipient(
+                        name=employee.name,
+                        account_number=employee.account_number,
+                        bank_code=bank_code
                     )
 
-                recipient_code = recipient_result['recipient_code']
+                    if not recipient_result or not recipient_result.get('status'):
+                        payment.status = 'failed'
+                        payment.save()
+                        return Response(
+                            {'error': f"Failed to create recipient: {recipient_result.get('message') if recipient_result else 'Unknown error'}"},
+                            status=status.HTTP_400_BAD_REQUEST
+                        )
+                except Exception as e:
+                    payment.status = 'failed'
+                    payment.save()
+                    logger.error(f"Paystack Recipient Error: {e}")
+                    return Response({'error': 'Failed to communicate with payment provider'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+                recipient_code = recipient_result.get('recipient_code')
 
                 # Save recipient_code to employee if field exists
                 if hasattr(employee, 'paystack_recipient_code'):
@@ -1087,18 +1453,24 @@ class PaymentViewSet(viewsets.ModelViewSet):
                     employee.save(update_fields=['paystack_recipient_code'])
 
             # Step 2: Initiate transfer
-            transfer_result = paystack.initiate_transfer(
-                amount=int(net_salary * 100),
-                recipient_code=recipient_code,
-                reference=payment.transaction_reference,
-                reason=f"Salary - {employee.name} ({employee.employee_id})"
-            )
+            try:
+                transfer_result = paystack.initiate_transfer(
+                    amount=int(net_salary * 100),
+                    recipient_code=recipient_code,
+                    reference=payment.transaction_reference,
+                    reason=f"Salary - {employee.name} ({employee.employee_id})"
+                )
+            except Exception as e:
+                payment.status = 'failed'
+                payment.save()
+                logger.error(f"Paystack Transfer Error: {e}")
+                return Response({'error': 'Transfer initiation failed'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
             if transfer_result.get('status'):
                 transfer_status = transfer_result.get('data', {}).get('status', 'pending')
                 logger.info(
                     f"{request.user.username} initiated salary transfer for "
-                    f"{employee.name}: ₦{net_salary} (status={transfer_status})"
+                    f"{employee.name}: NGN {net_salary} (status={transfer_status})"
                 )
                 return Response({
                     'message': 'Salary transfer initiated successfully',
@@ -1134,10 +1506,21 @@ class PaymentViewSet(viewsets.ModelViewSet):
         transfers_payload = []
         errors = []
         total_amount = 0
+        current_month = timezone.now().strftime('%Y-%m')
 
         for emp_id in employee_ids:
             try:
                 employee = Employee.objects.get(id=emp_id, status='active')
+
+                # Prevent double payment in bulk
+                existing = Payment.objects.filter(
+                    employee=employee, 
+                    payment_month=current_month
+                ).exclude(status='failed').exists()
+                
+                if existing:
+                    errors.append(f"{employee.name}: Already paid or processing for {current_month}")
+                    continue
 
                 bank_code = get_employee_bank_code(employee)
                 if not bank_code:
@@ -1163,6 +1546,7 @@ class PaymentViewSet(viewsets.ModelViewSet):
                     payment_method='bank_transfer'
                 )
 
+
                 # Get or create recipient
                 recipient_code = getattr(employee, 'paystack_recipient_code', None)
                 if not recipient_code:
@@ -1180,7 +1564,7 @@ class PaymentViewSet(viewsets.ModelViewSet):
                         )
                         continue
 
-                    recipient_code = recipient_result['recipient_code']
+                    recipient_code = recipient_result.get('data', {}).get('recipient_code') or recipient_result.get('recipient_code')
                     if hasattr(employee, 'paystack_recipient_code'):
                         employee.paystack_recipient_code = recipient_code
                         employee.save(update_fields=['paystack_recipient_code'])
@@ -1241,12 +1625,12 @@ class PaymentViewSet(viewsets.ModelViewSet):
             if otp_code:
                 try:
                     otp = OTP.objects.get(reference=reference, code=otp_code, is_used=False)
-                    if otp.failed_attempts >= 3:
+                    if otp.attempt_count >= 3:
                         raise ValidationError('Too many failed OTP attempts. Request a new OTP.')
                     if otp.has_expired():
                         return Response({'error': 'OTP has expired'}, status=status.HTTP_400_BAD_REQUEST)
                     if otp.code != otp_code:
-                        otp.failed_attempts += 1
+                        otp.attempt_count += 1
                         otp.save()
                         raise ValidationError('Incorrect OTP')
                     otp.is_used = True
@@ -1271,10 +1655,6 @@ class PaymentViewSet(viewsets.ModelViewSet):
                         payment.status = 'completed'
                         payment.paystack_reference = str(transfer_data.get('id', ''))
                         payment.save()
-
-                        Deduction.objects.filter(
-                            employee=payment.employee, status='pending'
-                        ).update(status='applied')
 
                         Notification.objects.create(
                             user=payment.employee.user,
@@ -1306,10 +1686,6 @@ class PaymentViewSet(viewsets.ModelViewSet):
                         payment.status = 'completed'
                         payment.paystack_reference = verification['data'].get('reference', '')
                         payment.save()
-
-                        Deduction.objects.filter(
-                            employee=payment.employee, status='pending'
-                        ).update(status='applied')
 
                         Notification.objects.create(
                             user=payment.employee.user,
@@ -1397,11 +1773,21 @@ class PaymentViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST
             )
 
+        # Find the payment record to get Paystack refs
+        payment_record = Payment.objects.filter(
+            employee=employee, 
+            payment_month=month, 
+            status='completed'
+        ).first()
+
         month_deductions = Deduction.objects.filter(
             employee=employee, date__range=[start_date, end_date]
         )
         total_deductions = month_deductions.aggregate(Sum('amount'))['amount__sum'] or 0
         net_salary = employee.salary - total_deductions
+
+        trans_ref = payment_record.transaction_reference if payment_record else "PENDING"
+        paystack_ref = payment_record.paystack_reference if payment_record else "N/A"
 
         month_payments = Payment.objects.filter(
             employee=employee,
@@ -1435,6 +1821,8 @@ class PaymentViewSet(viewsets.ModelViewSet):
                     } for d in month_deductions
                 ]
             },
+            'transaction_reference': trans_ref,
+            'paystack_reference': paystack_ref,
             'net_salary': float(net_salary),
             'payment_status': 'Paid' if month_payments.exists() else 'Pending',
             'generated_at': timezone.now().isoformat()
@@ -1446,6 +1834,9 @@ class PaymentViewSet(viewsets.ModelViewSet):
                 <h1 style="color: #117e62; margin: 0;">FOTASCO SECURITY SERVICES</h1>
                 <h2 style="margin: 10px 0;">PAYSLIP</h2>
                 <p style="margin: 5px 0;">Month: {month}</p>
+                <div style="font-size: 0.8em; color: #666; margin-top: 5px;">
+                    Ref: {trans_ref} | Paystack: {paystack_ref}
+                </div>
             </div>
             <div class="employee-info" style="margin-bottom: 30px;">
                 <h3 style="color: #117e62; border-bottom: 1px solid #ccc;">Employee Information</h3>
@@ -1481,6 +1872,246 @@ class PaymentViewSet(viewsets.ModelViewSet):
 
         return Response({'payslip_data': payslip_data, 'payslip_html': payslip_html})
 
+    @action(detail=False, methods=['post'], permission_classes=[IsAuthenticated, IsPayrollAdmin])
+    def bulk_preview(self, request):
+        """Preview total cost before payment"""
+        ids = request.data.get('employee_ids', [])
+        employees = Employee.objects.filter(id__in=ids)
+        total = 0
+        count = 0
+        for e in employees:
+            pending = Deduction.objects.filter(employee=e, status='pending').aggregate(Sum('amount'))['amount__sum'] or 0
+            total += (e.salary - pending)
+            count += 1
+        return Response({'total_amount': float(total), 'count': count})
+
+    @action(detail=False, methods=['post'], permission_classes=[IsAuthenticated, IsPayrollAdmin])
+    def request_payslip_export(self, request):
+        """Request a secure token for PDF payslip download"""
+        password = request.data.get('password')
+        employee_id = request.data.get('employee_id')
+        month = request.data.get('month')
+
+        if not request.user.check_password(password):
+            return Response({'error': 'Invalid password'}, status=401)
+
+        token = secrets.token_urlsafe(32)
+        ExportToken.objects.create(
+            user=request.user,
+            token=token,
+            data_type='payslip',
+            filters={'employee_id': employee_id, 'month': month},
+            expires_at=timezone.now() + timedelta(minutes=10),
+            is_2fa_verified=True # Single doc exports are authorized via password
+        )
+        return Response({'token': token})
+
+    @action(detail=False, methods=['get'], permission_classes=[IsAuthenticated])
+    def download_payslip_pdf(self, request):
+        """Generate and stream the PDF payslip using ReportLab"""
+        token = request.query_params.get('token')
+        try:
+            export_token = ExportToken.objects.get(token=token, is_used=False, data_type='payslip', user=request.user, is_2fa_verified=True)
+            if export_token.is_expired():
+                return Response({'error': 'Token expired'}, status=400)
+
+            export_token.is_used = True
+            export_token.save()
+
+            employee_id = export_token.filters.get('employee_id')
+            month = export_token.filters.get('month')
+            employee = Employee.objects.get(id=employee_id)
+            
+            payment_record = Payment.objects.filter(employee=employee, payment_month=month, status='completed').first()
+
+            # Calculate financial data again on the backend for security
+            year, month_num = map(int, month.split('-'))
+            total_deductions = Deduction.objects.filter(
+                employee=employee, 
+                date__year=year, 
+                date__month=month_num
+            ).aggregate(Sum('amount'))['amount__sum'] or 0
+            net_salary = employee.salary - total_deductions
+
+            # Generate PDF
+            buffer = io.BytesIO()
+            doc = SimpleDocTemplate(buffer, pagesize=letter)
+            styles = getSampleStyleSheet()
+            elements = []
+
+            elements.append(Paragraph("FOTASCO SECURITY SERVICES", styles['Title']))
+            elements.append(Paragraph(f"PAYSLIP - {month}", styles['Heading2']))
+            if payment_record:
+                elements.append(Paragraph(f"Trans ID: {payment_record.transaction_reference}", styles['Normal']))
+                elements.append(Paragraph(f"Paystack Ref: {payment_record.paystack_reference}", styles['Normal']))
+            elements.append(Spacer(1, 12))
+
+            # Employee Info Table
+            emp_data = [
+                ["Employee ID:", employee.employee_id, "Name:", employee.name],
+                ["Location:", employee.location, "Bank:", employee.bank_name],
+                ["Account No:", employee.account_number, "Role:", employee.type.title()]
+            ]
+            t = Table(emp_data, colWidths=[100, 150, 100, 150])
+            t.setStyle(TableStyle([('GRID', (0,0), (-1,-1), 0.5, colors.grey)]))
+            elements.append(t)
+            elements.append(Spacer(1, 24))
+
+            # Salary Table
+            sal_data = [
+                ["Description", "Amount (NGN)"],
+                ["Base Salary", f"{employee.salary:,.2f}"],
+                ["Total Deductions", f"({total_deductions:,.2f})"],
+                ["NET SALARY", f"{net_salary:,.2f}"]
+            ]
+            ts = Table(sal_data, colWidths=[300, 200])
+            ts.setStyle(TableStyle([
+                ('BACKGROUND', (0,0), (1,0), colors.HexColor("#117e62")),
+                ('TEXTCOLOR', (0,0), (1,0), colors.whitesmoke),
+                ('GRID', (0,0), (-1,-1), 0.5, colors.grey),
+                ('FONTNAME', (0,3), (1,3), 'Helvetica-Bold')
+            ]))
+            elements.append(ts)
+            
+            # Log the download
+            DownloadLog.objects.create(
+                user=request.user,
+                employee=employee,
+                doc_type='payslip',
+                reference=month,
+                ip_address=get_client_ip(request)
+            )
+
+            doc.build(elements, onLaterPages=draw_watermark, onFirstPage=draw_watermark)
+            buffer.seek(0)
+            response = HttpResponse(buffer, content_type='application/pdf')
+            response['Content-Disposition'] = f'attachment; filename="payslip_{employee.employee_id}_{month}.pdf"'
+            return response
+
+        except Exception as e:
+            return Response({'error': str(e)}, status=400)
+
+    @action(detail=True, methods=['post'], permission_classes=[IsAuthenticated, IsPayrollAdmin])
+    def request_receipt_export(self, request, pk=None):
+        """Securely request a token for a payment receipt"""
+        password = request.data.get('password')
+        if not request.user.check_password(password):
+            return Response({'error': 'Invalid password'}, status=401)
+
+        token = secrets.token_urlsafe(32)
+        ExportToken.objects.create(
+            user=request.user,
+            token=token,
+            data_type='receipt',
+            filters={'payment_id': str(pk)},
+            expires_at=timezone.now() + timedelta(minutes=10),
+            is_2fa_verified=True # Single doc exports are authorized via password
+        )
+        return Response({'token': token})
+
+    @action(detail=False, methods=['get'], permission_classes=[IsAuthenticated])
+    def download_receipt_pdf(self, request):
+        """Generate and stream a professional Payment Receipt PDF"""
+        token = request.query_params.get('token')
+        try:
+            export_token = ExportToken.objects.get(token=token, is_used=False, data_type='receipt', user=request.user, is_2fa_verified=True)
+            if export_token.is_expired():
+                return Response({'error': 'Token expired'}, status=400)
+
+            export_token.is_used = True
+            export_token.save()
+
+            payment_id = export_token.filters.get('payment_id')
+            payment = Payment.objects.get(id=payment_id)
+            employee = payment.employee
+            
+            # Log the download
+            DownloadLog.objects.create(
+                user=request.user,
+                employee=employee,
+                doc_type='receipt',
+                reference=payment.transaction_reference,
+                ip_address=get_client_ip(request)
+            )
+
+            buffer = generate_receipt_pdf_buffer(payment)
+            response = HttpResponse(buffer, content_type='application/pdf')
+            filename = f"receipt_{employee.employee_id}_{payment.transaction_reference[:8]}.pdf"
+            response['Content-Disposition'] = f'attachment; filename="{filename}"'
+            return response
+
+        except Exception as e:
+            logger.error(f"Receipt Generation Error: {e}")
+            return Response({'error': str(e)}, status=400)
+
+    @action(detail=False, methods=['post'], permission_classes=[IsAuthenticated, IsPayrollAdmin])
+    def request_export(self, request):
+        """Securely request an export token for payments"""
+        password = request.data.get('password')
+        if not password or not request.user.check_password(password):
+            return Response({'error': 'Invalid password'}, status=status.HTTP_401_UNAUTHORIZED)
+        
+        token = secrets.token_urlsafe(32)
+        export_token = ExportToken.objects.create(
+            user=request.user,
+            token=token,
+            data_type='payment',
+            filters=request.data.get('filters', {}),
+            expires_at=timezone.now() + timezone.timedelta(minutes=10)
+        )
+        return Response({'token': token, 'expires_at': export_token.expires_at})
+
+    @action(detail=False, methods=['get'], permission_classes=[IsAuthenticated],
+            authentication_classes=[SessionAuthentication, BasicAuthentication])
+    def export_csv(self, request):
+        """Stream the CSV file from the server using the token"""
+        token = request.query_params.get('token')
+        try:
+            export_token = ExportToken.objects.get(token=token, is_used=False, user=request.user)
+            if export_token.is_expired():
+                return Response({'error': 'Token expired'}, status=400)
+
+            export_token.is_used = True
+            export_token.save()
+
+            response = HttpResponse(content_type='text/csv')
+            response['Content-Disposition'] = 'attachment; filename="payment_history.csv"'
+
+            writer = csv.writer(response)
+            writer.writerow([
+                'Date', 'Employee ID', 'Name', 'Bank', 'Account', 
+                'Amount', 'Method', 'Reference', 'Status'
+            ])
+
+            queryset = Payment.objects.all().order_by('-payment_date')
+            # Apply optional filters from token if needed
+            
+            for p in queryset:
+                writer.writerow([
+                    p.payment_date,
+                    p.employee.employee_id if p.employee else 'N/A',
+                    p.employee.name if p.employee else 'N/A',
+                    p.employee.bank_name if p.employee else 'N/A',
+                    p.employee.account_number if p.employee else 'N/A',
+                    p.net_amount,
+                    p.payment_method,
+                    p.transaction_reference,
+                    p.status
+                ])
+
+            # Log the payment history export
+            DownloadLog.objects.create(
+                user=request.user,
+                employee=None,
+                doc_type='payment_csv',
+                reference=f"Token: {token[:8]}...",
+                ip_address=get_client_ip(request)
+            )
+
+            return response
+        except ExportToken.DoesNotExist:
+            return Response({'error': 'Invalid token'}, status=400)
+
     def update(self, request, *args, **kwargs):
         instance = self.get_object()
         if instance.status == "completed":
@@ -1513,21 +2144,62 @@ class DeductionViewSet(viewsets.ModelViewSet):
             return Deduction.objects.filter(employee__user=user).order_by('id')
         return Deduction.objects.none()
 
+    @action(detail=False, methods=['post'], permission_classes=[IsAuthenticated, IsDeductionAdmin])
+    def bulk_approve(self, request):
+        """Approve all pending deductions for a specific month (YYYY-MM)"""
+        month_str = request.data.get('month')
+        if not month_str:
+            return Response({'error': 'Month (YYYY-MM) is required'}, status=status.HTTP_400_BAD_REQUEST)
+        
+        try:
+            year, month = map(int, month_str.split('-'))
+            with transaction.atomic():
+                queryset = Deduction.objects.filter(
+                    status='pending',
+                    date__year=year,
+                    date__month=month
+                )
+                count = queryset.count()
+                queryset.update(status='applied')
+            return Response({'message': f'Successfully approved {count} deductions for {month_str}'})
+        except Exception as e:
+            return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
     def perform_create(self, serializer):
+        apply_now = self.request.data.get('apply_now', False)
         deduction = serializer.save()
+        
+        # Logic to check if deduction is heavy (>40% of salary)
+        threshold = deduction.employee.salary * Decimal('0.4')
+        is_heavy = deduction.amount > threshold
+        
+        msg = (f"Deduction of ₦{deduction.amount:,.2f} recorded for {deduction.employee.name}. "
+               f"Status: {deduction.status}.")
+        
+        if is_heavy:
+            # Create a specific notification for admin review
+            Notification.objects.create(
+                user=None, # Global/Admin notification
+                message=f"CRITICAL: High deduction (₦{deduction.amount:,.2f}) applied to {deduction.employee.name}. Please verify net salary impact.",
+                type='warning'
+            )
+
         Notification.objects.create(
             user=deduction.employee.user,
-            message=(
-                f"Deduction added for {deduction.employee.employee_id} - "
-                f"{deduction.employee.name}: ₦{deduction.amount}. Reason: {deduction.reason}"
-            ),
+            message=msg,
             type='warning'
         )
+        return deduction
 
     @action(detail=True, methods=['put'], permission_classes=[IsAuthenticated, IsDeductionAdmin])
     def update_status(self, request, pk=None):
         deduction = self.get_object()
         new_status = request.data.get('status')
+
+        # RESTRICTION: Admin cannot cancel their own deductions
+        if str(deduction.employee.user.id) == str(request.user.id) and new_status in ['cancelled', 'terminated']:
+            return Response({'error': 'Admins cannot cancel or terminate their own deductions.'}, 
+                            status=status.HTTP_403_FORBIDDEN)
 
         if new_status not in ['pending', 'applied', 'cancelled', 'terminated']:
             return Response(
@@ -1614,6 +2286,15 @@ class CompanyViewSet(viewsets.ModelViewSet):
     serializer_class = CompanySerializer
     permission_classes = [CanViewAndEditCompany]
 
+    def destroy(self, request, *args, **kwargs):
+        """Soft delete: change status to Not Active and save reason."""
+        instance = self.get_object()
+        reason = request.data.get('reason', 'Contract manually terminated')
+        instance.status = 'terminated'
+        instance.termination_reason = reason
+        instance.save()
+        return Response({'message': 'Company marked as not active'}, status=status.HTTP_200_OK)
+
     def get_queryset(self):
         user = self.request.user
         if user.is_superuser or user.role == 'admin':
@@ -1623,6 +2304,27 @@ class CompanyViewSet(viewsets.ModelViewSet):
                 assigned_guards__user=user
             ).distinct().order_by('id')
         return Company.objects.none()
+
+    def create(self, request, *args, **kwargs):
+        """Auto-update if company with same name exists, otherwise create."""
+        name = request.data.get('name')
+        instance = Company.objects.filter(name__iexact=name).first()
+        if instance:
+            serializer = self.get_serializer(instance, data=request.data, partial=True)
+            serializer.is_valid(raise_exception=True)
+            serializer.save()
+            return Response(serializer.data, status=status.HTTP_200_OK)
+        return super().create(request, *args, **kwargs)
+
+    @action(detail=True, methods=['get'], permission_classes=[IsAuthenticated])
+    def profit(self, request, pk=None):
+        """Explicit endpoint for company profit breakdown"""
+        company = self.get_object()
+        return Response({
+            'payment_to_us': float(company.payment_to_us),
+            'total_to_guards': float(company.total_payment_to_guards),
+            'profit': float(company.profit)
+        })
 
     @action(detail=True, methods=['post'], permission_classes=[IsAuthenticated, CanViewAndEditCompany])
     def renew_contract(self, request, pk=None):
@@ -1641,6 +2343,172 @@ class CompanyViewSet(viewsets.ModelViewSet):
         return Response({'message': 'Contract terminated', 'company': CompanySerializer(company).data})
 
 
+# ─────────────────────────────────────────
+# EMPLOYEE REQUEST VIEWSET
+# ─────────────────────────────────────────
+
+class EmployeeRequestViewSet(viewsets.ModelViewSet):
+    queryset = EmployeeRequest.objects.all().order_by('-created_at')
+    serializer_class = EmployeeRequestSerializer
+    filterset_fields = ['employee', 'request_type', 'status']
+
+    def get_permissions(self):
+        # Allow authenticated users to create requests
+        if self.action == 'create':
+            return [IsAuthenticated()]
+        # Admins/RequestAdmins can view/manage all requests
+        if self.request.user.is_superuser or getattr(self.request.user, 'is_request_admin', False):
+            return [IsAuthenticated()]
+        # Employees can only view/retrieve their own requests
+        if self.action in ['list', 'retrieve']:
+            return [IsAuthenticated()]
+        # Other actions (update, delete) for admins only
+        return [IsAuthenticated(), IsAdmin()]
+
+    def get_queryset(self):
+        user = self.request.user
+        if user.is_superuser or getattr(user, 'is_request_admin', False):
+            return EmployeeRequest.objects.all().order_by('-created_at')
+        try:
+            employee = Employee.objects.get(user=user)
+            return EmployeeRequest.objects.filter(employee=employee).order_by('-created_at')
+        except Employee.DoesNotExist:
+            return EmployeeRequest.objects.none()
+
+    def perform_create(self, serializer):
+        # Ensure employee is linked to the requesting user
+        employee = getattr(self.request.user, 'employee_profile', None)
+        if not employee:
+            # If user is an admin/superuser without a profile, we must return a clear error
+            raise serializers.ValidationError({
+                "detail": "Requests can only be submitted by users with an active Employee Profile."
+            })
+        
+        # Save the request
+        req = serializer.save(employee=employee, status='pending')
+        
+        # Handle multiple proof photos
+        for f in self.request.FILES.getlist('proof_photos'):
+            EmployeeRequestAttachment.objects.create(request=req, file=f, file_type='proof')
+            
+        # Handle multiple receipt files
+        for f in self.request.FILES.getlist('receipt_files'):
+            EmployeeRequestAttachment.objects.create(request=req, file=f, file_type='receipt')
+
+        Notification.objects.create(
+            user=self.request.user,
+            message=f"Your request for {serializer.instance.request_type} has been submitted.",
+            type='info'
+        )
+
+    @action(detail=True, methods=['post'], permission_classes=[IsAuthenticated, IsAdmin])
+    def approve(self, request, pk=None):
+        req = self.get_object()
+        if req.status != 'pending':
+            return Response({'error': 'Request is not pending'}, status=status.HTTP_400_BAD_REQUEST)
+        req.status = 'approved'
+        req.action_by = request.user
+        req.save()
+        Notification.objects.create(
+            user=req.employee.user,
+            message=f"Your request for {req.request_type} has been approved.",
+            type='success'
+        )
+        return Response({'message': 'Request approved', 'status': 'approved'})
+
+    @action(detail=True, methods=['post'], permission_classes=[IsAuthenticated, IsAdmin])
+    def decline(self, request, pk=None):
+        req = self.get_object()
+        reason = request.data.get('reason', 'No reason provided')
+        req.status = 'declined'
+        req.action_by = request.user
+        req.decline_reason = reason
+        req.save()
+        Notification.objects.create(
+            user=req.employee.user,
+            message=f"Your request for {req.request_type} has been declined. Reason: {reason}",
+            type='error'
+        )
+        return Response({'message': 'Request declined', 'status': 'declined'})
+
+    @action(detail=True, methods=['get'], permission_classes=[IsAuthenticated, IsAdmin])
+    def download_attachments(self, request, pk=None):
+        """Download all attachments for a request as a ZIP file"""
+        req = self.get_object()
+        attachments = req.attachments.all()
+        
+        if not attachments:
+            return Response({'error': 'No attachments found'}, status=404)
+            
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, 'w') as zip_file:
+            for attachment in attachments:
+                if attachment.file:
+                    # Get the actual file name from the path
+                    file_name = os.path.basename(attachment.file.name)
+                    # Read file content and write to zip
+                    try:
+                        with attachment.file.open('rb') as f:
+                            zip_file.writestr(f"{attachment.file_type}_{file_name}", f.read())
+                    except Exception as e:
+                        logger.error(f"Error adding file {file_name} to zip: {e}")
+
+        buffer.seek(0)
+        response = HttpResponse(buffer, content_type='application/zip')
+        filename = f"attachments_{req.employee.employee_id}_{req.id[:8]}.zip"
+        response['Content-Disposition'] = f'attachment; filename="{filename}"'
+        return response
+
 
 def frontend(request):
     return render(request, "frontend/index.html")
+
+
+class DownloadLogViewSet(viewsets.ReadOnlyModelViewSet):
+    """
+    ViewSet for administrators to monitor document download history.
+    """
+    queryset = DownloadLog.objects.all().order_by('-timestamp')
+    serializer_class = DownloadLogSerializer
+    permission_classes = [IsAdmin]
+    filterset_fields = ['doc_type', 'employee']
+    search_fields = ['employee__name', 'employee__employee_id', 'reference', 'user__username']
+
+@api_view(['GET'])
+@permission_classes([IsAdmin])
+def system_health_check(request):
+    """
+    Monitor Paystack connectivity and pending transfer counts.
+    Only accessible to administrators.
+    """
+    paystack = PaystackAPI()
+    
+    # Check counts of transfers in the queue (by model status)
+    pending_count = Payment.objects.filter(status='pending').count()
+    processing_count = Payment.objects.filter(status='processing').count()
+    
+    health_data = {
+        'status': 'healthy',
+        'timestamp': timezone.now(),
+        'paystack_connection': 'unknown',
+        'queue': {
+            'pending_transfers': pending_count,
+            'processing_transfers': processing_count,
+        }
+    }
+    
+    # Check Paystack API connection by trying to fetch transfer balance
+    try:
+        balance_res = paystack.get_transfer_balance()
+        if balance_res.get('status'):
+            health_data['paystack_connection'] = 'connected'
+        else:
+            health_data['paystack_connection'] = 'failed'
+            health_data['status'] = 'degraded'
+            health_data['paystack_error'] = balance_res.get('message')
+    except Exception as e:
+        health_data['paystack_connection'] = 'error'
+        health_data['status'] = 'unhealthy'
+        health_data['error_detail'] = str(e)
+        
+    return Response(health_data)

@@ -28,6 +28,7 @@ const AppState = {
     payments: [],
     notifications: [],
     attendance: [],
+    downloadLogs: [],
     currentUser: null,
     accessToken: null,
     refreshToken: null,
@@ -43,7 +44,6 @@ const AppState = {
     bankList: [],
     lastVerifiedAccountKey: null,
     pendingAccountVerificationKey: null,
-    paymentPollInterval: null,
     paymentPollInterval: null,
     bulkPollInterval: null,
     
@@ -99,6 +99,42 @@ function buildUrl(url, params = {}) {
     return query ? `${url}?${query}` : url;
 }
 
+/**
+ * Client-side image compression using Canvas
+ */
+async function compressImage(file, maxWidth = 1280, maxHeight = 720, quality = 0.7) {
+    return new Promise((resolve) => {
+        const reader = new FileReader();
+        reader.readAsDataURL(file);
+        reader.onload = (event) => {
+            const img = new Image();
+            img.src = event.target.result;
+            img.onload = () => {
+                const canvas = document.createElement('canvas');
+                let width = img.width;
+                let height = img.height;
+
+                if (width > height) {
+                    if (width > maxWidth) {
+                        height *= maxWidth / width;
+                        width = maxWidth;
+                    }
+                } else {
+                    if (height > maxHeight) {
+                        width *= maxHeight / height;
+                        height = maxHeight;
+                    }
+                }
+                canvas.width = width;
+                canvas.height = height;
+                const ctx = canvas.getContext('2d');
+                ctx.drawImage(img, 0, 0, width, height);
+                canvas.toBlob((blob) => resolve(blob), 'image/jpeg', quality);
+            };
+        };
+    });
+}
+
 function idsMatch(left, right) {
     return String(left) === String(right);
 }
@@ -152,7 +188,14 @@ function hideLoading(btn, spinnerEl) {
     }
 }
 
+let lastToastInfo = { message: '', time: 0 };
+
 function showToast(message, type = 'info', duration = CONFIG.TOAST_DURATION) {
+    const now = Date.now();
+    // Prevent showing the exact same message twice within 1 second
+    if (message === lastToastInfo.message && (now - lastToastInfo.time) < 1000) return;
+    lastToastInfo = { message, time: now };
+
     const container = AppState.elements.toastContainer || document.getElementById('toastContainer');
     if (!container) {
         console.warn('Toast container not found:', message);
@@ -160,6 +203,13 @@ function showToast(message, type = 'info', duration = CONFIG.TOAST_DURATION) {
     }
     const toast = document.createElement('div');
     toast.className = `toast ${type}`;
+    
+    // Fixed styling to ensure content visibility
+    toast.style.cssText = "display: flex; flex-direction: row; align-items: center; justify-content: space-between; padding: 12px; margin-bottom: 10px; border-radius: 4px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); background: #fff; z-index: 10000; position: relative; border-left: 5px solid;";
+    
+    const colors = { success: '#28a745', error: '#dc3545', warning: '#ffc107', info: '#17a2b8' };
+    toast.style.borderLeftColor = colors[type] || colors.info;
+
     toast.innerHTML = `
         <div class="toast-content">
             <div class="toast-message">${escapeHtml(message)}</div>
@@ -178,6 +228,29 @@ function closeToast(toast) {
     setTimeout(() => toast?.remove(), 300);
 }
 
+/**
+ * Toggle the user Account dropdown menu
+ */
+function toggleUserMenu(event) {
+    if (event) event.stopPropagation();
+    const dropdown = document.querySelector('.user-menu-dropdown .dropdown-content');
+    if (dropdown) {
+        dropdown.classList.toggle('show');
+    }
+}
+
+// Global click listener to close the Account dropdown when clicking outside
+document.addEventListener('click', (e) => {
+    const dropdown = document.querySelector('.user-menu-dropdown .dropdown-content');
+    const button = document.querySelector('.dropbtn-custom');
+    
+    if (dropdown && dropdown.classList.contains('show')) {
+        if (!dropdown.contains(e.target) && !button.contains(e.target)) {
+            dropdown.classList.remove('show');
+        }
+    }
+});
+
 function showSection(id) {
     document.querySelectorAll('.content-section').forEach(sec => sec.classList.remove('active'));
     const section = document.getElementById(id);
@@ -192,6 +265,12 @@ function showSection(id) {
     // Load data for specific sections
     if (id === 'payments') {
         populatePaymentsTable();
+    }
+    if (id === 'requests') {
+        loadRequests();
+    }
+    if (id === 'audit-logs') {
+        loadDownloadLogs();
     }
 }
 
@@ -229,7 +308,7 @@ function openModal(id) {
 }
 
 function closeModal(id) {
-    if (id === 'clockInModal' && AppState.cameraStream) {
+    if ((id === 'clockInModal' || id === 'requestModal') && AppState.cameraStream) {
         AppState.cameraStream.getTracks().forEach(track => track.stop());
         AppState.cameraStream = null;
     }
@@ -248,6 +327,34 @@ function closeModal(id) {
     
     const modal = document.getElementById(id);
     if (modal) modal.classList.remove('active');
+}
+
+// ==========================================
+// IMAGE PREVIEWER
+// ==========================================
+
+function showImagePreview(src) {
+    let overlay = document.getElementById('imagePreviewOverlay');
+    if (!overlay) {
+        overlay = document.createElement('div');
+        overlay.id = 'imagePreviewOverlay';
+        overlay.className = 'image-preview-overlay';
+        overlay.innerHTML = `
+            <div class="preview-content">
+                <span class="close-preview">&times;</span>
+                <img id="previewImageFull" src="" alt="Preview">
+            </div>
+        `;
+        document.body.appendChild(overlay);
+        overlay.querySelector('.close-preview').onclick = () => overlay.classList.remove('active');
+        overlay.onclick = (e) => { if(e.target === overlay) overlay.classList.remove('active'); };
+    }
+    
+    const img = document.getElementById('previewImageFull');
+    if (img) {
+        img.src = src;
+        overlay.classList.add('active');
+    }
 }
 
 // ==========================================
@@ -318,40 +425,47 @@ async function apiRequest(url, options = {}) {
     }
 }
 
+/**
+ * Refreshes the JWT access token using the stored refresh token.
+ * Improved to handle session expiry and state cleanup.
+ */
 async function refreshAccessToken() {
     try {
-        // FIXED: Try localStorage first, then cookie
         const refreshToken = AppState.refreshToken || 
                             localStorage.getItem('refreshToken') || 
                             getCookie('refresh_token');
         
         if (!refreshToken) return false;
 
-        const response = await fetch('/api/token/refresh/', {
+        const response = await fetch('/token/refresh/', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ refresh: refreshToken })
         });
 
-        if (!response.ok) {
-            localStorage.removeItem('refreshToken');
-            return false;
+        if (response.status === 401 || response.status === 403) {
+            throw new Error('AUTH_EXPIRED');
         }
+
+        if (!response.ok) throw new Error('Refresh request failed');
 
         const data = await response.json();
         AppState.accessToken = data.access;
         localStorage.setItem('accessToken', data.access);
-        sessionStorage.setItem('accessToken', data.access);
         
-        // If new refresh token returned, update it
         if (data.refresh) {
             AppState.refreshToken = data.refresh;
             localStorage.setItem('refreshToken', data.refresh);
         }
         
         return true;
-
     } catch (err) {
+        if (err.message === 'AUTH_EXPIRED') {
+            console.warn('Session expired. Cleaning up...');
+            logout();
+        } else {
+            console.error('Token refresh network error:', err);
+        }
         return false;
     }
 }
@@ -374,7 +488,7 @@ function getCookie(name) {
 
 async function loadNigerianBanks() {
     try {
-        const res = await apiRequest('/api/paystack/banks/');
+        const res = await apiRequest('/paystack/banks/');
         if (res.success && res.data?.data) {
             AppState.bankList = res.data.data;
             populateBankSelects();
@@ -433,11 +547,12 @@ function setAccountVerificationStatus(statusEl, message, className = 'text-muted
     statusEl.className = className;
 }
 
-async function verifyBankAccountFields({ accountInput, bankSelect, holderInput, statusEl, manual = false }) {
+async function verifyBankAccountFields({ accountInput, bankSelect, holderInput, statusEl, manual = false, attempt = 1 }) {
     const accountNumber = accountInput?.value.trim();
     const selectedOption = bankSelect?.options[bankSelect.selectedIndex];
     const bankCode = selectedOption?.dataset?.code;
     const verificationKey = `${bankCode || ''}:${accountNumber || ''}`;
+    const MAX_RETRIES = 3;
 
     if (!accountNumber || !/^\d{10}$/.test(accountNumber)) {
         if (manual) showToast('Enter valid 10-digit account number', 'error');
@@ -447,27 +562,51 @@ async function verifyBankAccountFields({ accountInput, bankSelect, holderInput, 
         if (manual) showToast('Select a valid bank first', 'error');
         return false;
     }
-    if (AppState.pendingAccountVerificationKey === verificationKey) {
+    if (AppState.pendingAccountVerificationKey === verificationKey && attempt === 1) {
         if (manual) showToast('Verification already in progress', 'info');
         return false;
     }
-    if (AppState.lastVerifiedAccountKey === verificationKey && holderInput?.value.trim()) {
+    if (AppState.lastVerifiedAccountKey === verificationKey && holderInput?.value.trim() && attempt === 1) {
         setAccountVerificationStatus(statusEl, `Verified: ${holderInput.value.trim()}`, 'text-success');
         return true;
     }
 
     AppState.pendingAccountVerificationKey = verificationKey;
-    holderInput.value = 'Verifying...';
+    holderInput.value = attempt > 1 ? `Retrying (${attempt}/${MAX_RETRIES})...` : 'Verifying...';
     holderInput.disabled = true;
     holderInput.readOnly = true;
     holderInput.style.background = '#f8f9fa';
     setAccountVerificationStatus(statusEl, 'Verifying with Paystack...', 'text-info');
 
     try {
-        const res = await apiRequest('/api/paystack/verify-account/', {
+        const res = await apiRequest('/paystack/verify-account/', {
             method: 'POST',
             body: { account_number: accountNumber, bank_code: bankCode }
         });
+
+        // Handle Rate Limiting (429) with Server-Aware Exponential Backoff
+        if (res.status === 429 && attempt < MAX_RETRIES) {
+            // Use server provided retry_after or default to 5 seconds if missing
+            const serverRetryAfter = (parseInt(res.data?.retry_after) || 5) * 1000;
+            
+            // Exponential Backoff: 2s, 4s, 8s... plus a small random jitter
+            // Client Backoff: 2s, 4s, 8s... plus a small random jitter
+            const clientBackoff = (Math.pow(2, attempt) * 1000) + (Math.random() * 500);
+            
+            // Respect the server's cooling period, but don't wait less than our backoff
+            const backoffDelay = Math.max(serverRetryAfter, clientBackoff);
+            const seconds = (backoffDelay / 1000).toFixed(1);
+            
+            setAccountVerificationStatus(statusEl, `Rate limited. Retrying in ${seconds}s...`, 'text-warning');
+            
+            return new Promise(resolve => {
+                setTimeout(() => {
+                    resolve(verifyBankAccountFields({ 
+                        accountInput, bankSelect, holderInput, statusEl, manual, attempt: attempt + 1 
+                    }));
+                }, backoffDelay);
+            });
+        }
 
         if (res.success && res.data?.status === true && res.data?.data?.account_name) {
             holderInput.value = res.data.data.account_name;
@@ -481,11 +620,11 @@ async function verifyBankAccountFields({ accountInput, bankSelect, holderInput, 
         holderInput.value = '';
         holderInput.style.background = '#f8d7da';
         AppState.lastVerifiedAccountKey = null;
-        setAccountVerificationStatus(
-            statusEl,
-            res.message || res.data?.message || 'Account could not be verified. Check bank and account number.',
-            'text-danger'
-        );
+
+        const errorMsg = res.status === 429 ? 'Too many requests. Please try again in a minute.' : 
+                         (res.message || res.data?.message || 'Account could not be verified.');
+
+        setAccountVerificationStatus(statusEl, errorMsg, 'text-danger');
         if (manual) showToast(res.message || res.data?.message || 'Verification failed', 'error');
         return false;
     } catch (err) {
@@ -511,10 +650,13 @@ function setupAccountVerification({ accountInputId, bankSelectId, holderInputId,
 
     if (!accountInput || !bankSelect || !holderInput) return null;
 
+    // Strictly prevent manual input for account holder names
     holderInput.readOnly = true;
+    holderInput.style.background = '#f8f9fa';
+
     const verifyCurrentAccount = debounce(() => verifyBankAccountFields({
         accountInput, bankSelect, holderInput, statusEl
-    }), 800);
+    }), 1200);
 
     accountInput.addEventListener('input', () => {
         holderInput.value = '';
@@ -538,6 +680,30 @@ function setupAccountVerification({ accountInputId, bankSelectId, holderInputId,
     return { accountInput, bankSelect, holderInput, statusEl };
 }
 
+async function verifyBankAccountManual() {
+    const accountInput = document.getElementById('accountNumber');
+    const bankSelect = document.getElementById('accountBankName');
+    const holderInput = document.getElementById('accountHolderName');
+    const statusEl = document.getElementById('verificationStatus');
+    return verifyBankAccountFields({ accountInput, bankSelect, holderInput, statusEl, manual: true });
+}
+
+async function clearBankCache() {
+    if (!confirm('Clear all cached bank verification details? This will force new lookups for all employees.')) return;
+    
+    try {
+        showLoading();
+        const res = await apiRequest('/paystack/clear-cache/', { method: 'POST' });
+        if (res.success) {
+            showToast(res.data.message || 'Cache cleared', 'success');
+        } else {
+            showToast(res.message || 'Failed to clear cache', 'error');
+        }
+    } finally {
+        hideLoading();
+    }
+}
+
 // ==========================================
 // FIXED: AUTO BANK VERIFICATION & NAME FILL
 // ==========================================
@@ -555,165 +721,7 @@ function setupBankVerification() {
         holderInputId: 'newEmployeeAccountHolder',
         statusId: 'newEmployeeVerificationStatus'
     });
-    return;
-
-    const accountInput = document.getElementById('accountNumber');
-    const bankSelect = document.getElementById('accountBankName');
-    const holderInput = document.getElementById('accountHolderName');
-    const statusEl = document.getElementById('verificationStatus');
-    
-    if (!accountInput || !bankSelect || !holderInput) return;
-
-    const verifyCurrentAccount = debounce(async () => {
-        const accountNumber = accountInput.value.trim();
-        const selectedOption = bankSelect.options[bankSelect.selectedIndex];
-        const bankCode = selectedOption?.dataset?.code;
-        const verificationKey = `${bankCode || ''}:${accountNumber}`;
-        
-        if (accountNumber.length !== 10 || !bankCode) return;
-        if (AppState.lastVerifiedAccountKey === verificationKey) return;
-        if (AppState.pendingAccountVerificationKey === verificationKey) return;
-        AppState.pendingAccountVerificationKey = verificationKey;
-        
-        // Show verifying state
-        holderInput.placeholder = 'Verifying account...';
-        holderInput.disabled = true;
-        if (statusEl) {
-            statusEl.textContent = 'Verifying account...';
-            statusEl.className = 'text-info';
-        }
-        
-        try {
-            const res = await apiRequest('/api/paystack/verify-account/', {
-                method: 'POST',
-                body: {
-                    account_number: accountNumber,
-                    bank_code: bankCode
-                }
-            });
-            
-            // FIXED: Check Paystack response format properly
-            if (res.success && res.data?.status === true && res.data?.data?.account_name) {
-                holderInput.value = res.data.data.account_name;
-                holderInput.style.background = '#d4edda'; // Light green
-                AppState.lastVerifiedAccountKey = verificationKey;
-                if (statusEl) {
-                    statusEl.textContent = `Verified: ${res.data.data.account_name}`;
-                    statusEl.className = 'text-success';
-                }
-                showToast(`✓ Verified: ${res.data.data.account_name}`, 'success');
-            } else {
-                holderInput.value = '';
-                holderInput.style.background = '#f8d7da'; // Light red
-                const msg = res.message || res.data?.message || 'Account could not be verified. Check bank and account number.';
-                AppState.lastVerifiedAccountKey = null;
-                if (statusEl) {
-                    statusEl.textContent = msg;
-                    statusEl.className = 'text-warning';
-                }
-                holderInput.readOnly = true;
-            }
-        } catch (err) {
-            console.error('Verification error:', err);
-            holderInput.value = '';
-            holderInput.readOnly = true;
-            AppState.lastVerifiedAccountKey = null;
-            if (statusEl) {
-                statusEl.textContent = 'Verification service unavailable. Try again later.';
-                statusEl.className = 'text-warning';
-            }
-        } finally {
-            AppState.pendingAccountVerificationKey = null;
-            holderInput.disabled = false;
-            holderInput.placeholder = 'Account Holder Name';
-        }
-    }, 800);
-
-    accountInput.addEventListener('input', verifyCurrentAccount);
-    bankSelect.addEventListener('change', () => {
-        AppState.lastVerifiedAccountKey = null;
-        holderInput.value = '';
-        holderInput.style.background = '';
-        if (statusEl) {
-            statusEl.textContent = 'Enter account number and leave field to auto-verify';
-            statusEl.className = 'text-muted';
-        }
-        if (accountInput.value.trim().length === 10) {
-            verifyCurrentAccount();
-        }
-    });
 }
-
-// FIXED: Manual verify button function
-async function verifyBankAccountManual() {
-    const accountInput = document.getElementById('accountNumber');
-    const bankSelect = document.getElementById('accountBankName');
-    const holderInput = document.getElementById('accountHolderName');
-    const statusEl = document.getElementById('verificationStatus');
-    return verifyBankAccountFields({ accountInput, bankSelect, holderInput, statusEl, manual: true });
-    
-    const accountNumber = accountInput?.value.trim();
-    const selectedOption = bankSelect?.options[bankSelect.selectedIndex];
-    const bankCode = selectedOption?.dataset?.code;
-    const verificationKey = `${bankCode || ''}:${accountNumber || ''}`;
-    
-    if (!accountNumber || accountNumber.length !== 10) {
-        showToast('Enter valid 10-digit account number', 'error');
-        return;
-    }
-    if (!bankCode) {
-        showToast('Select a valid bank first', 'error');
-        return;
-    }
-    
-    holderInput.value = 'Verifying...';
-    holderInput.disabled = true;
-    statusEl.textContent = 'Verifying with Paystack...';
-    statusEl.className = 'text-info';
-    
-    try {
-        const res = await apiRequest('/api/paystack/verify-account/', {
-            method: 'POST',
-            body: { account_number: accountNumber, bank_code: bankCode }
-        });
-        
-        // FIXED: Proper Paystack response parsing
-        if (res.success && res.data?.status === true && res.data?.data?.account_name) {
-            holderInput.value = res.data.data.account_name;
-            holderInput.style.background = '#d4edda';
-            AppState.lastVerifiedAccountKey = verificationKey;
-            statusEl.textContent = `✓ Verified: ${res.data.data.account_name}`;
-            statusEl.className = 'text-success';
-            statusEl.textContent = `Verified: ${res.data.data.account_name}`;
-            showToast('Account verified successfully', 'success');
-        } else {
-            holderInput.value = '';
-            holderInput.style.background = '#f8d7da';
-            AppState.lastVerifiedAccountKey = null;
-            AppState.lastVerifiedAccountKey = null;
-            AppState.lastVerifiedAccountKey = null;
-            AppState.lastVerifiedAccountKey = null;
-            const errorMsg = res.data?.message || 'Verification failed';
-            statusEl.textContent = errorMsg;
-            statusEl.className = 'text-danger';
-            statusEl.textContent = res.message || res.data?.message || 'Verification failed';
-            holderInput.readOnly = true;
-            showToast(errorMsg, 'error');
-        }
-    } catch (err) {
-        holderInput.value = '';
-        holderInput.readOnly = true;
-        AppState.lastVerifiedAccountKey = null;
-        statusEl.textContent = 'Error verifying account. Try again later.';
-        statusEl.className = 'text-warning';
-        showToast('Verification service unavailable', 'error');
-    } finally {
-        AppState.pendingAccountVerificationKey = null;
-        holderInput.disabled = false;
-    }
-}
-
-
 
 // ==========================================
 // AUTHENTICATION
@@ -737,7 +745,7 @@ async function handleLogin(e) {
     }
 
     try {
-        const response = await fetch(`${window.location.origin}/api/login/`, {
+        const response = await fetch(`${window.location.origin}/login/`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ username, password })
@@ -810,18 +818,114 @@ function logout() {
     document.getElementById('dashboardPage')?.classList.add('hidden');
     document.getElementById('loginPage')?.classList.remove('hidden');
 }
+async function handleForgotPassword(e) {
+    if (e) e.preventDefault();
+    const email = prompt("Please enter your registered email address:");
+    if (!email) return;
+    
+    try {
+        showLoading();
+        const res = await apiRequest('/request-reset/', {
+            method: 'POST',
+            body: { email }
+        });
+        if (res.success) {
+            showToast(res.data.message, 'success');
+        } else {
+            showToast(res.message, 'error');
+        }
+    } finally {
+        hideLoading();
+    }
+}
+
+/**
+ * Handle the submission of the Forgot Password form
+ */
+async function submitForgotPassword(e) {
+    e.preventDefault();
+    const email = document.getElementById('forgotEmail')?.value.trim();
+    if (!email) {
+        showToast('Email is required', 'error');
+        return;
+    }
+
+    const btn = e.target.querySelector('button[type="submit"]');
+    try {
+        showLoading(btn);
+        const res = await apiRequest('/request-reset/', {
+            method: 'POST',
+            body: { email }
+        });
+        if (res.success) {
+            showToast(res.data.message || 'If an account exists, a reset link has been sent.', 'success');
+            closeModal('forgotPasswordModal');
+        } else {
+            showToast(res.message || 'Failed to initiate password reset', 'error');
+        }
+    } finally {
+        hideLoading(btn);
+    }
+}
+
+/**
+ * Handle the submission of the Reset Password form (using uid and token from URL)
+ */
+async function handleResetPassword(e) {
+    e.preventDefault();
+    const password = document.getElementById('resetNewPassword')?.value;
+    const confirmPassword = document.getElementById('resetConfirmPassword')?.value;
+    
+    const urlParams = new URLSearchParams(window.location.search);
+    const uid = urlParams.get('uid');
+    const token = urlParams.get('token');
+
+    if (!password || !confirmPassword) {
+        showToast('Please fill in all fields', 'error');
+        return;
+    }
+    if (password !== confirmPassword) {
+        showToast('Passwords do not match', 'error');
+        return;
+    }
+
+    const btn = e.target.querySelector('button[type="submit"]');
+    try {
+        showLoading(btn);
+        // The endpoint defined in urls.py is /reset-password/confirm/<uidb64>/<token>/
+        const res = await apiRequest(`/reset-password/confirm/${uid}/${token}/`, {
+            method: 'POST',
+            body: { password } // auth_views.py reset_password_confirm expects 'password'
+        });
+
+        if (res.success) {
+            showToast('Password reset successful! You can now login.', 'success');
+            closeModal('resetPasswordModal');
+            window.history.replaceState({}, document.title, "/"); // Clear the URL parameters
+            showLoginPage();
+        } else {
+            showToast(res.message || 'Password reset failed. The link may be expired.', 'error');
+        }
+    } finally {
+        hideLoading(btn);
+    }
+}
 
 async function loadCurrentUser() {
     try {
-        const res = await apiRequest('/api/current-user/');
+        const res = await apiRequest('/current-user/');
         if (!res.success) throw new Error(res.message);
 
         AppState.currentUser = res.data;
         
-        const el = document.getElementById('currentUserName');
+        const el = document.getElementById('welcomeUserName'); // Changed target
         if (el) {
-            el.textContent = `Welcome, ${escapeHtml(AppState.currentUser.first_name || AppState.currentUser.username)}`;
+            el.textContent = `Welcome, ${escapeHtml(AppState.currentUser.name || AppState.currentUser.username)}`;
         }
+        
+        // Clear the inside of the dropdown text if it exists
+        const dropdownName = document.querySelector('.dropbtn-custom span.user-label');
+        if (dropdownName) dropdownName.style.display = 'none';
         
         applyRolePermissions(AppState.currentUser);
         return true;
@@ -876,7 +980,7 @@ async function loadEmployees(page = 1) {
 // ADDED: EMPLOYEE DETAIL VIEW
 // ==========================================
 
-function viewEmployeeDetail(employeeId) {
+async function viewEmployeeDetail(employeeId) {
     const employee = AppState.employees.find(e => idsMatch(e.id, employeeId));
     if (!employee) {
         showToast('Employee not found', 'error');
@@ -886,12 +990,8 @@ function viewEmployeeDetail(employeeId) {
     const content = document.getElementById('employeeDetailContent');
     if (!content) return;
 
-    // Calculate pending deductions
-    const pendingDeductions = AppState.deductions
-        .filter(d => idsMatch(d.employee, employeeId) && d.status === 'pending')
-        .reduce((sum, d) => sum + Number(d.amount || 0), 0);
-
-    const netSalary = Number(employee.salary || 0) - pendingDeductions;
+    const res = await apiRequest(`/api/employees/${employeeId}/net_salary/`);
+    const netData = res.success ? res.data : { pending_deductions: 0, net_salary: employee.salary };
 
     content.innerHTML = `
         <div class="detail-grid">
@@ -927,14 +1027,89 @@ function viewEmployeeDetail(employeeId) {
                 <h4>Salary Information</h4>
                 <table class="detail-table">
                     <tr><td><strong>Base Salary:</strong></td><td>${formatCurrency(employee.salary)}</td></tr>
-                    <tr><td><strong>Pending Deductions:</strong></td><td class="text-danger">${formatCurrency(pendingDeductions)}</td></tr>
-                    <tr><td><strong>Net Salary:</strong></td><td class="text-success font-bold">${formatCurrency(netSalary)}</td></tr>
+                    <tr><td><strong>Pending Deductions:</strong></td><td class="text-danger">${formatCurrency(netData.pending_deductions)}</td></tr>
+                    <tr><td><strong>Net Salary:</strong></td><td class="text-success font-bold">${formatCurrency(netData.net_salary)}</td></tr>
                 </table>
             </div>
         </div>
     `;
     
     openModal('employeeDetailModal');
+}
+
+async function resignEmployee(empId) {
+    const reason = prompt('Enter resignation details/reason:');
+    if (reason === null) return;
+
+    try {
+        showLoading();
+        const res = await apiRequest(`/api/employees/${empId}/resign/`, {
+            method: 'POST',
+            body: { reason: reason || 'Voluntary Resignation' }
+        });
+
+        if (!res.success) throw new Error(res.message);
+
+        showToast('Resignation processed successfully', 'success');
+        await loadEmployees();
+        await loadSackedEmployees();
+        updateDashboardStats();
+    } catch (err) {
+        showToast(err.message || 'Failed to process resignation', 'error');
+    } finally {
+        hideLoading();
+    }
+}
+
+async function approveEmployee(empId) {
+    if (!confirm('Are you sure you want to approve this employee registration?')) return;
+
+    try {
+        showLoading();
+        const res = await apiRequest(`/api/employees/${empId}/approve/`, {
+            method: 'POST'
+        });
+
+        if (!res.success) throw new Error(res.message);
+
+        showToast('Employee approved successfully', 'success');
+        await loadEmployees();
+        updateDashboardStats();
+    } catch (err) {
+        showToast(err.message || 'Failed to approve employee', 'error');
+    } finally {
+        hideLoading();
+    }
+}
+
+async function bulkApproveEmployees() {
+    const checkboxes = document.querySelectorAll('.employee-checkbox:checked');
+    const ids = Array.from(checkboxes).map(cb => cb.value);
+    
+    if (!ids.length) {
+        showToast('Select at least one pending employee', 'warning');
+        return;
+    }
+
+    if (!confirm(`Are you sure you want to approve ${ids.length} employees?`)) return;
+
+    try {
+        showLoading();
+        const res = await apiRequest('/api/employees/bulk_approve/', {
+            method: 'POST',
+            body: { ids }
+        });
+
+        if (!res.success) throw new Error(res.message);
+
+        showToast(res.data.message || 'Employees approved', 'success');
+        await loadEmployees();
+        updateDashboardStats();
+    } catch (err) {
+        showToast(err.message, 'error');
+    } finally {
+        hideLoading();
+    }
 }
 
 function renderEmployees(list = []) {
@@ -948,28 +1123,49 @@ function renderEmployees(list = []) {
         return;
     }
 
+    const isAdmin = AppState.currentUser?.is_superuser || AppState.currentUser?.role === 'admin';
+
     list.forEach(emp => {
         if (!emp) return;
         const row = document.createElement('tr');
+        const isPending = emp.status === 'pending';
+        
         row.innerHTML = `
+            <td>${isPending && isAdmin ? `<input type="checkbox" class="employee-checkbox" value="${emp.id}">` : ''}</td>
             <td>${escapeHtml(emp.employee_id ?? emp.id ?? '-')}</td>
             <td>${escapeHtml(emp.name ?? '-')}</td>
             <td>${escapeHtml(emp.type ?? '-')}</td>
             <td>${escapeHtml(emp.location ?? '-')}</td>
             <td>${escapeHtml(emp.bank_name ?? '-')}</td>
             <td>${formatCurrency(emp.salary)}</td>
-            <td><span class="badge ${emp.status === 'active' ? 'bg-success' : 'bg-danger'}">${escapeHtml(emp.status || 'Active')}</span></td>
+            <td><span class="badge ${emp.status === 'active' ? 'bg-success' : emp.status === 'pending' ? 'bg-warning' : 'bg-danger'}">${escapeHtml(emp.status || 'Active')}</span></td>
             <td>
                 <button type="button" class="btn btn-sm btn-info" onclick="viewEmployeeDetail('${emp.id}')">
                     <i class="fas fa-eye"></i> View
                 </button>
+                ${emp.status === 'pending' ? `
+                    <button type="button" class="btn btn-sm btn-success" onclick="approveEmployee('${emp.id}')">
+                        <i class="fas fa-user-check"></i> Approve
+                    </button>
+                    <button type="button" class="btn btn-sm btn-outline-info" onclick="resendConfirmationMail('${emp.id}')">
+                        <i class="fas fa-envelope"></i> Resend Mail
+                    </button>
+                ` : `
                 <button type="button" class="btn btn-sm btn-success" onclick="initiateIndividualPayment('${emp.id}')">Pay</button>
+                `}
+                <button type="button" class="btn btn-sm btn-info" onclick="resignEmployee('${emp.id}')">Resign</button>
                 <button type="button" class="btn btn-sm btn-warning" onclick="showSackEmployeeModal('${emp.id}')">Sack</button>
                 <button type="button" class="btn btn-sm btn-danger" onclick="handleDelete('${emp.id}')">Delete</button>
             </td>
         `;
         tableBody.appendChild(row);
     });
+}
+
+async function fetchNextEmployeeId(type) {
+    const res = await apiRequest(buildUrl('/next-employee-id/', { type }));
+    if (res.success && res.data?.next_id) return res.data.next_id;
+    throw new Error(res.message || 'Failed to fetch next employee ID');
 }
 
 function validateEmployeePayload(payload) {
@@ -992,11 +1188,6 @@ async function handleCreateEmployee(e) {
         return Number(String(value).replace(/,/g, '').trim()) || 0;
     }
 
-        // Generate employee ID first
-    const generatedId = await fetchNextEmployeeId(
-        document.getElementById('newEmployeeType')?.value.trim()
-    );
-
     const payload = {
         name: document.getElementById('newEmployeeName')?.value.trim(),
         type: document.getElementById('newEmployeeType')?.value.trim(),
@@ -1007,8 +1198,7 @@ async function handleCreateEmployee(e) {
         bank_name: document.getElementById('newEmployeeBankName')?.value.trim(),
         bank_code: document.getElementById('newEmployeeBankName')?.selectedOptions?.[0]?.dataset?.code || '',
         account_number: document.getElementById('newEmployeeAccountNumber')?.value.trim(),
-        account_holder: document.getElementById('newEmployeeAccountHolder')?.value.trim(),
-        employee_id: generatedId  // ← ADD THIS LINE
+        account_holder: document.getElementById('newEmployeeAccountHolder')?.value.trim()
     };
 
     // Hybrid validation
@@ -1038,7 +1228,15 @@ async function handleCreateEmployee(e) {
         });
 
         if (!res.success) {
-            throw new Error(res.message || 'Failed to create employee');
+            // Improved error handling: display specific backend validation errors
+            let errorMessage = res.message || 'Failed to create employee';
+            if (res.data && typeof res.data === 'object') {
+                const fieldErrors = Object.keys(res.data)
+                    .map(key => `${key}: ${Array.isArray(res.data[key]) ? res.data[key].join(', ') : res.data[key]}`)
+                    .join('; ');
+                if (fieldErrors) errorMessage = `Validation Error: ${fieldErrors}`;
+            }
+            throw new Error(errorMessage);
         }
 
         showToast('Employee created successfully!', 'success');
@@ -1073,6 +1271,23 @@ async function handleDelete(id) {
     }
 }
 
+async function resendConfirmationMail(empId) {
+    try {
+        showLoading();
+        const res = await apiRequest(`/api/employees/${empId}/resend_confirmation/`, {
+            method: 'POST'
+        });
+
+        if (!res.success) throw new Error(res.message);
+
+        showToast('Confirmation emails resent successfully', 'success');
+    } catch (err) {
+        showToast(err.message || 'Failed to resend emails', 'error');
+    } finally {
+        hideLoading();
+    }
+}
+
 // ==========================================
 // ACCOUNT CREATION - FIXED ID GENERATION
 // ==========================================
@@ -1085,15 +1300,6 @@ async function createAccount(e) {
     function parseMoney(value) {
         return Number(String(value).replace(/,/g, '').trim()) || 0;
     }
-
-    let generatedId = document.getElementById('generatedEmployeeIdInput')?.value;
-
-    // Ensure ID exists
-    if (!generatedId) {
-        const role = document.getElementById('accountType')?.value;
-        generatedId = await fetchNextEmployeeId(role);
-    }
-
     const payload = {
         username: document.getElementById('accountUsername')?.value.trim(),
         password: document.getElementById('accountPassword')?.value,
@@ -1106,8 +1312,7 @@ async function createAccount(e) {
         bank_name: document.getElementById('accountBankName')?.value,
         bank_code: document.getElementById('accountBankName')?.selectedOptions?.[0]?.dataset?.code || '',
         account_number: document.getElementById('accountNumber')?.value.trim(),
-        account_holder: document.getElementById('accountHolderName')?.value.trim(),
-        employee_id: generatedId
+        account_holder: document.getElementById('accountHolderName')?.value.trim()
     };
 
     const validations = [
@@ -1135,16 +1340,26 @@ async function createAccount(e) {
     }
 
     try {
-        const res = await apiRequest('/api/register/', {
+        const res = await apiRequest('/register/', {
             method: 'POST',
             body: payload
         });
 
         if (!res.success) {
-            throw new Error(res.message || res.data?.error || 'Registration failed');
+            let errorMessage = res.message || res.data?.error || 'Registration failed';
+            if (res.data && typeof res.data === 'object') {
+                // Check for a top-level 'error' key first
+                if (res.data.error) errorMessage = res.data.error;
+                // Then check for field-specific errors
+                const fieldErrors = Object.keys(res.data)
+                    .filter(key => key !== 'error') // Exclude the top-level error if present
+                    .map(key => `${key}: ${Array.isArray(res.data[key]) ? res.data[key].join(', ') : res.data[key]}`).join('; ');
+                if (fieldErrors) errorMessage = `${errorMessage} ${fieldErrors}`.trim();
+            }
+            throw new Error(errorMessage);
         }
 
-        const empId = res.data?.employee?.employee_id || generatedId;
+        const empId = res.data?.employee?.employee_id;
         const createdEmployee = res.data?.employee
             ? {
                 ...res.data.employee,
@@ -1162,10 +1377,7 @@ async function createAccount(e) {
 
         showToast(`Account created! ID: ${empId}`, 'success');
 
-        document.getElementById('generatedEmployeeId').textContent = empId;
         document.getElementById('createAccountForm')?.reset();
-        const hiddenInput = document.getElementById('generatedEmployeeIdInput');
-        if (hiddenInput) hiddenInput.value = '';
         if (createdEmployee) {
             AppState.employees = [
                 createdEmployee,
@@ -1184,85 +1396,6 @@ async function createAccount(e) {
         showToast(err.message, 'error');
     } finally {
         hideLoading(btn);
-    }
-}
-
-// ==========================================
-// FIXED: EMPLOYEE ID GENERATION
-// ==========================================
-
-async function fetchNextEmployeeId(type) {
-    try {
-        const res = await apiRequest(`/api/next-employee-id/?type=${type}`);
-        if (res.success && res.data?.next_id) {
-            return res.data.next_id;
-        }
-    } catch (e) {
-        console.warn('Server ID generation failed, using local fallback:', e);
-    }
-    
-    // FIXED: Better local fallback using actual employee data
-    const prefix = type === 'staff' ? 'STAFF' : 'GRD';
-    const prefixPattern = new RegExp(`^FSS-(\\\\d+)-${prefix}$`);
-    
-    let maxNum = 0;
-    AppState.employees.forEach(emp => {
-        if (emp.employee_id && emp.type === type) {
-            const match = emp.employee_id.match(prefixPattern);
-            if (match) {
-                const num = parseInt(match[1], 10);
-                if (num > maxNum) maxNum = num;
-            }
-        }
-    });
-    
-    const nextSeq = maxNum + 1;
-    return `FSS-${String(nextSeq).padStart(3, '0')}-${prefix}`;
-}
-
-function setupEmployeeIdGeneration() {
-    const typeSelect = document.getElementById('accountType');
-    const nameInput = document.getElementById('accountName');
-    const displayEl = document.getElementById('generatedEmployeeId');
-
-    const generateId = async () => {
-        const type = typeSelect?.value;
-        const name = nameInput?.value?.trim();
-        
-        if (!type || !name) {
-            if (displayEl) {
-                displayEl.textContent = '-';
-                displayEl.style.color = '#007bff';
-            }
-            return;
-        }
-
-        if (displayEl) displayEl.textContent = 'Generating...';
-        
-        const nextId = await fetchNextEmployeeId(type);
-        
-        if (displayEl) {
-            displayEl.textContent = nextId;
-            displayEl.style.color = '#28a745';
-        }
-        
-        // Update hidden input
-        let hiddenInput = document.getElementById('generatedEmployeeIdInput');
-        if (!hiddenInput) {
-            hiddenInput = document.createElement('input');
-            hiddenInput.type = 'hidden';
-            hiddenInput.id = 'generatedEmployeeIdInput';
-            hiddenInput.name = 'employee_id';
-            document.getElementById('createAccountForm')?.appendChild(hiddenInput);
-        }
-        hiddenInput.value = nextId;
-    };
-
-    // Generate on both change and blur for better UX
-    if (typeSelect) typeSelect.addEventListener('change', generateId);
-    if (nameInput) {
-        nameInput.addEventListener('blur', generateId);
-        nameInput.addEventListener('input', debounce(generateId, 500));
     }
 }
 
@@ -1292,23 +1425,31 @@ function renderCompanies(list) {
     tbody.innerHTML = '';
     
     if (!list.length) {
-        tbody.innerHTML = '<tr><td colspan="7" class="text-center">No companies found</td></tr>';
+        tbody.innerHTML = '<tr><td colspan="12" class="text-center">No companies found</td></tr>';
         return;
     }
 
     list.forEach(company => {
         const guardsCount = Array.isArray(company.assigned_guards) ? company.assigned_guards.length : (company.guards_count || 0);
-        const paymentToUs = Number(company.payment_to_us) || 0;
-        const paymentPerGuard = Number(company.payment_per_guard) || 0;
-        const totalToGuards = paymentPerGuard * guardsCount;
-        const profit = paymentToUs - totalToGuards;
+        const totalToGuards = Number(company.total_payment_to_guards) || 0;
+        const profit = Number(company.profit) || 0;
 
         const row = document.createElement('tr');
         row.innerHTML = `
             <td>${escapeHtml(company.name)}</td>
+            <td>${escapeHtml(company.email || '-')}</td>
+            <td>${escapeHtml(company.phone || '-')}</td>
             <td>${escapeHtml(company.location)}</td>
+            <td>
+                <span class="badge ${company.status === 'active' ? 'bg-success' : 'bg-danger'}" title="${escapeHtml(company.termination_reason || '')}">
+                    ${escapeHtml(company.status === 'terminated' ? 'Not Active' : (company.status || 'Active'))}
+                </span>
+                ${company.status === 'terminated' && company.termination_reason ? `<br><small class="reason-text">${escapeHtml(company.termination_reason)}</small>` : ''}
+            </td>
+            <td>${formatDate(company.contract_start)}</td>
+            <td>${formatDate(company.contract_end)}</td>
             <td>${guardsCount}</td>
-            <td>${formatCurrency(paymentToUs)}</td>
+            <td>${formatCurrency(company.payment_to_us)}</td>
             <td>${formatCurrency(totalToGuards)}</td>
             <td class="${profit >= 0 ? 'text-success' : 'text-danger'}">${formatCurrency(profit)}</td>
             <td>
@@ -1328,27 +1469,40 @@ async function handleCreateCompany(e) {
         document.querySelectorAll('#companyAssignedGuardsContainer input[name="assigned_guards"]:checked')
     ).map(cb => cb.value);
 
+    const name = document.getElementById('companyName')?.value.trim();
+
+    // Auto-detect existing company by name if not in explicit edit mode
+    let targetId = AppState.currentEditingCompanyId;
+    if (!targetId && name) {
+        const existing = AppState.companies.find(c => c.name.toLowerCase() === name.toLowerCase());
+        if (existing) targetId = existing.id;
+    }
+
     const payload = {
-        name: document.getElementById('companyName')?.value.trim(),
+        name: name,
         location: document.getElementById('companyLocation')?.value.trim(),
-        guards_count: Number(document.getElementById('companyGuardsCount')?.value),
-        payment_to_us: Number(document.getElementById('companyPaymentToUs')?.value),
-        payment_per_guard: Number(document.getElementById('companyPaymentPerGuard')?.value),
+        email: document.getElementById('companyEmail')?.value.trim() || null,
+        phone: document.getElementById('companyPhone')?.value.trim() || null,
+        contract_start: document.getElementById('companyStartDate')?.value || null,
+        contract_end: document.getElementById('companyEndDate')?.value || null,
+        guards_count: parseInt(document.getElementById('companyGuardsCount')?.value) || 0,
+        payment_to_us: parseFloat(document.getElementById('companyPaymentToUs')?.value) || 0,
+        payment_per_guard: parseFloat(document.getElementById('companyPaymentPerGuard')?.value) || 0,
         assigned_guards: selectedGuards
     };
 
-    if (!payload.name || !payload.location || !Number.isFinite(payload.guards_count) || payload.guards_count <= 0) {
-        showToast('Please fill all company fields correctly', 'error');
+    if (!payload.name || !payload.location || payload.guards_count < 1) {
+        showToast('Please fill all required company fields (Name, Location, and at least 1 Guard)', 'error');
         return;
     }
 
     try {
         showLoading(btn);
         
-        const url = AppState.currentEditingCompanyId 
-            ? `/api/companies/${AppState.currentEditingCompanyId}/`
+        const url = targetId 
+            ? `/api/companies/${targetId}/`
             : '/api/companies/';
-        const method = AppState.currentEditingCompanyId ? 'PUT' : 'POST';
+        const method = targetId ? 'PUT' : 'POST';
 
         const res = await apiRequest(url, { method, body: payload });
         if (!res.success) throw new Error(res.message);
@@ -1368,13 +1522,17 @@ async function handleCreateCompany(e) {
 }
 
 async function deleteCompany(companyId) {
-    if (!confirm('Are you sure you want to delete this company contract?')) return;
+    const reason = prompt('Enter reason for marking this company as Not Active:');
+    if (reason === null) return;
 
     try {
-        const res = await apiRequest(`/api/companies/${companyId}/`, { method: 'DELETE' });
+        const res = await apiRequest(`/api/companies/${companyId}/`, { 
+            method: 'DELETE',
+            body: { reason: reason || 'Contract ended' }
+        });
         if (!res.success) throw new Error(res.message);
         
-        showToast('Company deleted successfully', 'success');
+        showToast('Company status updated to Not Active', 'success');
         await loadCompanies();
     } catch (err) {
         showToast(err.message || 'Failed to delete company', 'error');
@@ -1391,9 +1549,18 @@ function editCompany(companyId) {
     AppState.currentEditingCompanyId = company.id;
     document.getElementById('companyName').value = company.name || '';
     document.getElementById('companyLocation').value = company.location || '';
+    document.getElementById('companyEmail').value = company.email || '';
+    document.getElementById('companyPhone').value = company.phone || '';
+    document.getElementById('companyStartDate').value = company.contract_start || '';
+    document.getElementById('companyEndDate').value = company.contract_end || '';
     document.getElementById('companyGuardsCount').value = company.guards_count || 0;
     document.getElementById('companyPaymentToUs').value = company.payment_to_us || 0;
     document.getElementById('companyPaymentPerGuard').value = company.payment_per_guard || 0;
+
+    const title = document.getElementById('companyModalTitle');
+    const btn = document.getElementById('saveCompanyBtn');
+    if (title) title.textContent = 'Edit Company';
+    if (btn) btn.textContent = 'Update Company';
 
     populateCompanyGuards();
     
@@ -1603,18 +1770,13 @@ async function loadAttendance() {
             updateAttendanceStats(0, 0, 0);
             return;
         }
-
-        // Calculate stats
-        const today = new Date().toISOString().split('T')[0];
-        const todayRecords = list.filter(a => a.date === today);
-        const present = todayRecords.filter(a => a.status === 'present').length;
-        const absent = todayRecords.filter(a => a.status === 'absent').length;
-        const onLeave = todayRecords.filter(a => a.status === 'leave').length;
-        updateAttendanceStats(present, absent, onLeave);
-
         list.forEach(att => {
             const row = document.createElement('tr');
             const photoUrl = att.clock_in_photo ? att.clock_in_photo.replace(/^\/media\//, '/media/') : null;
+            
+            const statusText = att.status === 'leave' && att.leave_start && att.leave_end 
+                ? `Leave (${att.leave_start} to ${att.leave_end})` 
+                : `${att.status || '-'}${att.clock_method ? ` (${att.clock_method})` : ''}`;
             
             row.innerHTML = `
                 <td>${escapeHtml(att.date || '-')}</td>
@@ -1622,7 +1784,7 @@ async function loadAttendance() {
                 <td>${escapeHtml(att.employee_name || '-')}</td>
                 <td>${escapeHtml(att.clock_in_display || att.clock_in || '-')}</td>
                 <td>${escapeHtml(att.clock_out_display || att.clock_out || '-')}</td>
-                <td><span class="badge ${att.status === 'present' ? 'bg-success' : att.status === 'leave' ? 'bg-warning' : 'bg-danger'}">${escapeHtml(att.status || '-')}</span></td>
+                <td><span class="badge ${att.status === 'present' ? 'bg-success' : att.status === 'leave' ? 'bg-warning' : 'bg-danger'}">${escapeHtml(statusText)}</span></td>
                 <td>
                     ${photoUrl 
                         ? `<img src="${escapeHtml(photoUrl)}" width="40" alt="clock in" class="img-thumbnail" 
@@ -1833,7 +1995,7 @@ async function handleClockIn(e) {
 // ==========================================
 
 // ADDED: Update payment preview when employee selected
-function updatePaymentPreview() {
+async function updatePaymentPreview() {
     const employeeId = document.getElementById('paymentEmployee')?.value;
     const preview = document.getElementById('paymentPreview');
     
@@ -1848,15 +2010,12 @@ function updatePaymentPreview() {
         return;
     }
 
-    const deductions = AppState.deductions
-        .filter(d => idsMatch(d.employee, employeeId) && d.status === 'pending')
-        .reduce((sum, d) => sum + Number(d.amount || 0), 0);
-    
-    const netAmount = Number(employee.salary || 0) - deductions;
+    const res = await apiRequest(`/api/employees/${employeeId}/net_salary/`);
+    const netData = res.success ? res.data : { pending_deductions: 0, net_salary: employee.salary };
 
     document.getElementById('previewBaseSalary').textContent = formatCurrency(employee.salary);
-    document.getElementById('previewDeductions').textContent = formatCurrency(deductions);
-    document.getElementById('previewNetAmount').textContent = formatCurrency(netAmount);
+    document.getElementById('previewDeductions').textContent = formatCurrency(netData.pending_deductions);
+    document.getElementById('previewNetAmount').textContent = formatCurrency(netData.net_salary);
     document.getElementById('previewBank').textContent = employee.bank_name || '-';
     document.getElementById('previewAccount').textContent = employee.account_number || '-';
     
@@ -1885,6 +2044,8 @@ async function loadPaymentHistory() {
             const statusClass = payment.status === 'completed' ? 'text-success' : 
                                 payment.status === 'failed' ? 'text-danger' : 'text-warning';
             
+            const isCompleted = payment.status === 'completed';
+
             row.innerHTML = `
                 <td>${escapeHtml(payment.payment_date || '-')}</td>
                 <td>${escapeHtml(payment.employee_id || payment.employee || '-')}</td>
@@ -1894,9 +2055,12 @@ async function loadPaymentHistory() {
                 <td>${escapeHtml(payment.payment_method || 'Paystack')}</td>
                 <td><span class="${statusClass}">${escapeHtml(payment.status || '-')}</span></td>
                 <td>
-                    ${payment.status === 'completed' 
-                        ? '<span class="text-success"><i class="fas fa-check"></i> Paid</span>' 
-                        : `<button class="btn btn-sm btn-primary" onclick="retryPayment('${payment.id}')">Retry</button>`
+                    ${isCompleted 
+                        ? `<span class="text-success"><i class="fas fa-check"></i> Paid</span>
+                           <button type="button" class="btn btn-sm btn-outline-success" onclick="exportReceipt('${payment.id}')" title="Download Receipt">
+                             <i class="fas fa-file-invoice"></i>
+                           </button>`
+                        : `<button type="button" class="btn btn-sm btn-primary" onclick="retryPayment('${payment.transaction_reference || payment.id}')">Retry</button>`
                     }
                 </td>
             `;
@@ -1979,107 +2143,33 @@ async function processBulkPayment() {
     }
 }
 
-function startBulkPaymentPolling(payments, maxAttempts = 40, interval = 3000) {
-    // payments = [{reference, employee_name, employee_id, net_salary, bank}, ...]
-    
-    const pendingRefs = new Map(); // reference -> {employee_name, status}
-    const completedRefs = new Set();
-    const failedRefs = new Set();
-    
-    payments.forEach(p => {
-        pendingRefs.set(p.reference, {
-            employee_name: p.employee_name,
-            employee_id: p.employee_id,
-            net_salary: p.net_salary,
-            status: 'processing'
-        });
-    });
-    
+async function startBulkPaymentPolling(payments, maxAttempts = 30, interval = 3000) {
     let attempts = 0;
-    
-    // Clear any existing bulk poll
-    if (AppState.bulkPollInterval) {
-        clearInterval(AppState.bulkPollInterval);
-    }
-    
-    // Show progress toast initially
-    showToast(`Checking status for ${pendingRefs.size} payments...`, 'info');
-    
-    const pollAll = async () => {
+    let currentDelay = interval;
+    if (AppState.bulkPollInterval) clearTimeout(AppState.bulkPollInterval);
+
+    const poll = async () => {
         attempts++;
-        
-        // Poll all pending references in parallel
-        const pollPromises = Array.from(pendingRefs.keys()).map(async (reference) => {
-            try {
-                const res = await apiRequest(`/api/payments/verify-payment/${reference}/`);
-                
-                if (!res.success) return { reference, status: null };
-                
-                const paymentStatus = res.data.payment_status;
-                const paymentInfo = pendingRefs.get(reference);
-                
-                if (paymentStatus === 'completed') {
-                    completedRefs.add(reference);
-                    pendingRefs.delete(reference);
-                    showToast(`Paid: ${paymentInfo.employee_name} — ₦${paymentInfo.net_salary?.toLocaleString?.() || paymentInfo.net_salary}`, 'success', 3000);
-                    
-                } else if (paymentStatus === 'failed') {
-                    failedRefs.add(reference);
-                    pendingRefs.delete(reference);
-                    showToast(`Failed: ${paymentInfo.employee_name}`, 'error', 3000);
-                }
-                
-                return { reference, status: paymentStatus };
-                
-            } catch (err) {
-                console.error(`Poll error for ${reference}:`, err);
-                return { reference, status: null };
+        const pending = payments.filter(p => !p.done);
+
+        for (const p of pending) {
+            const res = await apiRequest(`/payments/verify-payment/${p.reference}/`);
+            if (res.success && (res.data.payment_status === 'completed' || res.data.payment_status === 'failed')) {
+                p.done = true;
+                showToast(`${p.employee_name}: ${res.data.payment_status}`, res.data.payment_status === 'completed' ? 'success' : 'error');
             }
-        });
-        
-        await Promise.all(pollPromises);
-        
-        // Calculate progress
-        const total = payments.length;
-        const completed = completedRefs.size;
-        const failed = failedRefs.size;
-        const remaining = pendingRefs.size;
-        
-        // Show progress toast every 3 attempts (every ~9 seconds)
-        if (attempts % 3 === 0 && remaining > 0) {
-            showToast(`Progress: ${completed} paid, ${failed} failed, ${remaining} pending...`, 'info', 2000);
         }
-        
-        // Refresh tables to show updated statuses
-        if (completedRefs.size > 0 || failedRefs.size > 0) {
+
+        if (payments.every(p => p.done) || attempts >= maxAttempts) {
             await loadPaymentHistory();
-            populatePaymentsTable();
-            updateDashboardStats();
+            return;
         }
-        
-        // Check if all done
-        if (pendingRefs.size === 0) {
-            clearInterval(AppState.bulkPollInterval);
-            AppState.bulkPollInterval = null;
-            
-            const finalMsg = `Bulk payment complete! ${completed} successful, ${failed} failed.`;
-            showToast(finalMsg, failed > 0 ? 'warning' : 'success', 8000);
-            
-            // Final refresh
-            await loadPaymentHistory();
-            populatePaymentsTable();
-            updateDashboardStats();
-            
-        } else if (attempts >= maxAttempts) {
-            clearInterval(AppState.bulkPollInterval);
-            AppState.bulkPollInterval = null;
-            
-            const remainingNames = Array.from(pendingRefs.values()).map(p => p.employee_name).join(', ');
-            showToast(`Timeout: ${pendingRefs.size} payments still pending. Refresh later to check.`, 'warning', 10000);
-        }
+
+        // Optimized Polling: Increase delay by 50% each time (Exponential Backoff) to save mobile data
+        currentDelay = Math.min(currentDelay * 1.5, 30000); 
+        AppState.bulkPollInterval = setTimeout(poll, currentDelay);
     };
-    pollAll();
-    AppState.bulkPollInterval = setInterval(pollAll, interval);
+    AppState.bulkPollInterval = setTimeout(poll, currentDelay);
 }
 
 // REPLACE your current initiateIndividualPayment function with this:
@@ -2120,58 +2210,26 @@ async function initiateIndividualPayment(empId) {
 
 // ADD this new function for polling:
 
-function startPaymentStatusPolling(reference, maxAttempts = 30, interval = 3000) {
+async function startPaymentStatusPolling(reference, maxAttempts = 30, interval = 3000) {
     let attempts = 0;
-    
-    showToast('Checking payment status...', 'info');
-    
-    const pollInterval = setInterval(async () => {
+    let currentDelay = interval;
+
+    const poll = async () => {
         attempts++;
-        
-        try {
-            const res = await apiRequest(`/api/payments/verify-payment/${reference}/`);
-            
-            if (!res.success) {
-                console.warn('Status check failed:', res.message);
-                if (attempts >= maxAttempts) {
-                    clearInterval(pollInterval);
-                    showToast('Payment status check timed out. Please refresh to see updates.', 'warning');
-                }
-                return;
-            }
-            
-            const paymentStatus = res.data.payment_status;
-            
-            // Update UI based on status
-            if (paymentStatus === 'completed') {
-                clearInterval(pollInterval);
-                showToast('Payment successful!', 'success');
-                await loadPaymentHistory();  // Refresh the table
-                updateDashboardStats();
-                populatePaymentsTable();  // Refresh payments page table
-                
-            } else if (paymentStatus === 'failed') {
-                clearInterval(pollInterval);
-                showToast('Payment failed or was declined.', 'error');
-                await loadPaymentHistory();
-                populatePaymentsTable();
-                
-            } else if (paymentStatus === 'pending' || paymentStatus === 'processing') {
-                // Still waiting, continue polling
-                if (attempts >= maxAttempts) {
-                    clearInterval(pollInterval);
-                    showToast('Payment is still processing. Check back later.', 'info');
-                }
-            }
-            
-        } catch (err) {
-            console.error('Polling error:', err);
-            if (attempts >= maxAttempts) {
-                clearInterval(pollInterval);
-                showToast('Could not verify payment status. Please refresh.', 'warning');
-            }
+        const res = await apiRequest(`/payments/verify-payment/${reference}/`);
+
+        if (res.success && (res.data.payment_status === 'completed' || res.data.payment_status === 'failed')) {
+            showToast(`Payment ${res.data.payment_status}`, res.data.payment_status === 'completed' ? 'success' : 'error');
+            await loadPaymentHistory();
+            return;
         }
-    }, interval);
+
+        if (attempts < maxAttempts) {
+            currentDelay = Math.min(currentDelay * 1.5, 30000);
+            setTimeout(poll, currentDelay);
+        }
+    };
+    setTimeout(poll, currentDelay);
 }
 
 // ADD this helper to stop polling when modal closes:
@@ -2192,25 +2250,74 @@ async function handleIndividualPaymentSubmit(e) {
     await initiateIndividualPayment(employeeId);
 }
 
-// ADDED: Calculate and display bulk total dynamically
-function updateBulkTotal() {
-    const checkboxes = document.querySelectorAll('#bulkPaymentModal tbody input[type="checkbox"]');
-    const selected = Array.from(checkboxes).filter(cb => cb.checked);
+async function updateBulkTotal() {
+    const checkboxes = document.querySelectorAll('#bulkPaymentModal tbody input[type="checkbox"]:checked');
+    const selectedIds = Array.from(checkboxes).map(cb => cb.value);
     
-    let total = 0;
-    selected.forEach(cb => {
-        const empId = cb.value;
-        const employee = AppState.employees.find(e => idsMatch(e.id, empId));
-        if (employee) {
-            const deductions = AppState.deductions
-                .filter(d => d.employee === empId && d.status === 'pending')
-                .reduce((sum, d) => sum + Number(d.amount || 0), 0);
-            total += Number(employee.salary || 0) - deductions;
-        }
+    if (selectedIds.length === 0) {
+        document.getElementById('bulkTotalAmount').textContent = formatCurrency(0);
+        document.getElementById('bulkTotalEmployees').textContent = 0;
+        return;
+    }
+
+    const res = await apiRequest('/api/payments/bulk_preview/', {
+        method: 'POST',
+        body: { employee_ids: selectedIds }
     });
-    
-    document.getElementById('bulkTotalAmount').textContent = formatCurrency(total);
-    document.getElementById('bulkTotalEmployees').textContent = selected.length;
+
+    if (res.success) {
+        document.getElementById('bulkTotalAmount').textContent = formatCurrency(res.data.total_amount);
+        document.getElementById('bulkTotalEmployees').textContent = res.data.count;
+    }
+}
+
+// ==========================================
+// DOWNLOAD LOGS (AUDIT)
+// ==========================================
+
+async function loadDownloadLogs(search = '') {
+    const tbody = document.getElementById('downloadLogsTableBody');
+    if (!tbody) return;
+
+    try {
+        const url = search ? buildUrl('/api/download-logs/', { search }) : '/api/download-logs/';
+        const res = await apiRequest(url);
+        
+        if (!res.success) throw new Error(res.message);
+
+        const list = res.data?.results || res.data || [];
+        AppState.downloadLogs = list;
+        
+        tbody.innerHTML = '';
+        if (!list.length) {
+            tbody.innerHTML = '<tr><td colspan="6" class="text-center">No download records found</td></tr>';
+            return;
+        }
+
+        list.forEach(log => {
+            const row = document.createElement('tr');
+            const employeeDisplay = log.employee_name 
+                ? `<strong>${escapeHtml(log.employee_name)}</strong><br><small>${escapeHtml(log.employee_id)}</small>`
+                : `<span class="text-muted"><em>Bulk/System Export</em></span>`;
+                
+            row.innerHTML = `
+                <td>${formatDate(log.timestamp)} ${new Date(log.timestamp).toLocaleTimeString()}</td>
+                <td>${escapeHtml(log.user_username || 'System')}</td>
+                <td>${employeeDisplay}</td>
+                <td><span class="badge bg-info">${log.doc_type.toUpperCase()}</span></td>
+                <td><code>${escapeHtml(log.reference)}</code></td>
+                <td><small>${escapeHtml(log.ip_address || '-')}</small></td>
+            `;
+            tbody.appendChild(row);
+        });
+    } catch (err) {
+        showToast('Failed to load audit logs', 'error');
+    }
+}
+
+function filterDownloadLogs() {
+    const query = document.getElementById('auditLogSearch')?.value;
+    loadDownloadLogs(query);
 }
 
 // ==========================================
@@ -2356,10 +2463,15 @@ async function loadNotifications() {
     }
 }
 
-function clearAllNotifications() {
-    const list = document.getElementById('notificationsList');
-    if (list) list.innerHTML = '<p class="text-muted">No notifications yet.</p>';
-    AppState.notifications = [];
+async function markAllNotificationsAsRead() {
+    try {
+        const res = await apiRequest('/api/notifications/mark_all_read/', { method: 'POST' });
+        if (!res.success) throw new Error(res.message);
+        await loadNotifications();
+        showToast('All notifications marked as read', 'success');
+    } catch (err) {
+        showToast(`Failed to update notifications: ${err.message}`, 'error');
+    }
 }
 
 // ==========================================
@@ -2388,7 +2500,14 @@ function showAddDeductionModal() {
 
 function showAddCompanyModal() {
     AppState.currentEditingCompanyId = null;
-    document.getElementById('addCompanyForm')?.reset();
+    const form = document.getElementById('addCompanyForm');
+    if (form) form.reset();
+    
+    const title = document.getElementById('companyModalTitle');
+    const btn = document.getElementById('saveCompanyBtn');
+    if (title) title.textContent = 'Add Company';
+    if (btn) btn.textContent = 'Save Company';
+
     populateCompanyGuards();
     openModal('addCompanyModal');
 }
@@ -2422,86 +2541,142 @@ function showSackEmployeeModal(empId) {
     openModal('sackEmployeeModal');
 }
 
-// ==========================================
-// UI UPDATES & HELPERS
-// ==========================================
+let salaryChart = null;
 
-function updateDashboardStats() {
-    // FIXED: Recalculate from actual data, don't rely on stale state
-    const activeEmployees = AppState.employees.filter(e => 
-        e.status === 'active' || e.status === undefined || e.status === null
-    );
+async function renderSalaryChart(data = []) {
+    const ctx = document.getElementById('salarySummaryChart')?.getContext('2d');
+    if (!ctx) return;
+
+    if (salaryChart) salaryChart.destroy();
+
+    salaryChart = new Chart(ctx, {
+        type: 'line',
+        data: {
+            labels: data.map(d => d.month),
+            datasets: [{
+                label: 'Salary Expenditure (₦)',
+                data: data.map(d => d.amount),
+                borderColor: '#117e62',
+                backgroundColor: 'rgba(17, 126, 98, 0.1)',
+                fill: true,
+                tension: 0.4
+            }]
+        },
+        options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            plugins: { legend: { display: false } },
+            scales: { y: { beginAtZero: true } }
+        }
+    });
+}
+
+async function updateDashboardStats() {
+    const res = await apiRequest('/api/employees/dashboard_stats/');
+    if (!res.success) return;
+
+    const stats = res.data;
     
-    const totalStaff = activeEmployees.filter(e => e.type === 'staff').length;
-    const totalGuards = activeEmployees.filter(e => e.type === 'guard').length;
-    
-    // Calculate total deductions (pending only)
-    const totalDeductions = (AppState.deductions || []).reduce((sum, d) => {
-        return d.status === 'pending' ? sum + Number(d.amount || 0) : sum;
-    }, 0);
-    
-    // Calculate total payments (net salaries after pending deductions)
-    const totalPayments = activeEmployees.reduce((sum, emp) => {
-        const salary = Number(String(emp.salary).replace(/,/g, '').trim()) || 0;
-        const empDeductions = (AppState.deductions || [])
-            .filter(d => d.employee === emp.id && d.status === 'pending')
-            .reduce((sum, d) => sum + Number(d.amount || 0), 0);
-        return sum + (salary - empDeductions);
-    }, 0);
+    // Update Chart
+    if (stats.salary_summary) renderSalaryChart(stats.salary_summary);
+
+    // NEW: Update health check
+    const healthRes = await apiRequest('/health-check/');
+    if (healthRes.success) updateHealthStatusUI(healthRes.data);
 
     const elements = {
         totalStaff: document.getElementById('totalStaff'),
         totalGuards: document.getElementById('totalGuards'),
+        totalSelfRegistered: document.getElementById('totalSelfRegistered'),
         totalPayments: document.getElementById('totalPayments'),
-        totalDeductions: document.getElementById('totalDeductions')
+        totalDeductions: document.getElementById('totalDeductions'),
+        monthlyPayments: document.getElementById('monthlyPayments')
     };
 
-    if (elements.totalStaff) elements.totalStaff.textContent = totalStaff.toLocaleString();
-    if (elements.totalGuards) elements.totalGuards.textContent = totalGuards.toLocaleString();
-    if (elements.totalPayments) elements.totalPayments.textContent = formatCurrency(totalPayments);
-    if (elements.totalDeductions) elements.totalDeductions.textContent = formatCurrency(totalDeductions);
+    if (elements.totalStaff) elements.totalStaff.textContent = (stats.total_staff || 0).toLocaleString();
+    if (elements.totalGuards) elements.totalGuards.textContent = (stats.total_guards || 0).toLocaleString();
+    if (elements.totalSelfRegistered) elements.totalSelfRegistered.textContent = (stats.total_self_registered || 0).toLocaleString();
+    if (elements.totalPayments) elements.totalPayments.textContent = formatCurrency(stats.total_payments || 0);
+    if (elements.totalDeductions) elements.totalDeductions.textContent = formatCurrency(stats.total_deductions || 0);
+    if (elements.monthlyPayments) elements.monthlyPayments.textContent = formatCurrency(stats.total_payments || 0);
 
-    // FIXED: Also update monthly payments display
-    const monthlyEl = document.getElementById('monthlyPayments');
-    if (monthlyEl) monthlyEl.textContent = formatCurrency(totalPayments);
+    const pendingAlert = document.getElementById('pendingApprovalsAlert');
+    if (pendingAlert) {
+        if (stats.total_self_registered > 0) {
+            pendingAlert.classList.remove('hidden');
+            document.getElementById('pendingCount').textContent = stats.total_self_registered;
+        } else {
+            pendingAlert.classList.add('hidden');
+        }
+    }
 
-    updateRecentActivity();
+    if (stats.attendance_today) {
+        updateAttendanceStats(
+            stats.attendance_today.present,
+            stats.attendance_today.absent,
+            stats.attendance_today.leave
+        );
+    }
+
+    updateRecentActivity(stats.recent_employees, stats.recent_payments);
 }
 
-function updateRecentActivity() {
+/**
+ * Periodically check system health (Paystack connectivity)
+ */
+function initHealthPoller() {
+    // Check every 2 minutes
+    setInterval(async () => {
+        const res = await apiRequest('/health-check/');
+        if (res.success) updateHealthStatusUI(res.data);
+    }, 120000);
+}
+
+function updateHealthStatusUI(data) {
+    const indicator = document.getElementById('paystackHealthIndicator');
+    if (!indicator) return;
+    
+    const isHealthy = data.paystack_connection === 'connected';
+    indicator.className = `health-badge ${isHealthy ? 'healthy' : 'degraded'}`;
+    indicator.innerHTML = `
+        <i class="fas fa-circle"></i> 
+        Paystack: ${data.paystack_connection.toUpperCase()} 
+        ${data.queue.pending_transfers > 0 ? `(${data.queue.pending_transfers} in queue)` : ''}
+    `;
+}
+
+async function initiatePartialPayment(empId) {
+    const amount = prompt("Enter available amount to pay (Leave blank for full amount):");
+    const res = await apiRequest('/api/payments/initiate_payment/', {
+        method: 'POST',
+        body: { employee_id: empId, custom_amount: amount }
+    });
+    if (res.success) {
+        showToast(`Partial payment of ${formatCurrency(amount)} initiated`, 'success');
+        loadPaymentHistory();
+    }
+}
+function updateRecentActivity(recentEmployees = [], recentPayments = []) {
     const container = document.getElementById('recentActivityList');
     if (!container) return;
 
     const activities = [];
-    
-    // Add recent employees
-    (AppState.employees || []).slice(-3).forEach(e => {
+
+    recentEmployees.forEach(e => {
         activities.push({
             text: `${e.type === 'staff' ? 'Staff' : 'Guard'} added: ${e.name}`,
-            date: new Date().toLocaleDateString(),
+            date: formatDate(e.created_at),
             type: 'success'
         });
     });
-    
-    // Add recent payments
-    (AppState.payments || []).slice(-3).forEach(p => {
+
+    recentPayments.forEach(p => {
         activities.push({
             text: `Payment ${p.status}: ${p.employee_name || 'Unknown'}`,
-            date: p.payment_date,
+            date: formatDate(p.payment_date),
             type: p.status === 'completed' ? 'success' : 'warning'
         });
     });
-    
-    // Add recent deductions
-    (AppState.deductions || []).slice(-3).forEach(d => {
-        activities.push({
-            text: `Deduction ${d.status}: ${d.employee_name || 'Unknown'}`,
-            date: d.date,
-            type: d.status === 'applied' ? 'success' : 'warning'
-        });
-    });
-
-    activities.sort((a, b) => new Date(b.date) - new Date(a.date)).slice(0, 5);
 
     if (!activities.length) {
         container.innerHTML = '<p class="text-muted">No recent activity</p>';
@@ -2594,17 +2769,19 @@ function populateBulkTable() {
     tbody.innerHTML = '';
     
     if (!AppState.employees.length) {
-        tbody.innerHTML = '<tr><td colspan="5" class="text-center">No employees available</td></tr>';
+        tbody.innerHTML = '<tr><td colspan="9" class="text-center">No employees available</td></tr>';
         return;
     }
     
     const activeEmployees = AppState.employees.filter(e => e.status === 'active' || !e.status);
+    const currentMonth = new Date().toISOString().slice(0, 7); // YYYY-MM
     
     activeEmployees.forEach(emp => {
-        const deductions = AppState.deductions
-            .filter(d => d.employee === emp.id && d.status === 'pending')
-            .reduce((sum, d) => sum + Number(d.amount || 0), 0);
-        const netSalary = Number(emp.salary || 0) - deductions;
+        // Find if a payment exists for this employee in the current month
+        const monthlyPayment = (AppState.payments || []).find(p => 
+            idsMatch(p.employee, emp.id) && p.payment_month === currentMonth
+        );
+        const netSalary = emp.net_salary || 0;
         
         const row = document.createElement('tr');
         row.innerHTML = `
@@ -2625,21 +2802,39 @@ function populatePaymentsTable() {
     if (!tbody) return;
 
     tbody.innerHTML = '';
-    
+
     if (!AppState.employees.length) {
-        tbody.innerHTML = '<tr><td colspan="8" class="text-center">No employees available</td></tr>';
+        tbody.innerHTML = '<tr><td colspan="9" class="text-center">No employees available</td></tr>';
         return;
     }
     
     const activeEmployees = AppState.employees.filter(e => e.status === 'active' || !e.status);
+    const currentMonth = new Date().toISOString().slice(0, 7); // YYYY-MM
     
     activeEmployees.forEach(emp => {
-        const deductions = AppState.deductions
-            .filter(d => d.employee === emp.id && d.status === 'pending')
-            .reduce((sum, d) => sum + Number(d.amount || 0), 0);
+        // Find if a payment exists for this employee in the current month
+        const monthlyPayment = (AppState.payments || []).find(p => 
+            idsMatch(p.employee, emp.id) && p.payment_month === currentMonth
+        );
         const baseSalary = Number(emp.salary || 0);
-        const netSalary = baseSalary - deductions;
+        const netSalary = emp.net_salary || 0;
+        const deductions = baseSalary - netSalary;
         
+        let statusBadge = '<span class="badge bg-secondary">Not Paid</span>';
+        let actionBtn = `<button type="button" class="btn btn-sm btn-success" onclick="initiateIndividualPayment('${emp.id}')">Pay</button>`;
+
+        if (monthlyPayment) {
+            const s = monthlyPayment.status;
+            const statusClass = s === 'completed' ? 'bg-success' : s === 'failed' ? 'bg-danger' : 'bg-warning';
+            statusBadge = `<span class="badge ${statusClass}">${s.toUpperCase()}</span>`;
+            
+            if (s === 'completed') {
+                actionBtn = '<span class="text-success"><i class="fas fa-check-circle"></i> Paid</span>';
+            } else if (s === 'processing' || s === 'pending') {
+                actionBtn = `<button type="button" class="btn btn-sm btn-info" onclick="retryPayment('${monthlyPayment.transaction_reference}')">Checking...</button>`;
+            }
+        }
+
         const row = document.createElement('tr');
         row.innerHTML = `
             <td><input type="checkbox" value="${emp.id}" class="payment-checkbox" onchange="updatePaymentSelection()"></td>
@@ -2649,9 +2844,8 @@ function populatePaymentsTable() {
             <td>${formatCurrency(baseSalary)}</td>
             <td>${formatCurrency(deductions)}</td>
             <td>${formatCurrency(netSalary)}</td>
-            <td>
-                <button type="button" class="btn btn-sm btn-success" onclick="initiateIndividualPayment('${emp.id}')">Pay</button>
-            </td>
+            <td>${statusBadge}</td>
+            <td>${actionBtn}</td>
         `;
         tbody.appendChild(row);
     });
@@ -2733,6 +2927,48 @@ async function verifyOTP() {
         await loadPaymentHistory();
     } catch (err) {
         showToast('OTP verification failed', 'error');
+    } finally {
+        hideLoading(btn);
+    }
+}
+
+// ADDED: Function to handle password change submission
+async function handleChangePassword(e) {
+    e.preventDefault();
+    const btn = e.target.querySelector('button[type="submit"]');
+
+    const oldPassword = document.getElementById('oldPassword')?.value;
+    const newPassword = document.getElementById('newPassword')?.value;
+    const confirmPassword = document.getElementById('confirmPassword')?.value;
+
+    if (!oldPassword || !newPassword || !confirmPassword) {
+        showToast('All password fields are required', 'error');
+        return;
+    }
+
+    if (newPassword !== confirmPassword) {
+        showToast('New passwords do not match', 'error');
+        return;
+    }
+
+    if (newPassword.length < 8) {
+        showToast('New password must be at least 8 characters long', 'error');
+        return;
+    }
+
+    try {
+        showLoading(btn);
+        const res = await apiRequest('/change-password/', {
+            method: 'POST',
+            body: { old_password: oldPassword, new_password: newPassword, confirm_password: confirmPassword }
+        });
+
+        if (!res.success) throw new Error(res.message);
+
+        showToast(res.data?.message || 'Password changed successfully!', 'success');
+        closeModal('changePasswordModal');
+    } catch (err) {
+        showToast(err.message || 'Failed to change password', 'error');
     } finally {
         hideLoading(btn);
     }
@@ -2850,6 +3086,9 @@ function exportAllEmployees() {
     const modal = document.getElementById('exportPasswordModal');
     if (modal) {
         modal.dataset.exportType = 'employees';
+        // Populate username for password manager autofill
+        const usernameInput = document.getElementById('exportUsername');
+        if (usernameInput) usernameInput.value = AppState.currentUser?.username || '';
     }
     openModal('exportPasswordModal');
 }
@@ -2858,136 +3097,102 @@ function exportPaymentHistory() {
     const modal = document.getElementById('exportPasswordModal');
     if (modal) {
         modal.dataset.exportType = 'payments';
+        // Populate username for password manager autofill
+        const usernameInput = document.getElementById('exportUsername');
+        if (usernameInput) usernameInput.value = AppState.currentUser?.username || '';
     }
     openModal('exportPasswordModal');
 }
 
-function exportPaymentHistory() {
-    const modal = document.getElementById('exportPasswordModal');
-    if (modal) {
-        modal.dataset.exportType = 'payments';
+async function triggerSecureDownload(url, token, filename) {
+    try {
+        const fullUrl = `${url}?token=${token}`;
+        const accessToken = AppState.accessToken || localStorage.getItem('accessToken');
+        const response = await fetch(fullUrl, {
+            headers: { 'Authorization': `Bearer ${accessToken}` }
+        });
+        
+        if (!response.ok) throw new Error('Authorization failed or token expired');
+        
+        const blob = await response.blob();
+        const downloadUrl = window.URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = downloadUrl;
+        a.download = filename;
+        document.body.appendChild(a);
+        a.click();
+        window.URL.revokeObjectURL(downloadUrl);
+        a.remove();
+    } catch (err) {
+        showToast('Download Error: ' + err.message, 'error');
     }
-    openModal('exportPasswordModal');
 }
 
-function confirmExport() {
+async function confirmExport() {
     const password = document.getElementById('exportPassword')?.value;
+    const modal = document.getElementById('exportPasswordModal');
+    const type = modal?.dataset.exportType;
+
     if (!password) {
-        showToast('Password required', 'error');
+        showToast('Password is required', 'warning');
         return;
     }
 
-    apiRequest('/api/verify-password/', {
-        method: 'POST',
-        body: { password }
-    }).then(res => {
-        if (res.valid) {
-            const modal = document.getElementById('exportPasswordModal');
-            const exportType = modal?.dataset.exportType || 'employees';
-            
-            // Check if this is for payslip download
-            if (modal && modal.dataset.pendingPayslipHtml) {
-                const html = modal.dataset.pendingPayslipHtml;
-                const employeeId = modal.dataset.pendingEmployeeId;
-                const month = modal.dataset.pendingMonth;
-                
-                // Clear the temporary data
-                delete modal.dataset.pendingPayslipHtml;
-                delete modal.dataset.pendingEmployeeId;
-                delete modal.dataset.pendingMonth;
-                
-                // Download the payslip
-                const element = document.createElement('div');
-                element.innerHTML = html;
-                element.style.padding = '20px';
-                document.body.appendChild(element);
-                
-                const opt = {
-                    margin: 1,
-                    filename: `payslip_${employeeId}_${month}.pdf`,
-                    image: { type: 'jpeg', quality: 0.98 },
-                    html2canvas: { scale: 2 },
-                    jsPDF: { unit: 'in', format: 'letter', orientation: 'portrait' }
-                };
+    let url = type === 'payments' ? '/api/payments/request_export/' : '/api/employees/request_export/';
+    let payload = { password };
+    let downloadFilename = type === 'payments' ? 'payment_history.csv' : 'employees.csv';
 
-                html2pdf().set(opt).from(element).save().then(() => {
-                    element.remove();
+    if (type === 'payslip') {
+        url = '/api/payments/request_payslip_export/';
+        payload.employee_id = modal.dataset.employeeId;
+        payload.month = modal.dataset.month;
+        downloadFilename = `payslip_${modal.dataset.month}.pdf`;
+    } else if (type === 'receipt') {
+        url = `/api/payments/${modal.dataset.paymentId}/request_receipt_export/`;
+        downloadFilename = `receipt_${modal.dataset.paymentId.slice(0,8)}.pdf`;
+    }
+
+    const btn = document.getElementById('confirmExportBtn');
+    try {
+        showLoading(btn);
+        const res = await apiRequest(url, { method: 'POST', body: payload });
+
+        if (res.success) {
+            if (res.data['2fa_required']) {
+                const otp = prompt("A verification code has been sent to your email. Enter it to continue:");
+                if (!otp) return;
+                
+                const vRes = await apiRequest('/api/employees/verify_2fa/', {
+                    method: 'POST',
+                    body: { token: res.data.token, otp }
                 });
-                
-                showToast('Payslip downloaded successfully', 'success');
-                closeModal('exportPasswordModal');
-                return;
-            }
-            
-            // Handle different export types
-            if (exportType === 'payments') {
-                // Export payment history
-                if (!AppState.payments.length) {
-                    showToast('No payments to export', 'warning');
-                    closeModal('exportPasswordModal');
-                    return;
+
+                if (vRes.success) {
+                    await finishDownload(res.data.token, type, modal, url, downloadFilename);
+                } else {
+                    showToast('Invalid 2FA code', 'error');
                 }
-                
-                const csvContent = [
-                    ['Date', 'Employee ID', 'Name', 'Bank Account', 'Amount', 'Method', 'Status'],
-                    ...AppState.payments.map(p => [
-                        p.payment_date,
-                        p.employee_id,
-                        p.employee_name,
-                        p.bank_account,
-                        p.net_amount,
-                        p.payment_method || 'Paystack',
-                        p.status
-                    ])
-                ].map(row => row.map(field => `"${String(field).replace(/"/g, '""')}"`).join(',')).join('\n');
-                
-                downloadCSV(csvContent, 'payment_history.csv');
-                showToast('Payment history export successful', 'success');
             } else {
-                // Export employees
-                if (!AppState.employees.length) {
-                    showToast('No employees to export', 'warning');
-                    closeModal('exportPasswordModal');
-                    return;
-                }
-                
-                const csvContent = [
-                    ['Employee ID', 'Name', 'Type', 'Location', 'Bank', 'Account Number', 'Salary', 'Status'],
-                    ...AppState.employees.map(emp => [
-                        emp.employee_id,
-                        emp.name,
-                        emp.type,
-                        emp.location,
-                        emp.bank_name,
-                        emp.account_number,
-                        emp.salary,
-                        emp.status || 'Active'
-                    ])
-                ].map(row => row.map(field => `"${String(field).replace(/"/g, '""')}"`).join(',')).join('\n');
-                
-                downloadCSV(csvContent, 'employees_export.csv');
-                showToast('Employee export successful', 'success');
+                // No 2FA required (Payments, Payslips, Receipts)
+                await finishDownload(res.data.token, type, modal, url, downloadFilename);
             }
-            
-            closeModal('exportPasswordModal');
         } else {
-            showToast('Invalid password', 'error');
+            showToast(res.message || 'Verification failed', 'error');
         }
-    }).catch(err => {
-        showToast('Password verification failed', 'error');
-    });
+    } finally {
+        hideLoading(btn);
+    }
 }
 
-function downloadCSV(content, filename) {
-    const blob = new Blob(['\ufeff' + content], { type: 'text/csv;charset=utf-8;' });
-    const url = window.URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = filename;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    window.URL.revokeObjectURL(url);
+async function finishDownload(token, type, modal, url, downloadFilename) {
+    const downloadEndpoint = type === 'payslip' 
+            ? '/api/payments/download_payslip_pdf/' 
+            : type === 'receipt'
+            ? '/api/payments/download_receipt_pdf/'
+            : url.replace('request_export/', 'export_csv/');
+            
+        await triggerSecureDownload(downloadEndpoint, token, downloadFilename);
+        closeModal('exportPasswordModal');
 }
 
 // ==========================================
@@ -3022,7 +3227,7 @@ function filterHistory() {
     
     tbody.innerHTML = '';
     if (!filtered.length) {
-        tbody.innerHTML = '<tr><td colspan="8" class="text-center">No matching records</td></tr>';
+        tbody.innerHTML = '<tr><td colspan="12" class="text-center">No companies found</td></tr>';
         return;
     }
     
@@ -3105,7 +3310,7 @@ function setupEmployeeIdGeneration() {
     if (typeSelect) typeSelect.addEventListener('change', generateId);
     if (nameInput) {
         nameInput.addEventListener('blur', generateId);
-        nameInput.addEventListener('input', debounce(generateId, 300));
+        nameInput.addEventListener('input', debounce(generateId, 800));
     }
     form?.addEventListener('reset', () => {
         setTimeout(() => {
@@ -3210,8 +3415,12 @@ function setupEventListeners() {
         { id: 'addDeductionForm', handler: addDeduction },
         { id: 'editDeductionForm', handler: updateDeduction },
         { id: 'addEmployeeForm', handler: handleCreateEmployee },
-        { id: 'createAccountForm', handler: createAccount },
-        { id: 'leaveForm', handler: handleMarkLeave } // ADDED
+        { id: 'createAccountForm', handler: createAccount }, 
+        { id: 'changePasswordForm', handler: handleChangePassword }, // ADDED
+        { id: 'forgotPasswordForm', handler: submitForgotPassword },
+        { id: 'resetPasswordForm', handler: handleResetPassword },
+        { id: 'leaveForm', handler: handleMarkLeave }, // ADDED
+        { id: 'requestForm', handler: handleCreateRequest }
     ];
 
     forms.forEach(({ id, handler }) => {
@@ -3229,6 +3438,246 @@ function setupEventListeners() {
 // DASHBOARD & INITIALIZATION
 // ==========================================
 
+async function loadRequests() {
+    const tbody = document.getElementById('requestsTableBody');
+    if (!tbody) return;
+
+    const renderGallery = (attachments, type) => {
+        if (!attachments || !attachments.length) return '-';
+        const filtered = attachments.filter(a => a.file_type === type);
+        if (!filtered.length) return '-';
+        return `<div class="attachment-gallery" style="display: flex; gap: 4px; flex-wrap: wrap;">
+            ${filtered.map(a => `
+                <img src="${a.file}" 
+                     style="width: 35px; height: 35px; object-fit: cover; border-radius: 4px; border: 1px solid #ddd; cursor: pointer;" 
+                     onclick="showImagePreview('${a.file}')">
+            `).join('')}
+        </div>`;
+    };
+
+    const res = await apiRequest('/api/requests/');
+    if (res.success) {
+        const list = res.data?.results || res.data || [];
+        tbody.innerHTML = list.length ? '' : '<tr><td colspan="8">No requests found</td></tr>';
+        list.forEach(req => {
+            const isAdmin = AppState.currentUser?.is_superuser || AppState.currentUser?.is_request_admin;
+            const hasAttachments = req.attachments && req.attachments.length > 0;
+            
+            const row = document.createElement('tr');
+            row.innerHTML = `
+                <td>${formatDate(req.created_at)}</td>
+                <td>${escapeHtml(req.employee_name)}</td>
+                <td>${escapeHtml(req.request_type)}</td>
+                <td>${formatCurrency(req.amount)}</td>
+                <td>${renderGallery(req.attachments, 'proof')}</td>
+                <td>${renderGallery(req.attachments, 'receipt')}</td>
+                <td><span class="badge status-${req.status}">${req.status}</span></td>
+                <td>
+                    ${isAdmin && req.status === 'pending' ? `
+                        <button class="btn btn-sm btn-success" onclick="approveRequest('${req.id}')">Approve</button>
+                        <button class="btn btn-sm btn-danger" onclick="showDeclineModal('${req.id}')">Decline</button>
+                    ` : '-'}
+                    ${isAdmin && hasAttachments ? `
+                        <button class="btn btn-sm btn-outline-primary" title="Download ZIP" onclick="downloadRequestAttachments('${req.id}')">
+                            <i class="fas fa-file-archive"></i>
+                        </button>
+                    ` : ''}
+                </td>
+            `;
+            tbody.appendChild(row);
+        });
+    }
+}
+
+async function downloadRequestAttachments(requestId) {
+    try {
+        const token = AppState.accessToken || localStorage.getItem('accessToken');
+        const response = await fetch(`${window.location.origin}/api/requests/${requestId}/download_attachments/`, {
+            headers: { 'Authorization': `Bearer ${token}` }
+        });
+        
+        if (!response.ok) throw new Error('Download failed');
+        
+        const blob = await response.blob();
+        const url = window.URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `attachments_${requestId.slice(0,8)}.zip`;
+        document.body.appendChild(a);
+        a.click();
+        window.URL.revokeObjectURL(url);
+        a.remove();
+    } catch (err) {
+        showToast('Failed to download ZIP: ' + err.message, 'error');
+    }
+}
+
+// ==========================================
+// SELF SIGNUP
+// ==========================================
+
+function showSignupModal() {
+    openModal('selfSignupModal'); // Internal ID remains, Label changes
+}
+
+async function handleSelfSignup(e) {
+    e.preventDefault();
+    const btn = e.target.querySelector('button[type="submit"]');
+    
+    const payload = {
+        username: document.getElementById('signupUsername')?.value,
+        password: document.getElementById('signupPassword')?.value,
+        full_name: document.getElementById('signupFullName')?.value,
+        email: document.getElementById('signupEmail')?.value,
+        type: document.getElementById('signupRole')?.value,
+        location: document.getElementById('signupLocation')?.value,
+        salary: document.getElementById('signupSalary')?.value || 0,
+        bank_name: document.getElementById('signupBankName')?.value,
+        account_number: document.getElementById('signupAccountNumber')?.value,
+        account_holder: document.getElementById('signupAccountHolder')?.value
+    };
+
+    try {
+        showLoading(btn);
+        const res = await apiRequest('/self-register/', { method: 'POST', body: payload });
+        if (res.success) {
+            showToast('Signup successful! Awaiting admin approval.', 'success');
+            closeModal('selfSignupModal');
+        } else {
+            // DRF returns structured errors, show the first one
+            const errorMsg = typeof res.data === 'object' ? Object.values(res.data)[0] : res.message;
+            showToast(errorMsg || 'Signup failed', 'error');
+        }
+    } finally {
+        hideLoading(btn);
+    }
+}
+
+let requestPhotoBlobs = [];
+
+function updateCharCount(textarea) {
+    const counter = document.getElementById('charCounter');
+    if (counter) counter.textContent = `${textarea.value.length} / 500 characters`;
+}
+
+async function startRequestCamera() {
+    const video = document.getElementById('reqVideo');
+    const section = document.getElementById('requestCameraSection');
+    if (section) section.style.display = 'block';
+    try {
+        const stream = await navigator.mediaDevices.getUserMedia({ video: true });
+        video.srcObject = stream;
+        AppState.cameraStream = stream;
+    } catch (err) { console.warn('Request camera failed'); }
+}
+
+function captureRequestPhoto() {
+    const video = document.getElementById('reqVideo');
+    const canvas = document.createElement('canvas');
+    canvas.width = video.videoWidth;
+    canvas.height = video.videoHeight;
+    canvas.getContext('2d').drawImage(video, 0, 0);
+    
+    canvas.toBlob(async (rawBlob) => {
+        const compressedBlob = await compressImage(rawBlob);
+        requestPhotoBlobs.push(compressedBlob);
+        
+        const previewContainer = document.getElementById('reqCapturedImage');
+        const imgWrapper = document.createElement('div');
+        imgWrapper.style.display = 'inline-block';
+        imgWrapper.style.position = 'relative';
+        imgWrapper.style.margin = '5px';
+        
+        imgWrapper.innerHTML = `
+            <img src="${URL.createObjectURL(compressedBlob)}" style="width: 100px; height: 100px; object-fit: cover; border-radius: 4px;">
+            <span style="position: absolute; top: 0; right: 0; background: red; color: white; border-radius: 50%; width: 20px; height: 20px; text-align: center; cursor: pointer; line-height: 20px;" onclick="this.parentElement.remove(); requestPhotoBlobs.splice(${requestPhotoBlobs.length - 1}, 1);">×</span>
+        `;
+        previewContainer.appendChild(imgWrapper);
+    }, 'image/jpeg', 0.8);
+}
+
+function clearCapturedPhotos() {
+    requestPhotoBlobs = [];
+    document.getElementById('reqCapturedImage').innerHTML = '';
+}
+
+async function handleCreateRequest(e) {
+    e.preventDefault();
+    if (!confirm('Are you sure you want to submit this request?')) return;
+    
+    const btn = e.target.querySelector('button[type="submit"]');
+    const formData = new FormData();
+    formData.append('request_type', document.getElementById('reqType').value);
+    
+    const amount = document.getElementById('reqAmount').value;
+    if (amount) formData.append('amount', amount);
+    formData.append('description', document.getElementById('reqDescription').value);
+
+    requestPhotoBlobs.forEach((blob, i) => formData.append('proof_photos', blob, `proof_${i}.jpg`));
+    
+    const receiptFiles = document.getElementById('reqReceipt').files;
+    const compressedReceipts = await Promise.all(
+        Array.from(receiptFiles).map(file => compressImage(file))
+    );
+    
+    compressedReceipts.forEach((blob, i) => {
+        formData.append('receipt_files', blob, `receipt_${i}.jpg`);
+    });
+
+    try {
+        showLoading(btn);
+        const res = await apiRequest('/api/requests/', { method: 'POST', body: formData });
+        if (res.success) {
+            showToast('Request and attachments submitted successfully', 'success');
+            closeModal('requestModal');
+            clearCapturedPhotos();
+            loadRequests();
+        } else {
+            showToast(res.message || 'Failed to submit request', 'error');
+        }
+    } finally {
+        hideLoading(btn);
+    }
+}
+
+async function approveRequest(id) {
+    if (confirm('Approve this request?')) {
+        const res = await apiRequest(`/api/requests/${id}/approve/`, { method: 'POST' });
+        if (res.success) { showToast('Approved'); loadRequests(); }
+    }
+}
+
+let pendingDeclineId = null;
+function showDeclineModal(id) {
+    pendingDeclineId = id;
+    openModal('declineReasonModal');
+}
+
+async function submitDeclineRequest() {
+    const reason = document.getElementById('declineReasonText').value;
+    if (!reason) return showToast('Reason required', 'warning');
+
+    const btn = document.querySelector('#declineReasonModal button.btn-danger');
+    try {
+        showLoading(btn);
+        const res = await apiRequest(`/api/requests/${pendingDeclineId}/decline/`, { 
+            method: 'POST', body: { reason } 
+        });
+        if (res.success) {
+            showToast('Request declined successfully', 'success');
+            closeModal('declineReasonModal');
+            document.getElementById('declineReasonText').value = '';
+            loadRequests();
+        } else {
+            showToast(res.message || 'Failed to decline request', 'error');
+        }
+    } finally {
+        hideLoading(btn);
+    }
+}
+
+function showRequestModal() { openModal('requestModal'); }
+
 async function loadDashboard() {
     if (!AppState.currentUser) {
         await loadCurrentUser();
@@ -3242,6 +3691,7 @@ async function loadDashboard() {
         // Step 1: Critical data (sequential)
         await loadEmployees();
         await loadDeductions();
+        await loadRequests();
 
         // Step 2: Medium priority (parallel but limited)
         await Promise.all([
@@ -3284,146 +3734,89 @@ function showDashboardPage() {
 // INITIALIZATION
 // ==========================================
 
+let AUTH_BOOTSTRAP_IN_FLIGHT = false;
+let AUTH_BOOTSTRAP_DONE = false;
+
 document.addEventListener('DOMContentLoaded', async () => {
-    console.log('DOM Content Loaded - Initializing Application');
-    
-    // Cache DOM elements
-    AppState.elements.tbody = document.getElementById('employeeTableBody');
-    AppState.elements.deductionsTbody = document.getElementById('deductionsTableBody');
-    AppState.elements.attendanceTbody = document.getElementById('attendanceTableBody');
-    AppState.elements.companiesTbody = document.getElementById('companiesTableBody');
-    AppState.elements.sackedTbody = document.getElementById('sackedTableBody');
-    AppState.elements.historyTbody = document.getElementById('historyTableBody');
-    AppState.elements.notificationsContainer = document.getElementById('notificationsList');
-    AppState.elements.toastContainer = document.getElementById('toastContainer');
-    AppState.elements.globalSpinner = document.getElementById('globalSpinner');
+    if (AUTH_BOOTSTRAP_DONE || AUTH_BOOTSTRAP_IN_FLIGHT) return;
 
-    const storedToken = localStorage.getItem('accessToken') || sessionStorage.getItem('accessToken');
-    const storedRefresh = localStorage.getItem('refreshToken');
-    
-    if (!storedToken) {
-        console.log('No token found, showing login page');
-        showLoginPage();
-        setupEventListeners();
-        return;
-    }
+    AUTH_BOOTSTRAP_IN_FLIGHT = true;
+    try {
+        console.log('DOM Content Loaded - Initializing Application');
+        
+        // Cache DOM elements
+        AppState.elements.tbody = document.getElementById('employeeTableBody');
+        AppState.elements.deductionsTbody = document.getElementById('deductionsTableBody');
+        AppState.elements.attendanceTbody = document.getElementById('attendanceTableBody');
+        AppState.elements.companiesTbody = document.getElementById('companiesTableBody');
+        AppState.elements.sackedTbody = document.getElementById('sackedTableBody');
+        AppState.elements.historyTbody = document.getElementById('historyTableBody');
+        AppState.elements.notificationsContainer = document.getElementById('notificationsList');
+        AppState.elements.toastContainer = document.getElementById('toastContainer');
+        AppState.elements.globalSpinner = document.getElementById('globalSpinner');
 
-    AppState.accessToken = storedToken;
-    if (storedRefresh) AppState.refreshToken = storedRefresh;
+        // FEATURE: Check for Reset Password link in URL immediately
+        const urlParams = new URLSearchParams(window.location.search);
+        if (urlParams.get('action') === 'reset-password' && urlParams.get('uid') && urlParams.get('token')) {
+            openModal('resetPasswordModal');
+        }
 
-        try {
+        const storedToken = localStorage.getItem('accessToken') || sessionStorage.getItem('accessToken');
+        const storedRefresh = localStorage.getItem('refreshToken');
+        
+        if (!storedToken) {
+            console.log('No token found, showing login page');
+            showLoginPage();
+            setupEventListeners();
+            return;
+        }
+
+        AppState.accessToken = storedToken;
+        if (storedRefresh) AppState.refreshToken = storedRefresh;
+
         if (isJwtExpired(AppState.accessToken)) {
             console.log('Stored access token expired, refreshing before verification...');
             const refreshed = await refreshAccessToken();
             if (!refreshed) throw new Error('Cannot refresh token');
         }
 
+        // Step 2: verify current user (at most 2 attempts total)
         console.log('Verifying token on page load...');
-        const res = await apiRequest('/api/current-user/');
-        
+        const res = await apiRequest('/current-user/');
+
         if (res.success && res.data) {
             console.log('Token valid, loading dashboard');
             AppState.currentUser = res.data;
             await loadDashboard();
         } else {
-            console.log('Token invalid, attempting refresh...');
+            console.log('Token invalid, attempting refresh once...');
             const refreshed = await refreshAccessToken();
-            
-            if (refreshed) {
-                const retryRes = await apiRequest('/api/current-user/');
-                if (retryRes.success && retryRes.data) {
-                    AppState.currentUser = retryRes.data;
-                    await loadDashboard();
-                } else {
-                    throw new Error('Token refresh failed - user data missing');
-                }
+            if (!refreshed) throw new Error('Cannot refresh token');
+
+            const retryRes = await apiRequest('/current-user/');
+            if (retryRes.success && retryRes.data) {
+                AppState.currentUser = retryRes.data;
+                await loadDashboard();
             } else {
-                throw new Error('Cannot refresh token');
+                throw new Error('Token refresh failed - user data missing');
             }
         }
+
     } catch (err) {
-        console.error('Auth failed:', err.message);
-        logout();
+        console.error('Auth bootstrap failed:', err.message);
+        // Clear local storage and show login without calling apiRequest recursively
+        localStorage.removeItem('accessToken');
+        localStorage.removeItem('refreshToken');
+        AppState.accessToken = null;
+        AppState.refreshToken = null;
         showLoginPage();
-    }
-    
-    setupEventListeners();
-    console.log('Application initialization complete');
-});
-
-async function verifyBankAccountManual() {
-    const accountInput = document.getElementById('accountNumber');
-    const bankSelect = document.getElementById('accountBankName');
-    const holderInput = document.getElementById('accountHolderName');
-    const statusEl = document.getElementById('verificationStatus');
-    return verifyBankAccountFields({ accountInput, bankSelect, holderInput, statusEl, manual: true });
-    
-    const accountNumber = accountInput?.value.trim();
-    const selectedOption = bankSelect?.options[bankSelect.selectedIndex];
-    const bankCode = selectedOption?.dataset?.code;
-    const verificationKey = `${bankCode || ''}:${accountNumber}`;
-    
-    if (!accountNumber || accountNumber.length !== 10) {
-        showToast('Enter valid 10-digit account number', 'error');
-        return;
-    }
-    if (!bankCode) {
-        showToast('Select a valid bank first', 'error');
-        return;
-    }
-    if (AppState.pendingAccountVerificationKey === verificationKey) {
-        showToast('Verification already in progress', 'info');
-        return;
-    }
-    if (AppState.lastVerifiedAccountKey === verificationKey && holderInput?.value.trim()) {
-        statusEl.textContent = `Verified: ${holderInput.value.trim()}`;
-        statusEl.className = 'text-success';
-        return;
-    }
-    
-    AppState.pendingAccountVerificationKey = verificationKey;
-    holderInput.value = 'Verifying...';
-    holderInput.disabled = true;
-    statusEl.textContent = 'Verifying with Paystack...';
-    statusEl.className = 'text-info';
-    
-    try {
-        const res = await apiRequest('/api/paystack/verify-account/', {
-            method: 'POST',
-            body: { account_number: accountNumber, bank_code: bankCode }
-        });
-        
-        if (res.success && res.data?.status === true && res.data?.data?.account_name) {
-            holderInput.value = res.data.data.account_name;
-            holderInput.style.background = '#d4edda';
-            statusEl.textContent = `✓ Verified: ${res.data.account_name}`;
-            statusEl.className = 'text-success';
-            statusEl.textContent = `Verified: ${res.data.data.account_name}`;
-            AppState.lastVerifiedAccountKey = verificationKey;
-            showToast('Account verified successfully', 'success');
-        } else {
-            holderInput.value = '';
-            holderInput.style.background = '#f8d7da';
-            statusEl.textContent = 'Verification failed';
-            statusEl.className = 'text-danger';
-            statusEl.textContent = res.message || res.data?.message || 'Verification failed';
-            holderInput.readOnly = true;
-            showToast(res.message || res.data?.message || 'Verification failed', 'error');
-            AppState.lastVerifiedAccountKey = null;
-        }
-    } catch (err) {
-        holderInput.value = '';
-        holderInput.readOnly = true;
-        AppState.lastVerifiedAccountKey = null;
-        statusEl.textContent = 'Error verifying account. Try again later.';
-        statusEl.className = 'text-warning';
-        showToast('Verification service unavailable', 'error');
     } finally {
-        AppState.pendingAccountVerificationKey = null;
-        holderInput.disabled = false;
+        AUTH_BOOTSTRAP_DONE = true;
+        AUTH_BOOTSTRAP_IN_FLIGHT = false;
+        setupEventListeners();
+        console.log('Application initialization complete');
     }
-}
-
+});
 
 // ==========================================
 // GLOBAL EXPORTS - MUST BE AT END OF FILE
@@ -3434,7 +3827,11 @@ const EXPOSED_FUNCTIONS = {
     handleLogin,
     logout,
     refreshAccessToken,
+    handleForgotPassword,
+    submitForgotPassword,
+    handleResetPassword,
     
+    handleChangePassword, // ADDED
     // Navigation
     showSection,
     openModal,
@@ -3446,6 +3843,9 @@ const EXPOSED_FUNCTIONS = {
     handleCreateEmployee,
     handleDelete,
     createAccount,
+    bulkApproveEmployees,
+    resendConfirmationMail,
+    approveEmployee,
     fetchNextEmployeeId,
     setupEmployeeIdGeneration,
     
@@ -3470,6 +3870,7 @@ const EXPOSED_FUNCTIONS = {
     handleClockIn,
     startCamera,
     capturePhoto,
+    toggleUserMenu,
     handleMarkLeave,
     updateAttendanceStats,
     
@@ -3495,11 +3896,16 @@ const EXPOSED_FUNCTIONS = {
     
     // Notifications
     loadNotifications,
-    clearAllNotifications,
+    markAllNotificationsAsRead,
+    
+    // Audit Logs
+    loadDownloadLogs,
+    filterDownloadLogs,
     
     // Exports
     exportAllEmployees,        // <-- THIS WAS MISSING
     exportPaymentHistory,
+    exportReceipt,
     confirmExport,
     
     // Filters
@@ -3514,8 +3920,18 @@ const EXPOSED_FUNCTIONS = {
     // Bank verification
     verifyBankAccountManual,
     setupBankVerification,
+    clearBankCache,
     setupBankCodeTracking,
     viewEmployeeDetail,
+
+    // Requests
+    showRequestModal,
+    loadRequests,
+    approveRequest,
+    showDeclineModal,
+    submitDeclineRequest,
+    startRequestCamera,
+    captureRequestPhoto,
     
     // Misc
     showToast,
@@ -3555,6 +3971,13 @@ function openChangePasswordModal() {
         showToast('Change password modal not found', 'error');
         return;
     }
+
+    // Accessibility: include username on password forms (optionally hidden)
+    const usernameInput = document.getElementById('changePasswordUsername');
+    if (usernameInput) {
+        usernameInput.value = AppState.currentUser?.username || AppState.currentUser?.email || '';
+    }
+
     document.getElementById('oldPassword').value = '';
     document.getElementById('newPassword').value = '';
     document.getElementById('confirmPassword').value = '';
@@ -3572,4 +3995,34 @@ Object.keys(EXPOSED_FUNCTIONS).forEach(key => {
 window.showChangePasswordModal = showChangePasswordModal;
 window.openChangePasswordModal = openChangePasswordModal;
 
-console.log('All functions exported to window object:', Object.keys(EXPOSED_FUNCTIONS));
+function exportReceipt(paymentId) {
+    const modal = document.getElementById('exportPasswordModal');
+    if (modal) {
+        modal.dataset.exportType = 'receipt';
+        modal.dataset.paymentId = paymentId;
+        const usernameInput = document.getElementById('exportUsername');
+        if (usernameInput) usernameInput.value = AppState.currentUser?.username || '';
+    }
+    openModal('exportPasswordModal');
+}
+
+async function retryPayment(transactionReferenceOrId) {
+    try {
+        if (!transactionReferenceOrId) {
+            showToast('Missing payment reference for retry', 'error');
+            return;
+        }
+        const res = await apiRequest(`/payments/verify-payment/${transactionReferenceOrId}/`);
+        if (res.success && res.data?.payment_status) {
+            await loadPaymentHistory();
+            populatePaymentsTable();
+            updateDashboardStats();
+            showToast(`Payment status: ${res.data.payment_status}`, res.data.payment_status === 'completed' ? 'success' : 'info', 4000);
+            return;
+        }
+        showToast('Retry not available yet. Please try again later.', 'warning');
+    } catch (err) {
+        console.error('retryPayment error:', err);
+        showToast(err.message || 'Retry failed', 'error');
+    }
+}

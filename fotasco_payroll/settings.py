@@ -23,18 +23,11 @@ import logging.config
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
 
-# comingBack to this later for conf
 # Media Files (for selfie uploads)
 MEDIA_URL = '/media/'
 MEDIA_ROOT = os.path.join(BASE_DIR, 'media')
 
 # Static Files
-STATIC_URL = '/static/'
-STATIC_ROOT = os.path.join(BASE_DIR, 'staticfiles')
-
-# Static files (CSS, JavaScript, Images)
-# https://docs.djangoproject.com/en/5.2/howto/static-files/
-
 STATIC_URL = '/static/'
 STATICFILES_DIRS = [
     BASE_DIR / "static",
@@ -42,6 +35,7 @@ STATICFILES_DIRS = [
     # BASE_DIR.parent.parent / "front_admin",
 ]
 
+STATIC_ROOT = os.path.join(BASE_DIR, 'staticfiles')
 
 
 # Quick-start development settings - unsuitable for production
@@ -51,14 +45,13 @@ STATICFILES_DIRS = [
 SECRET_KEY = config('SECRET_KEY')
 DEBUG = config('DEBUG', default=False, cast=bool)
 
-# STATICFILES_STORAGE = "django.contrib.staticfiles.storage.ManifestStaticFilesStorage"
-
+# Use WhiteNoise for serving static files in production.
+# Manifest storage enables cache-busting hashes for long-term caching.
+STATICFILES_STORAGE = "whitenoise.storage.CompressedManifestStaticFilesStorage"
 
 ALLOWED_HOSTS = ['fot-pyroll.onrender.com', 
                 'fotasco-payroll.onrender.com',
-                # 3LATER?? 'payroll.fotasco.com',
-                'localhost',
-                '127.0.0.1'
+                # Add any other production domains here
                 ]
 
 # SECURITY WARNING: don't run with debug turned on in production!
@@ -83,6 +76,7 @@ INSTALLED_APPS = [
     
     # Local apps
     'payroll',
+    'django_extensions',
 ]
 
 MIDDLEWARE = [
@@ -122,14 +116,16 @@ TEMPLATES = [
 WSGI_APPLICATION = 'fotasco_payroll.wsgi.application'
 
 
-# DATABASES = {
-#     'default': dj_database_url.config(
-#         default=os.environ.get('DATABASE_URL'),
-#         conn_max_age=600,
-#         conn_health_checks=True,
-#     )
-# }
-
+# REDIS CACHE CONFIGURATION
+CACHES = {
+    'default': {
+        'BACKEND': 'django_redis.cache.RedisCache',
+        'LOCATION': config('REDIS_URL', default='redis://127.0.0.1:6379/1'),
+        'OPTIONS': {
+            'CLIENT_CLASS': 'django_redis.client.DefaultClient',
+        }
+    }
+}
 
 DATABASE_URL = os.environ.get("DATABASE_URL")
 
@@ -150,6 +146,17 @@ else:
         }
     }
 
+# Celery Beat Schedule Configuration
+CELERY_BEAT_SCHEDULE = {
+    'monitor-paystack-health-every-minute': {
+        'task': 'payroll.tasks.monitor_paystack_health',
+        'schedule': 60.0, # Run every 60 seconds
+    },
+    'verify-stale-payments-every-30-minutes': {
+        'task': 'payroll.tasks.verify_processing_payments',
+        'schedule': 1800.0,
+    },
+}
 
 
 AUTH_PASSWORD_VALIDATORS = [
@@ -213,6 +220,7 @@ REST_FRAMEWORK = {
         'verify_password': '5/min',   # VerifyPasswordThrottle — export gate
         'otp':           '10/hour',   # OTPThrottle        — OTP resend / verify
         'export':        '10/hour',   # ExportTokenThrottle — CSV export tokens
+        'bank_verify':   '60/min',    # BankVerifyThrottle — Paystack account lookups
     },
     'DEFAULT_PAGINATION_CLASS': 'rest_framework.pagination.PageNumberPagination',
     'PAGE_SIZE': 20,
@@ -232,20 +240,20 @@ SIMPLE_JWT = {
     'AUTH_TOKEN_CLASSES': ('rest_framework_simplejwt.tokens.AccessToken',),
 }
 
+# Password Reset Token Expiration (24 hours = 86400 seconds)
+PASSWORD_RESET_TIMEOUT = 86400
+
 # CORS Settings REMOVIN all LATER
 CORS_ALLOWED_ORIGINS = [
-    "http://localhost:3000",
-    "http://127.0.0.1:8000",
-    "http://127.0.0.1:3000",
-    "http://localhost:5173",
-    "https://localhost:8000",
-    "https://127.0.0.1:8000",
-    "https://fot-pyroll.onrender.com",
+    config('FRONTEND_URL', default="https://fot-pyroll.onrender.com"),
+]
+
+CSRF_TRUSTED_ORIGINS = [
+    'https://fot-pyroll.onrender.com',
+    'https://fotasco-payroll.onrender.com',
 ]
 
 CORS_ALLOW_CREDENTIALS = True
-
-
 
 ## Paystack Configuration
 PAYSTACK_SECRET_KEY = config('PAYSTACK_SECRET_KEY', default='')
@@ -258,10 +266,10 @@ PAYSTACK_CALLBACK_URL = config('PAYSTACK_CALLBACK_URL', default='')
 EMAIL_BACKEND = 'django.core.mail.backends.smtp.EmailBackend'
 EMAIL_HOST = config('EMAIL_HOST', default='smtp.gmail.com')
 EMAIL_PORT = config('EMAIL_PORT', default=587, cast=int)
-EMAIL_USE_TLS = True
-EMAIL_HOST_USER = config('EMAIL_HOST_USER', default='')
-EMAIL_HOST_PASSWORD = config('EMAIL_HOST_PASSWORD', default='')
-DEFAULT_FROM_EMAIL = config('DEFAULT_FROM_EMAIL', default='amsatlolade@gmail.com') ##payrollmail
+EMAIL_USE_TLS = config('EMAIL_USE_TLS', default=True, cast=bool)
+EMAIL_HOST_USER = config('EMAIL_HOST_USER')
+EMAIL_HOST_PASSWORD = config('EMAIL_HOST_PASSWORD')
+DEFAULT_FROM_EMAIL = config('DEFAULT_FROM_EMAIL', default='noreply@fotasco.com')
 
 # Internationalization
 # https://docs.djangoproject.com/en/5.2/topics/i18n/
@@ -281,19 +289,18 @@ DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 
 # Production Security Settings
 # Set these to True in production environment
-SECURE_SSL_REDIRECT = config('SECURE_SSL_REDIRECT', default=False, cast=bool)
+SECURE_SSL_REDIRECT = config('SECURE_SSL_REDIRECT', default=True, cast=bool)
 SECURE_HSTS_SECONDS = config('SECURE_HSTS_SECONDS', default=31536000, cast=int)
 SECURE_HSTS_INCLUDE_SUBDOMAINS = config('SECURE_HSTS_INCLUDE_SUBDOMAINS', default=True, cast=bool)
 SECURE_HSTS_PRELOAD = config('SECURE_HSTS_PRELOAD', default=True, cast=bool)
 SECURE_CONTENT_TYPE_NOSNIFF = True
 SECURE_BROWSER_XSS_FILTER = True
 X_FRAME_OPTIONS = 'DENY'
-CSRF_COOKIE_SECURE = config('CSRF_COOKIE_SECURE', default=True, cast=bool)
-SESSION_COOKIE_SECURE = config('SESSION_COOKIE_SECURE', default=True, cast=bool)
+CSRF_COOKIE_SECURE = config('CSRF_COOKIE_SECURE', default=not DEBUG, cast=bool)
+SESSION_COOKIE_SECURE = config('SESSION_COOKIE_SECURE', default=not DEBUG, cast=bool)
 SECURE_REFERRER_POLICY = 'strict-origin-when-cross-origin'
 
-# CSRF_TRUSTED_ORIGINS = config('CSRF_TRUSTED_ORIGINS', default='').split(',')
-# SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
+SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
 
 # Content Security Policy
 CSP_DEFAULT_SRC = ("'self'",)
