@@ -15,7 +15,7 @@ Django==5.1.8
 django-cors-headers==4.9.0
 django-csp==4.0
 django-extensions==4.1
-django-filter==25.2
+django-filter==25.1
 django-redis==6.0.0
 djangorestframework==3.17.1
 djangorestframework_simplejwt==5.5.1
