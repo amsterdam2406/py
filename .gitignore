@@ -18,9 +18,9 @@ ENV/
 .python-version
 
 # Project Specific - Files you don't want to track yet
-static/self_signup.js
-static/frontend/self_signup.js
-static/frontend/self_signup.css
+# static/self_signup.js
+# static/frontend/self_signup.js
+# static/frontend/self_signup.css
 
 # System files
 .DS_Store
