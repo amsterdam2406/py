@@ -34,6 +34,6 @@ build/
 # dedc att
 backend_admin\fotasco_payroll\payroll\attendance_deductions.py"
 
-git rm --cached static/frontend/self_signup.js
-git rm --cached static/frontend/self_signup.css
-1
+# git rm --cached static/frontend/self_signup.js
+1venv-/ 
+venv/ 
