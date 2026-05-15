@@ -124,17 +124,24 @@ WSGI_APPLICATION = 'fotasco_payroll.wsgi.application'
 
 
 # REDIS CACHE CONFIGURATION
+# CACHES = {
+#     'default': {
+#         'BACKEND': 'django_redis.cache.RedisCache',
+#         'LOCATION': config('REDIS_URL', default='redis://127.0.0.1:6379/1'),
+#         'OPTIONS': {
+#             'CLIENT_CLASS': 'django_redis.client.DefaultClient',
+#             'IGNORE_EXCEPTIONS': True,  # Prevent cache errors from crashing the app
+#         },
+#         'TIMEOUT': 300,  # Cache timeout in seconds (5 minutes)
+#     }
+# }2
+
 CACHES = {
-    'default': {
-        'BACKEND': 'django_redis.cache.RedisCache',
-        'LOCATION': config('REDIS_URL', default='redis://127.0.0.1:6379/1'),
-        'OPTIONS': {
-            'CLIENT_CLASS': 'django_redis.client.DefaultClient',
-            'IGNORE_EXCEPTIONS': True,  # Prevent cache errors from crashing the app
-        },
-        'TIMEOUT': 300,  # Cache timeout in seconds (5 minutes)
+    "default": {
+        "BACKEND": "django.core.cache.backends.locmem.LocMemCache",
     }
 }
+
 
 DATABASE_URL = os.environ.get("DATABASE_URL")
 
@@ -348,15 +355,18 @@ CONTENT_SECURITY_POLICY = {
     }
 }
 
-CELERY_BROKER_URL = config(
-    'REDIS_URL',
-    default='redis://127.0.0.1:6379/0'
-)
+# CELERY_BROKER_URL = config(
+#     'REDIS_URL',
+#     default='redis://127.0.0.1:6379/0'
+# )
 
-CELERY_RESULT_BACKEND = config(
-    'REDIS_URL',
-    default='redis://127.0.0.1:6379/0'
-)
+# CELERY_RESULT_BACKEND = config(
+#     'REDIS_URL',
+#     default='redis://127.0.0.1:6379/0'
+# ) 2
+
+CELERY_BROKER_URL = 'memory://'
+CELERY_RESULT_BACKEND = 'cache+memory://'
 
 CELERY_TIMEZONE = 'Africa/Lagos'
 CELERY_ENABLE_UTC = True
