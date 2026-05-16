@@ -124,23 +124,25 @@ WSGI_APPLICATION = 'fotasco_payroll.wsgi.application'
 
 
 # REDIS CACHE CONFIGURATION
-# CACHES = {
-#     'default': {
-#         'BACKEND': 'django_redis.cache.RedisCache',
-#         'LOCATION': config('REDIS_URL', default='redis://127.0.0.1:6379/1'),
-#         'OPTIONS': {
-#             'CLIENT_CLASS': 'django_redis.client.DefaultClient',
-#             'IGNORE_EXCEPTIONS': True,  # Prevent cache errors from crashing the app
-#         },
-#         'TIMEOUT': 300,  # Cache timeout in seconds (5 minutes)
-#     }
-# }2
-
-CACHES = {
-    "default": {
-        "BACKEND": "django.core.cache.backends.locmem.LocMemCache",
+REDIS_URL = os.environ.get('REDIS_URL')
+if REDIS_URL:
+    CACHES = {
+        'default': {
+            'BACKEND': 'django_redis.cache.RedisCache',
+            'LOCATION': REDIS_URL,
+            'OPTIONS': {
+                'CLIENT_CLASS': 'django_redis.client.DefaultClient',
+                'IGNORE_EXCEPTIONS': True,
+            },
+            'TIMEOUT': 300,
+        }
     }
-}
+else:
+    CACHES = {
+        "default": {
+            "BACKEND": "django.core.cache.backends.locmem.LocMemCache",
+        }
+    }
 
 
 DATABASE_URL = os.environ.get("DATABASE_URL")
@@ -152,8 +154,11 @@ if DATABASE_URL:
             conn_max_age=600,
             conn_health_checks=True,
             ssl_require=not DEBUG,  # Enforce SSL in production
+            engine='django.db.backends.postgresql',
         )
     }
+    # Ensure SSL options are correctly passed for Render
+    DATABASES['default']['OPTIONS'] = {'sslmode': 'require'}
 else:
     # Local development fallback
     DATABASES = {
@@ -401,23 +406,16 @@ LOGGING = {
             'level': LOG_LEVEL,
             'formatter': 'simple',
         },
-    
-    'file': {
-        'class': 'logging.FileHandler',
-        'filename': os.path.join(LOGS_DIR, 'fotasco_payroll.log'),
-        'level': LOG_LEVEL,
-        'formatter': 'verbose',
-    },
 },
 
     'root': {
-        'handlers': ['console', 'file'],
+        'handlers': ['console'],
         'level': LOG_LEVEL,
     },
 
     'loggers': {
         'django': {
-            'handlers': ['console', 'file'],
+            'handlers': ['console'],
             'level': LOG_LEVEL,
             'propagate': False,
         },
@@ -441,7 +439,7 @@ LOGGING = {
         },
 
         'payroll': {
-            'handlers': ['console', 'file'],
+            'handlers': ['console'],
             'level': LOG_LEVEL,
             'propagate': False,
         },

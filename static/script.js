@@ -745,20 +745,30 @@ async function handleLogin(e) {
     }
 
     try {
-        const response = await fetch(`${window.location.origin}/login/`, {
+        const response = await fetch('/login/', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ username, password })
         });
 
         let data = {};
-        const contentType = response.headers.get("content-type");
-        if (contentType && contentType.includes("application/json")) {
-            data = await response.json();
+        try {
+            const contentType = response.headers.get("content-type");
+            if (contentType && contentType.includes("application/json")) {
+                data = await response.json();
+            }
+        } catch (parseErr) {
+            console.warn("Could not parse error response as JSON");
         }
 
         if (!response.ok) {
             AppState.loginAttempts++;
+            
+            if (response.status === 500) {
+                showToast('Server error (500). Please check Render backend logs.', 'error');
+                return;
+            }
+
             if (AppState.loginAttempts >= CONFIG.MAX_LOGIN_ATTEMPTS) {
                 AppState.loginLockedUntil = Date.now() + CONFIG.LOCKOUT_DURATION;
                 showToast('Too many failed attempts. Account locked for 15 minutes.', 'error');
