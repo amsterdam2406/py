@@ -1,5 +1,5 @@
 from rest_framework.permissions import BasePermission
-
+# lj
 
 class IsAdmin(BasePermission):
     """Authenticated user with role='admin' or superuser."""

@@ -8,7 +8,7 @@ logger = logging.getLogger(__name__)
 class PaystackAPI:
     """Paystack Payment Gateway Integration"""
     
-    BASE_URL = "https://api.paystack.co"  # FIXED: 
+    BASE_URL = "https://api.paystack.co"  # FXD: 
     
     def __init__(self):
         self.secret_key = getattr(settings, 'PAYSTACK_SECRET_KEY', '')

@@ -1,4 +1,4 @@
-# payroll/admin.py - MINIMAL VERSION
+# payroll/admin.py MINIMA VERSION
 from django.contrib import admin
 from django.contrib.auth.admin import UserAdmin as BaseUserAdmin
 from django.core.cache import cache

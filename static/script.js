@@ -1,5 +1,6 @@
 /**
- * Fotasco Payroll - Production Ready JavaScript
+ * Fotasco Payr
+ * Fotasco Payroll - Poduction Ready JavaScript
  * DRF API Integration with JWT Authentication
  * Version: 5.0.0 - All Critical Fixes Applied
  */
@@ -958,11 +959,13 @@ async function loadCurrentUser() {
 function applyRolePermissions(user) {
     if (!user) return;
 
+    // Mapping backend flags to UI visibility
     const permissions = [
         { id: 'admin-controls-employee', allowed: user.is_superuser || user.role === 'admin' || user.is_employee_admin },
         { id: 'admin-controls-sacked', allowed: user.is_superuser || user.role === 'admin' || user.is_employee_admin },
         { id: 'admin-controls-companies', allowed: user.is_superuser || user.role === 'admin' || user.is_company_admin },
         { id: 'accounts', allowed: user.is_superuser || user.role === 'admin' },
+        { id: 'requests-admin-view', allowed: user.is_superuser || user.role === 'admin' || user.is_request_admin },
         { id: 'payments', allowed: user.is_superuser || user.role === 'admin' || user.is_payment_admin },
         { id: 'deductions-section', allowed: user.is_superuser || user.role === 'admin' || user.is_deduction_admin }
     ];
@@ -1343,7 +1346,8 @@ async function createAccount(e) {
             { check: !payload.salary, msg: 'Valid salary is required' },
             { check: !payload.location, msg: 'Location is required' },
             { check: !payload.bank_name, msg: 'Bank name is required' },
-            { check: !payload.account_number || !/^\d{10}$/.test(payload.account_number), msg: 'Valid 10-digit account number required' }
+            { check: !payload.account_number || !/^\d{10}$/.test(payload.account_number), msg: 'Valid 10-digit account number required' },
+            { check: !payload.account_holder, msg: 'Account holder name is required' }
         );
     }
 
@@ -2169,15 +2173,16 @@ async function startBulkPaymentPolling(payments, maxAttempts = 30, interval = 30
         const pending = payments.filter(p => !p.done);
 
         for (const p of pending) {
-            const res = await apiRequest(`/payments/verify-payment/${p.reference}/`);
-            if (res.success && (res.data.payment_status === 'completed' || res.data.payment_status === 'failed')) {
+            const res = await apiRequest(`/verify-payment-status/${p.reference}/`);
+            if (res.success && (res.data.is_completed || res.data.payment_status === 'failed')) {
                 p.done = true;
-                showToast(`${p.employee_name}: ${res.data.payment_status}`, res.data.payment_status === 'completed' ? 'success' : 'error');
+                showToast(`${p.employee_name}: ${res.data.payment_status}`, res.data.is_completed ? 'success' : 'error');
             }
         }
 
         if (payments.every(p => p.done) || attempts >= maxAttempts) {
-            await loadPaymentHistory();
+            await loadDashboard(); // Reload everything to update stats
+            await loadDashboard(); // Reloading dashboard updates stats automatically
             return;
         }
 
@@ -2188,9 +2193,10 @@ async function startBulkPaymentPolling(payments, maxAttempts = 30, interval = 30
     AppState.bulkPollInterval = setTimeout(poll, currentDelay);
 }
 
-// REPLACE your current initiateIndividualPayment function with this:
 async function initiateIndividualPayment(empId) {
     try {
+        const btn = document.querySelector(`button[onclick="initiateIndividualPayment('${empId}')"]`);
+        showLoading(btn);
         const res = await apiRequest('/api/payments/initiate_payment/', {
             method: 'POST',
             body: { employee_id: empId }
@@ -2216,15 +2222,16 @@ async function initiateIndividualPayment(empId) {
             showOTPModal();
         } else {
             showToast(res.data.message || 'Payment initiated', 'success');
+            await loadDashboard(); // Backend handles status, JS just refreshes
             await loadPaymentHistory();
-            updateDashboardStats();
+            await updateDashboardStats();
         }
     } catch (err) {
         showToast(err.message || 'Failed to initiate payment', 'error');
+    } finally {
+        hideLoading(document.querySelector(`button[onclick="initiateIndividualPayment('${empId}')"]`));
     }
 }
-
-// ADD this new function for polling:
 
 async function startPaymentStatusPolling(reference, maxAttempts = 30, interval = 3000) {
     let attempts = 0;
@@ -2232,14 +2239,27 @@ async function startPaymentStatusPolling(reference, maxAttempts = 30, interval =
 
     const poll = async () => {
         attempts++;
-        const res = await apiRequest(`/payments/verify-payment/${reference}/`);
+        const res = await apiRequest(`/verify-payment-status/${reference}/`);
 
-        if (res.success && (res.data.payment_status === 'completed' || res.data.payment_status === 'failed')) {
-            showToast(`Payment ${res.data.payment_status}`, res.data.payment_status === 'completed' ? 'success' : 'error');
-            await loadPaymentHistory();
+        if (res.success && (res.data.is_completed || res.data.payment_status === 'failed')) {
+            showToast(`Payment ${res.data.payment_status}`, res.data.is_completed ? 'success' : 'error');
+            await loadDashboard();
             return;
         }
 
+async function syncPaymentsWithPaystack() {
+    const btn = document.getElementById('syncPaymentsBtn');
+    try {
+        showLoading(btn);
+        const res = await apiRequest('/api/payments/sync_processing_payments/', { method: 'POST' });
+        if (res.success) {
+            showToast(res.data.message, 'success');
+            await loadDashboard();
+        }
+    } finally {
+        hideLoading(btn);
+    }
+}
         if (attempts < maxAttempts) {
             currentDelay = Math.min(currentDelay * 1.5, 30000);
             setTimeout(poll, currentDelay);
@@ -2637,6 +2657,21 @@ async function updateDashboardStats() {
     updateRecentActivity(stats.recent_employees, stats.recent_payments);
 }
 
+async function syncPaymentsWithPaystack() {
+    const btn = document.getElementById('syncPaymentsBtn');
+    try {
+        showLoading(btn);
+        const res = await apiRequest('/api/payments/sync_processing_payments/', { method: 'POST' });
+        if (res.success) {
+            showToast(res.data.message, 'success');
+            await loadPaymentHistory();
+            await updateDashboardStats();
+        }
+    } finally {
+        hideLoading(btn);
+    }
+}
+
 /**
  * Periodically check system health (Paystack connectivity)
  */
@@ -2879,6 +2914,12 @@ function toggleAllPayments() {
     const checkboxes = document.querySelectorAll('.payment-checkbox');
     checkboxes.forEach(cb => cb.checked = selectAllCheckbox.checked);
     updatePaymentSelection();
+}
+
+function toggleAllEmployees() {
+    const selectAllCheckbox = document.getElementById('selectAllEmployees');
+    const checkboxes = document.querySelectorAll('.employee-checkbox');
+    checkboxes.forEach(cb => cb.checked = selectAllCheckbox?.checked);
 }
 
 // ==========================================
@@ -3914,6 +3955,7 @@ const EXPOSED_FUNCTIONS = {
     // Audit Logs
     loadDownloadLogs,
     filterDownloadLogs,
+    syncPaymentsWithPaystack,
     
     // Exports
     exportAllEmployees,        // <-- THIS WAS MISSING
@@ -3923,6 +3965,7 @@ const EXPOSED_FUNCTIONS = {
     
     // Filters
     filterHistory,
+    toggleAllEmployees,
     
     // OTP
     showOTPModal,

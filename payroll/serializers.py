@@ -161,7 +161,7 @@ class EmployeeSerializer(serializers.ModelSerializer):
             user.set_unusable_password()
             user.save()
             try:
-                # The employee_id is generated in the model's save method
+                # The employee_id is generatd in the model's save method
                 employee = Employee.objects.create(user=user, **validated_data)
             except IntegrityError as e:
                 # Catch potential unique constraint violations, e.g., on employee_id if generation fails

@@ -3,7 +3,7 @@ from rest_framework.throttling import UserRateThrottle, AnonRateThrottle, Scoped
 
 # ---------------------------------------------------------------------------
 # LOGIN
-# ---------------------------------------------------------------------------
+# ------------------------------------------------------------------------
 
 class LoginThrottle(AnonRateThrottle):
     """Throttle unauthenticated login attempts by IP."""

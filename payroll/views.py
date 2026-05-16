@@ -197,7 +197,7 @@ def paystack_verify_account(request):
             status=status.HTTP_400_BAD_REQUEST
         )
 
-    # Check for existing active employees to save Paystack API calls and prevent duplicates
+    # Check for existing active employees to avePaystack API calls and prevent duplicates
     duplicate = Employee.objects.filter(
         account_number=account_number,
         status__in=['active', 'pending']
@@ -569,6 +569,7 @@ def verify_payment_status(request, reference):
     return Response({
         'status': True,
         'payment_status': payment.status,  # 'pending' | 'processing' | 'completed' | 'failed'
+        'is_completed': payment.status == 'completed',
         'reference': reference,
         'amount': float(payment.net_amount),
         'employee_name': payment.employee.name if payment.employee else None,
@@ -644,6 +645,8 @@ class EmployeeViewSet(viewsets.ModelViewSet):
         with transaction.atomic():
             employee.status = 'terminated'
             employee.save()
+            employee.user.is_active = False
+            employee.user.save()
             SackedEmployee.objects.create(
                 employee=employee,
                 date_sacked=timezone.now().date(),
@@ -693,6 +696,8 @@ class EmployeeViewSet(viewsets.ModelViewSet):
             )
             employee.status = 'terminated'
             employee.save()
+            employee.user.is_active = False
+            employee.user.save()
 
             Notification.objects.create(
                 user=employee.user,
@@ -719,6 +724,8 @@ class EmployeeViewSet(viewsets.ModelViewSet):
             )
             employee.status = 'resigned'
             employee.save()
+            employee.user.is_active = False
+            employee.user.save()
 
             Notification.objects.create(
                 user=employee.user,
@@ -1288,6 +1295,38 @@ class PaymentViewSet(viewsets.ModelViewSet):
         elif self.action in ['initiate_payment', 'create']:
             return [PaymentThrottle()]
         return []
+
+    @action(detail=False, methods=['post'], permission_classes=[IsAuthenticated, IsPayrollAdmin])
+    def sync_processing_payments(self, request):
+        """Backend logic to check all processing payments against Paystack API"""
+        processing_payments = Payment.objects.filter(status='processing')
+        updated_count = 0
+        paystack = PaystackAPI()
+
+        for payment in processing_payments:
+            try:
+                res = paystack.verify_transfer(payment.transaction_reference)
+                if res.get('status'):
+                    data = res.get('data', {})
+                    if data.get('status') == 'success':
+                        with transaction.atomic():
+                            payment.change_status('completed')
+                            payment.paystack_reference = str(data.get('id', ''))
+                            payment.save()
+                            # DRF handles logic: Apply deductions only on success
+                            Deduction.objects.filter(employee=payment.employee, status='pending').update(status='applied')
+                        updated_count += 1
+                    elif data.get('status') in ['failed', 'reversed']:
+                        payment.change_status('failed')
+                        payment.save()
+                        updated_count += 1
+            except Exception as e:
+                logger.error(f"Sync error for {payment.transaction_reference}: {e}")
+
+        return Response({
+            'message': f'Sync complete. {updated_count} payments updated.',
+            'checked': processing_payments.count()
+        })
 
     def get_queryset(self):
         user = self.request.user

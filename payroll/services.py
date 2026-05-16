@@ -7,6 +7,7 @@ from django.utils import timezone
 from .models import Payment, Employee, Deduction, Notification
 from .paystack import PaystackAPI, NIGERIAN_BANKS
 
+# l
 logger = logging.getLogger(__name__)
 
 def get_employee_bank_code(employee):
@@ -129,7 +130,7 @@ class PaystackService:
                     status='processing',
                     payment_method='bank_transfer'
                 )
-
+#l
                 transfers_payload.append({
                     "amount": int(net_amount * 100),
                     "recipient": recipient_code,

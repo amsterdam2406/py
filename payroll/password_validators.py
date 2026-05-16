@@ -20,7 +20,7 @@ class ComplexPasswordValidator:
     def validate(self, password, user=None):
         errors = []
         
-        # Minimum length check
+        # Minimum lngth check
         if len(password) < 8:
             errors.append(
                 ValidationError(

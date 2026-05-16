@@ -38,3 +38,4 @@ backend_admin\fotasco_payroll\payroll\attendance_deductions.py"
 1venv-/ 
 venv/ 
 venv-/
+check_env.py

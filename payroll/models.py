@@ -237,7 +237,7 @@ class Payment(models.Model):
         ('completed', 'Completed'),
         ('failed', 'Failed'),
     ]    
-    # State Machine Definition
+    # Stalte Machine Definition
     STATUS_TRANSITIONS = {
         'pending': ['processing', 'failed'],
         'processing': ['completed', 'failed'],
@@ -304,7 +304,7 @@ class Payment(models.Model):
 
     
     def save(self, *args, **kwargs):
-        # Status-based automation removed to ensure all payroll side-effects require admin approval
+        # Status-based automation remove to ensure all payroll side-effects require admin approval
         super().save(*args, **kwargs)
     
     def __str__(self):

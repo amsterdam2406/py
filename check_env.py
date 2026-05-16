@@ -25,7 +25,7 @@ def check_production_env():
     else:
         print("✅ All required environment variables are present.")
 
-    # 1. DEBUG Check
+    # 1. DEBUG Checkl
     debug_val = os.environ.get('DEBUG', 'False')
     if debug_val.lower() in ['true', '1', 't']:
         print("❌ SECURITY WARNING: DEBUG is set to TRUE. This must be FALSE in production.")

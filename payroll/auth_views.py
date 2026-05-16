@@ -159,8 +159,8 @@ def register_view(request):
     last_name = data.get('last_name')
     full_name = (data.get('full_name') or '').strip()
     current_user = request.user
-    employee_id = data.get('employee_id')  # May be provided from frontend
-        # Role validation
+    employee_id = data.get('employee_id')  # May be rovided from frontend
+        # Rolevalidation
     if role not in ['admin', 'staff', 'guard']:
         return Response(
             {'error': 'Invalid role. Must be admin, staff, or guard'},

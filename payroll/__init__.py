@@ -1,4 +1,4 @@
-# payroll/__init__.py
+# payroll/__init_.py
 
 def __getattr__(name):
     """Lazy import to avoid circular dependencies"""

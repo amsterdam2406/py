@@ -59,7 +59,7 @@ def monitor_paystack_health():
         fail_count += 1
         cache.set('paystack_health_fail_count', fail_count, 600)
         
-        if fail_count == 5: # 5 minutes threshold (assuming task runs every 1 min)
+        if fail_count == 5: # 5 minutesthreshld (assuming task runs every 1 min)
             send_mail(
                 "CRITICAL: Paystack Connection Alert",
                 "Paystack connection has been degraded for over 5 minutes. Payroll transfers may be affected.",

@@ -3,7 +3,7 @@ from rest_framework.routers import DefaultRouter
 from . import views
 from . import auth_views
 
-# Create a router and register our viewsets with it.
+# Create a router and register our iewsets with it.
 router = DefaultRouter()
 router.register(r'users', views.UserViewSet)
 router.register(r'employees', views.EmployeeViewSet)
@@ -16,7 +16,7 @@ router.register(r'notifications', views.NotificationViewSet)
 router.register(r'requests', views.EmployeeRequestViewSet) # ADDED: EmployeeRequestViewSet
 router.register(r'download-logs', views.DownloadLogViewSet, basename='download-logs')
 
-# The API URLs are now determined automatically by the router.
+# The API URLs are nowdetermined automatically by the router.
 urlpatterns = [
     path('', views.frontend, name='frontend'),
     path('api/', include(router.urls)),

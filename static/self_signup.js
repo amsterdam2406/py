@@ -112,7 +112,7 @@
 
     document.body.appendChild(modal);
 
-    // Close handler: click on the backdrop only
+    // Close handlclick on the backdrop only
     modal.addEventListener('click', (ev) => {
       if (ev.target === modal) modal.style.display = 'none';
     });

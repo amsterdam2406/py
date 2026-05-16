@@ -25,7 +25,7 @@ from django.http import JsonResponse
 
 urlpatterns = [
     path('admin/', admin.site.urls),
-    # Avoid noisy 404 from Chrome/DevTools probing:
+    # Avoid noisy 404 from Chrome/DevTool probing:
     # /.well-known/appspecific/com.chrome.devtools.json
     re_path(r'^\.well-known/appspecific/com\.chrome\.devtools\.json$', lambda request: JsonResponse({}, status=200)),
 

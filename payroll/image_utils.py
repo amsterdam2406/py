@@ -14,7 +14,7 @@ from PIL import Image, ImageOps
 from django.core.files.base import ContentFile
 from django.core.exceptions import ValidationError
 
-# Prevent decompression bomb attacks
+# Prevent decompresion bomb attacks
 Image.MAX_IMAGE_PIXELS = 20_000_000
 
 logger = logging.getLogger(__name__)

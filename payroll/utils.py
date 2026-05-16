@@ -1,5 +1,5 @@
 from typing import Optional, Dict, Any
-from .models import AuditLog  # optional (or keep inside function)
+from .models import AuditLog  # optional(or keep inside function)
 
 def get_client_ip(request):
     x_forwarded_for = request.META.get('HTTP_X_FORWARDED_FOR')

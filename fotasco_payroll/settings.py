@@ -123,7 +123,7 @@ TEMPLATES = [
 WSGI_APPLICATION = 'fotasco_payroll.wsgi.application'
 
 
-# REDIS CACHE CONFIGURATION
+# REDIS CACHE CONFIGURATlION
 REDIS_URL = os.environ.get('REDIS_URL')
 if REDIS_URL:
     CACHES = {
