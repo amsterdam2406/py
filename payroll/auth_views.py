@@ -80,59 +80,72 @@ def login_view(request):
     username = request.data.get('username')
     password = request.data.get('password')
     
-    if not username or not password:
-        return Response(
-            {'error': 'Username and password are required'},
-            status=status.HTTP_400_BAD_REQUEST
+    try:
+        if not username or not password:
+            return Response(
+                {'error': 'Username and password are required'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+            
+        user = authenticate(request, username=username, password=password)
+        
+        if not user:
+            logger.warning(f"Failed login attempt for {username} from {request.META.get('REMOTE_ADDR')}")
+            return Response(
+                {'error': 'Invalid credentials'},
+                status=status.HTTP_401_UNAUTHORIZED
+            )
+            
+        logger.info(f"Successful login for {username} from {request.META.get('REMOTE_ADDR')}")
+            
+        # This is where 500s often happen if SimpleJWT migrations aren't run
+        refresh = RefreshToken.for_user(user)
+            
+        # Get employee_id safely
+        employee_id = None
+        try:
+            if hasattr(user, 'employee_profile'):
+                employee_id = user.employee_profile.employee_id
+        except Exception as profile_err:
+            logger.error(f"Error accessing employee profile for {username}: {profile_err}")
+
+        response = Response({
+            'access': str(refresh.access_token),
+            'refresh': str(refresh),
+            'user': {
+                'id': user.id,
+                'username': user.username,
+                'email': user.email,
+                'role': user.role,
+                'employee_id': employee_id,
+                'first_name': user.first_name,
+                'last_name': user.last_name,
+                'is_superuser': user.is_superuser,
+                'is_company_admin': getattr(user, 'is_company_admin', False),
+                'is_payment_admin': getattr(user, 'is_payment_admin', False),
+                'is_deduction_admin': getattr(user, 'is_deduction_admin', False),
+                'is_employee_admin': getattr(user, 'is_employee_admin', False),
+            }
+        }, status=status.HTTP_200_OK)
+
+        # Also set refresh token in HttpOnly cookie as backup
+        response.set_cookie(
+            key='refresh_token',
+            value=str(refresh),
+            httponly=True,
+            secure=not settings.DEBUG,
+            samesite='Lax',
+            path="/"
         )
-        
-    user = authenticate(request, username=username, password=password)
-    
-    if not user:
-        logger.warning(f"Failed login attempt for {username} from {request.META.get('REMOTE_ADDR')}")
+
+        return response
+
+    except Exception as e:
+        logger.error(f"CRITICAL LOGIN ERROR for {username}: {str(e)}", exc_info=True)
         return Response(
-            {'error': 'Invalid credentials'},
-            status=status.HTTP_401_UNAUTHORIZED
+            {'error': 'An internal server error occurred during login.'},
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR
         )
-        
-    logger.info(f"Successful login for {username} from {request.META.get('REMOTE_ADDR')}")
-        
-    refresh = RefreshToken.for_user(user)
-        
-    # Get employee_id if user has employee profile
-    employee_id = None
-    if hasattr(user, 'employee_profile'):
-        employee_id = user.employee_profile.employee_id
-
-    response = Response({
-        'access': str(refresh.access_token),
-        'refresh': str(refresh),  # ADDED: Return refresh in body for localStorage
-        'user': {
-            'id': user.id,
-            'username': user.username,
-            'email': user.email,
-            'role': user.role,
-            'employee_id': employee_id,
-            'first_name': user.first_name,
-            'last_name': user.last_name,
-            'is_superuser': user.is_superuser,
-            'is_company_admin': getattr(user, 'is_company_admin', False),
-            'is_payment_admin': getattr(user, 'is_payment_admin', False),
-            'is_deduction_admin': getattr(user, 'is_deduction_admin', False),
-            'is_employee_admin': getattr(user, 'is_employee_admin', False),
-        }
-    }, status=status.HTTP_200_OK)
-
-    # Also set refresh token in HttpOnly cookie as backup
-    response.set_cookie(
-        key='refresh_token',
-        value=str(refresh),
-        httponly=True,
-        secure=not settings.DEBUG,
-        path="/"
-    )
-
-    return response
 
 
 @api_view(['POST'])
