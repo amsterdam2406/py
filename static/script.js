@@ -431,17 +431,28 @@ async function apiRequest(url, options = {}) {
  */
 async function refreshAccessToken() {
     try {
-        const refreshToken = AppState.refreshToken || 
-                            localStorage.getItem('refreshToken') || 
-                            getCookie('refresh_token');
+        // IMPORTANT: refresh_token cookie is HttpOnly, so JS cannot read it.
+        // Rely only on localStorage (and in-memory AppState) for SPA bootstrapping.
+        const refreshToken = AppState.refreshToken || localStorage.getItem('refreshToken');
         
         if (!refreshToken) return false;
 
-        const response = await fetch('/token/refresh/', {
+
+        // Prefer HttpOnly cookie refresh (DRF reads refresh_token cookie server-side).
+        // Send refresh token in body only if we explicitly have it.
+        const refreshBody = refreshToken ? { refresh: refreshToken } : null;
+
+        const fetchOptions = {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ refresh: refreshToken })
-        });
+            headers: {}
+        };
+
+        if (refreshBody) {
+            fetchOptions.headers['Content-Type'] = 'application/json';
+            fetchOptions.body = JSON.stringify(refreshBody);
+        }
+
+        const response = await fetch('/token/refresh/', fetchOptions);
 
         if (response.status === 401 || response.status === 403) {
             throw new Error('AUTH_EXPIRED');
@@ -468,14 +479,6 @@ async function refreshAccessToken() {
         }
         return false;
     }
-}
-
-// ADDED: Helper to get cookie value
-function getCookie(name) {
-    const value = `; ${document.cookie}`;
-    const parts = value.split(`; ${name}=`);
-    if (parts.length === 2) return parts.pop().split(';').shift();
-    return null;
 }
 
 // ==========================================
