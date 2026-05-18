@@ -244,6 +244,37 @@ class PaystackAPI:
             logger.error(f"Paystack verify transfer unexpected error: {e}")
             return {'status': False, 'message': str(e), 'data': {'status': 'failed'}}
         
+    def finalize_transfer(self, transfer_code, otp):
+        """
+        Finalizes a transfer that requires an OTP from Paystack.
+        https://paystack.com/docs/api/transfer/#finalize-transfer
+        """
+        url = f"{self.BASE_URL}/transfer/finalize_transfer"
+        headers = {
+            "Authorization": f"Bearer {self.secret_key}",
+            "Content-Type": "application/json"
+        }
+        payload = {
+            "transfer_code": transfer_code,
+            "otp": otp
+        }
+        try:
+            response = requests.post(url, headers=headers, json=payload, timeout=30)
+            response.raise_for_status() # Raise HTTPError for bad responses (4xx or 5xx)
+            return response.json()
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Paystack finalize transfer error for transfer_code {transfer_code}: {e}")
+            # Return a structured error response, including message from Paystack API if available
+            error_message = str(e)
+            if hasattr(e, 'response') and e.response is not None:
+                try:
+                    error_json = e.response.json()
+                    error_message = error_json.get('message', error_message)
+                except ValueError: # Not a JSON response
+                    pass
+            return {"status": False, "message": error_message, "error_code": "PAYSTACK_API_ERROR"}
+
+        
 # Nigerian Bank Codes for Paystack
 NIGERIAN_BANKS = {
     '044': 'Access Bank',

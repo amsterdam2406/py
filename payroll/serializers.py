@@ -59,7 +59,7 @@ class UserSerializer(serializers.ModelSerializer):
         fields = [
             'id', 'username', 'email', 'role', 'phone', 'employee_id',
             'is_company_admin', 'is_notification_admin', 'is_payment_admin',
-            'is_deduction_admin', 'is_employee_admin', 'is_request_admin',
+            'is_deduction_admin', 'is_employee_admin', 'is_request_admin', 'is_hr_admin',
             'first_name', 'last_name',
             'is_superuser', 'is_staff', 'is_active',
             'date_joined', 'last_login', 'groups', 'user_permissions',
@@ -141,26 +141,6 @@ class EmployeeSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError("Salary cannot be negative")
         return value
     
-    def validate_employee_id(self, value):
-        if not value:
-            return value  # Allow empty, model will generate
-        # Check format: FSS-XXX-TYPE
-        import re
-        if not re.match(r'^FSS-\d{3}-(STAFF|GRD|EMP)$', value):
-            raise serializers.ValidationError("Employee ID must be in format FSS-XXX-TYPE")
-        # Check uniqueness
-        queryset = Employee.objects.filter(employee_id=value)
-        if self.instance:
-            queryset = queryset.exclude(pk=self.instance.pk)
-        if queryset.exists():
-            raise serializers.ValidationError("This employee ID is already in use")
-        return value
-        
-    def validate_account_number(self, value):
-        if not value:
-            return value
-        if len(value) != 10:
-            raise serializers.ValidationError("Account number must be exactly 10 digits")
         if not value.isdigit():
             raise serializers.ValidationError("Account number must contain only digits")
         
@@ -306,7 +286,7 @@ class AttendanceSerializer(serializers.ModelSerializer):
         ]
         read_only_fields = [
             'id', 'created_at', 'updated_at',
-            'clock_in_timestamp', 'clock_out_timestamp', 'clock-in-photo', 
+            'clock_in_timestamp', 'clock_out_timestamp', 
             'clock_in_photo', 'clock_out_photo', 'clock_in_display', 'clock_out_display', 'status', 'clock_in_photo_base64', 'clock_out_photo_base64'
         ]
 
@@ -427,6 +407,7 @@ class PaymentSerializer(serializers.ModelSerializer):
             'payment_method',
             'transaction_reference',
             'paystack_reference',
+            'paystack_transfer_code',
             'status',
             'payment_date',
             'processed_by',

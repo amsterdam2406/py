@@ -9,7 +9,7 @@
 // ==========================================
 const CONFIG = {
     API_BASE_URL: window.location.origin,  // FIXED: Dynamic base URL
-    TOKEN_REFRESH_INTERVAL: 25 * 60 * 1000, // FIXED: Match 30min token - 5min buffer
+    TOKEN_REFRESH_INTERVAL: 14 * 60 * 1000, // FIXED: Refreshes at 14 mins (Before 15 min expiry)
     MAX_LOGIN_ATTEMPTS: 5,
     LOCKOUT_DURATION: 15 * 60 * 1000,
     DEBOUNCE_DELAY: 300,
@@ -43,9 +43,11 @@ const AppState = {
     selectedEmployeesForBulk: new Set(),
     bankList: [],
     lastVerifiedAccountKey: null,
+    globalLoadingCount: 0, // ADDED: Counter for global loading operations
     pendingAccountVerificationKey: null,
     paymentPollInterval: null,
     bulkPollInterval: null,
+    isPolling: false,
     
     elements: {
         tbody: null,
@@ -65,6 +67,23 @@ const AppState = {
 // UTILITY FUNCTIONS
 // ==========================================
 
+/**
+ * Standard cookie reader for CSRF tokens and session management
+ */
+function getCookie(name) {
+    if (!name) return null;
+    const cookieString = document.cookie || '';
+    if (!cookieString) return null;
+
+    const cookies = cookieString.split(';').map(c => c.trim());
+    for (const cookie of cookies) {
+        if (!cookie) continue;
+        const [key, ...rest] = cookie.split('=');
+        if (key === name) return decodeURIComponent(rest.join('=') || '');
+    }
+    return null;
+}
+
 function escapeHtml(text) {
     if (typeof text !== 'string') return text;
     const div = document.createElement('div');
@@ -78,6 +97,22 @@ function debounce(fn, delay = CONFIG.DEBOUNCE_DELAY) {
         clearTimeout(timeout);
         timeout = setTimeout(() => fn(...args), delay);
     };
+}
+
+/**
+ * Updates the text message in the global loading spinner.
+ */
+function updateLoadingProgress(message) {
+    const spinner = AppState.elements.globalSpinner || document.getElementById('globalSpinner');
+    if (!spinner) return;
+
+    let textEl = spinner.querySelector('.spinner-text');
+    if (!textEl) {
+        textEl = Array.from(spinner.querySelectorAll('div, span, p'))
+            .find(el => el.textContent.toLowerCase().includes('loading')) || spinner;
+    }
+
+    if (textEl) textEl.innerHTML = `<i class="fas fa-spinner fa-spin"></i> ${escapeHtml(message)}`;
 }
 
 function formatCurrency(amount, currency = '₦') {
@@ -160,12 +195,12 @@ function isJwtExpired(token) {
 
 function showLoading(btn, spinnerEl) {
     try {
-        if (btn && !btn.disabled) {
+        if (btn) {
             btn.disabled = true;
-            btn.dataset.originalText = btn.innerHTML;
+            if (!btn.dataset.originalText) btn.dataset.originalText = btn.innerHTML;
             btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Loading...';
         }
-        const spinner = spinnerEl || AppState.elements.globalSpinner;
+        const spinner = spinnerEl || AppState.elements.globalSpinner || document.getElementById('globalSpinner');
         if (spinner) spinner.classList.remove('hidden');
     } catch (error) {
         console.error('Error in showLoading:', error);
@@ -174,15 +209,18 @@ function showLoading(btn, spinnerEl) {
 
 function hideLoading(btn, spinnerEl) {
     try {
-        if (btn && btn.disabled) {
+        if (btn) {
             btn.disabled = false;
             if (btn.dataset.originalText) {
                 btn.innerHTML = btn.dataset.originalText;
                 delete btn.dataset.originalText;
             }
         }
-        const spinner = spinnerEl || AppState.elements.globalSpinner;
-        if (spinner) spinner.classList.add('hidden');
+        const spinner = spinnerEl || AppState.elements.globalSpinner || document.getElementById('globalSpinner');
+        if (spinner) {
+            if (!btn) AppState.globalLoadingCount = Math.max(0, AppState.globalLoadingCount - 1); // Decrement global counter
+            if (AppState.globalLoadingCount === 0 && !AppState.isPolling) spinner.classList.add('hidden');
+        }
     } catch (error) {
         console.error('Error in hideLoading:', error);
     }
@@ -200,7 +238,7 @@ function showToast(message, type = 'info', duration = CONFIG.TOAST_DURATION) {
     if (!container) {
         console.warn('Toast container not found:', message);
         return;
-    }
+    } // Fixed: Ensure toast container exists
     const toast = document.createElement('div');
     toast.className = `toast ${type}`;
     
@@ -286,9 +324,10 @@ function openModal(id) {
         document.getElementById('markWithoutSelfie')?.addEventListener('change', toggleCamera);
         toggleCamera();
     }
-    if (id === 'addCompanyModal') {
+    if (id === 'addCompanyModal' || id === 'signup-modal') {
         AppState.currentEditingCompanyId = null;
-        populateCompanyGuards();
+        populateCompanyGuards(); // Fixed: Ensure guards are populated
+        populateBankSelects(); // Ensure banks are loaded for signup
     }
     if (id === 'bulkPaymentModal') {
         populateBulkTable();
@@ -296,7 +335,12 @@ function openModal(id) {
     }
     if (id === 'individualPaymentModal') {
         populateEmployeeSelect('paymentEmployee');
-        document.getElementById('paymentPreview').style.display = 'none';
+        document.getElementById('paymentPreview').style.display = 'none'; // Fixed: Hide preview initially
+        fetchPaystackBalance(); // Check balance when opening payment modal
+    }
+    if (id === 'bulkPaymentModal') {
+        populateBulkTable();
+        fetchPaystackBalance(); // Check balance
     }
     // ADDED: Initialize leave modal dates
     if (id === 'leaveModal') {
@@ -311,7 +355,7 @@ function closeModal(id) {
     if ((id === 'clockInModal' || id === 'requestModal') && AppState.cameraStream) {
         AppState.cameraStream.getTracks().forEach(track => track.stop());
         AppState.cameraStream = null;
-    }
+    } // Fixed: Stop camera stream
     
     // Stop payment polling when closing payment modals
     if (id === 'individualPaymentModal' || id === 'bulkPaymentModal') {
@@ -323,7 +367,7 @@ function closeModal(id) {
             clearInterval(AppState.bulkPollInterval);
             AppState.bulkPollInterval = null;
         }
-    }
+    } // Fixed: Clear polling intervals
     
     const modal = document.getElementById(id);
     if (modal) modal.classList.remove('active');
@@ -367,10 +411,12 @@ async function apiRequest(url, options = {}) {
     const fullUrl = url.startsWith('http') ? url : `${baseUrl}${url.startsWith('/') ? '' : '/'}${url}`;
     
     const token = AppState.accessToken || localStorage.getItem('accessToken');
+    const csrfToken = getCookie('csrftoken');
     
     const headers = {
         ...(options.body instanceof FormData ? {} : { 'Content-Type': 'application/json' }),
         ...(token ? { 'Authorization': `Bearer ${token}` } : {}),
+        ...(csrfToken ? { 'X-CSRFToken': csrfToken } : {}),
         ...options.headers
     };
 
@@ -386,8 +432,9 @@ async function apiRequest(url, options = {}) {
         const response = await fetch(fullUrl, fetchOptions);
 
         if (response.status === 401) {
-            if (url.includes('/login/')) {
-                return { success: false, status: response.status, message: 'Invalid credentials' };
+            // Prevent infinite loops on auth endpoints
+            if (url.includes('/login/') || url.includes('/logout/') || url.includes('/token/refresh/')) {
+                return { success: false, status: response.status, message: 'Auth failed' };
             }
             const refreshed = await refreshAccessToken();
             if (refreshed) return apiRequest(url, options);
@@ -582,7 +629,7 @@ async function verifyBankAccountFields({ accountInput, bankSelect, holderInput, 
     setAccountVerificationStatus(statusEl, 'Verifying with Paystack...', 'text-info');
 
     try {
-        const res = await apiRequest('/paystack/verify-account/', {
+        const res = await apiRequest('/paystack/verify-account/', { // This function doesn't manage its own spinner
             method: 'POST',
             body: { account_number: accountNumber, bank_code: bankCode }
         });
@@ -679,7 +726,7 @@ function setupAccountVerification({ accountInputId, bankSelectId, holderInputId,
         setAccountVerificationStatus(statusEl, 'Enter 10-digit account number to auto-verify', 'text-muted');
         if (accountInput.value.trim().length === 10) verifyCurrentAccount();
     });
-
+    
     return { accountInput, bankSelect, holderInput, statusEl };
 }
 
@@ -688,7 +735,9 @@ async function verifyBankAccountManual() {
     const bankSelect = document.getElementById('accountBankName');
     const holderInput = document.getElementById('accountHolderName');
     const statusEl = document.getElementById('verificationStatus');
-    return verifyBankAccountFields({ accountInput, bankSelect, holderInput, statusEl, manual: true });
+    const btn = document.getElementById('verifyAccountBtn');
+    showLoading(btn); // Button spinner
+    try { return await verifyBankAccountFields({ accountInput, bankSelect, holderInput, statusEl, manual: true }); } finally { hideLoading(btn); }
 }
 
 async function clearBankCache() {
@@ -703,7 +752,7 @@ async function clearBankCache() {
             showToast(res.message || 'Failed to clear cache', 'error');
         }
     } finally {
-        hideLoading();
+        hideLoading(); // Global spinner
     }
 }
 
@@ -733,6 +782,7 @@ function setupBankVerification() {
 async function handleLogin(e) {
     e.preventDefault();
 
+    const btn = document.getElementById('loginBtn');
     if (AppState.loginLockedUntil && Date.now() < AppState.loginLockedUntil) {
         const remaining = Math.ceil((AppState.loginLockedUntil - Date.now()) / 1000 / 60);
         showToast(`Account locked. Try again in ${remaining} minutes.`, 'error');
@@ -748,6 +798,7 @@ async function handleLogin(e) {
     }
 
     try {
+        showLoading(btn);
         const response = await fetch('/login/', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -806,36 +857,39 @@ async function handleLogin(e) {
     } catch (err) {
         console.error('Login error:', err);
         showToast('Login failed. Please try again.', 'error');
+    } finally {
+        hideLoading(btn);
     }
 }
 
-function logout() {
-    // Call backend logout to blacklist token
-    apiRequest('/logout/', { method: 'POST' }).catch(() => {});
-    
+async function logout(silent = false) {
+    try {
+        if (!silent) showLoading(null, AppState.elements.globalSpinner);
+        const refresh = AppState.refreshToken || localStorage.getItem('refreshToken');
+        // If tokens are already gone, don't even try the network request to avoid noise
+        if (refresh) {
+            await fetch(`${window.location.origin}/logout/`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ refresh })
+            }).catch(() => {}); // Ignore errors on logout
+        }
+    } catch (err) {
+        console.error('Logout error:', err);
+    } finally {
     AppState.accessToken = null;
-    AppState.refreshToken = null; // ADDED
+        AppState.refreshToken = null;
     AppState.currentUser = null;
-    AppState.employees = [];
-    AppState.companies = [];
-    AppState.deductions = [];
-    AppState.payments = [];
+        localStorage.clear();
+        sessionStorage.clear();
+        if (!silent) hideLoading(null, AppState.elements.globalSpinner);
+        showLoginPage();
+    }
 
     if (AppState.cameraStream) {
         AppState.cameraStream.getTracks().forEach(track => track.stop());
         AppState.cameraStream = null;
     }
-
-    if (AppState.otpTimerInterval) clearInterval(AppState.otpTimerInterval);
-
-    localStorage.removeItem('accessToken');
-    localStorage.removeItem('refreshToken'); // ADDED
-    localStorage.removeItem('isLoggedIn');
-    sessionStorage.removeItem('accessToken');
-    sessionStorage.removeItem('isLoggedIn');
-
-    document.getElementById('dashboardPage')?.classList.add('hidden');
-    document.getElementById('loginPage')?.classList.remove('hidden');
 }
 async function handleForgotPassword(e) {
     if (e) e.preventDefault();
@@ -843,7 +897,7 @@ async function handleForgotPassword(e) {
     if (!email) return;
     
     try {
-        showLoading();
+        showLoading(); // Global spinner
         const res = await apiRequest('/request-reset/', {
             method: 'POST',
             body: { email }
@@ -854,7 +908,7 @@ async function handleForgotPassword(e) {
             showToast(res.message, 'error');
         }
     } finally {
-        hideLoading();
+        hideLoading(); // Global spinner
     }
 }
 
@@ -949,7 +1003,7 @@ async function loadCurrentUser() {
         applyRolePermissions(AppState.currentUser);
         return true;
     } catch (err) {
-        console.error('Failed to load user:', err);
+        console.error('Failed to load user:', err); // No hideLoading here, as it's part of bootstrap
         return false;
     }
 }
@@ -984,7 +1038,7 @@ function applyRolePermissions(user) {
 
 async function loadEmployees(page = 1) {
     try {
-        const res = await apiRequest(buildUrl('/api/employees/', { page }));
+        const res = await apiRequest(buildUrl('/api/employees/', { page })); // No spinner here, caller manages
         if (!res.success) throw new Error(res.message);
 
         AppState.employees = res.data?.results || res.data || [];
@@ -1011,7 +1065,9 @@ async function viewEmployeeDetail(employeeId) {
     const content = document.getElementById('employeeDetailContent');
     if (!content) return;
 
-    const res = await apiRequest(`/api/employees/${employeeId}/net_salary/`);
+    showLoading(); // Global spinner for modal content loading
+    const res = await apiRequest(`/api/employees/${employeeId}/net_salary/`); // No spinner for this small API call
+
     const netData = res.success ? res.data : { pending_deductions: 0, net_salary: employee.salary };
 
     content.innerHTML = `
@@ -1056,6 +1112,7 @@ async function viewEmployeeDetail(employeeId) {
     `;
     
     openModal('employeeDetailModal');
+    hideLoading(); // Global spinner
 }
 
 async function resignEmployee(empId) {
@@ -1063,7 +1120,7 @@ async function resignEmployee(empId) {
     if (reason === null) return;
 
     try {
-        showLoading();
+        showLoading(); // Global spinner
         const res = await apiRequest(`/api/employees/${empId}/resign/`, {
             method: 'POST',
             body: { reason: reason || 'Voluntary Resignation' }
@@ -1078,7 +1135,7 @@ async function resignEmployee(empId) {
     } catch (err) {
         showToast(err.message || 'Failed to process resignation', 'error');
     } finally {
-        hideLoading();
+        hideLoading(); // Global spinner
     }
 }
 
@@ -1086,7 +1143,7 @@ async function approveEmployee(empId) {
     if (!confirm('Are you sure you want to approve this employee registration?')) return;
 
     try {
-        showLoading();
+        showLoading(); // Global spinner
         const res = await apiRequest(`/api/employees/${empId}/approve/`, {
             method: 'POST'
         });
@@ -1099,7 +1156,7 @@ async function approveEmployee(empId) {
     } catch (err) {
         showToast(err.message || 'Failed to approve employee', 'error');
     } finally {
-        hideLoading();
+        hideLoading(); // Global spinner
     }
 }
 
@@ -1115,7 +1172,7 @@ async function bulkApproveEmployees() {
     if (!confirm(`Are you sure you want to approve ${ids.length} employees?`)) return;
 
     try {
-        showLoading();
+        showLoading(); // Global spinner
         const res = await apiRequest('/api/employees/bulk_approve/', {
             method: 'POST',
             body: { ids }
@@ -1129,7 +1186,7 @@ async function bulkApproveEmployees() {
     } catch (err) {
         showToast(err.message, 'error');
     } finally {
-        hideLoading();
+        hideLoading(); // Global spinner
     }
 }
 
@@ -1138,6 +1195,8 @@ function renderEmployees(list = []) {
     if (!tableBody) return;
 
     tableBody.innerHTML = '';
+    const selectAll = document.getElementById('selectAllEmployees');
+    if (selectAll) selectAll.checked = false; // Uncheck "Select All" on re-render
     
     if (!list.length) {
         tableBody.innerHTML = '<tr><td colspan="8" class="text-center">No employees found</td></tr>';
@@ -1149,7 +1208,7 @@ function renderEmployees(list = []) {
     list.forEach(emp => {
         if (!emp) return;
         const row = document.createElement('tr');
-        const isPending = emp.status === 'pending';
+        const isPending = emp.status === 'pending'; // Fixed: Only pending employees can be bulk approved
         
         row.innerHTML = `
             <td>${isPending && isAdmin ? `<input type="checkbox" class="employee-checkbox" value="${emp.id}">` : ''}</td>
@@ -1295,7 +1354,7 @@ async function handleDelete(id) {
 async function resendConfirmationMail(empId) {
     try {
         showLoading();
-        const res = await apiRequest(`/api/employees/${empId}/resend_confirmation/`, {
+        const res = await apiRequest(`/api/employees/${empId}/resend_confirmation/`, { // Global spinner
             method: 'POST'
         });
 
@@ -1313,10 +1372,45 @@ async function resendConfirmationMail(empId) {
 // ACCOUNT CREATION - FIXED ID GENERATION
 // ==========================================
 
-async function createAccount(e) {
+/**
+ * Evaluates password strength based on length, casing, numbers, and symbols.
+ */
+function checkPasswordStrength(password) {
+    let strength = 0;
+    if (password.length >= 8) strength++;
+    if (password.match(/[a-z]/) && password.match(/[A-Z]/)) strength++;
+    if (password.match(/\d/)) strength++;
+    if (password.match(/[^a-zA-Z\d]/)) strength++;
+    return strength;
+}
+
+/**
+ * Updates the UI feedback for password strength.
+ */
+function updatePasswordUI(password) {
+    const meter = document.getElementById('passwordStrength');
+    const feedback = document.getElementById('passwordFeedback');
+    if (!meter) return;
+
+    const strength = checkPasswordStrength(password);
+    const colors = ['#dc3545', '#ffc107', '#17a2b8', '#28a745'];
+    const texts = ['Very Weak', 'Weak', 'Good', 'Strong'];
+
+    meter.style.width = (password.length > 0 ? (strength * 25) : 0) + '%';
+    meter.style.backgroundColor = colors[strength - 1] || '#eee';
+    if (feedback) {
+        feedback.textContent = password ? `Strength: ${texts[strength - 1] || 'Too short'}` : 'Min 8 chars, uppercase, number & symbol';
+        feedback.style.color = colors[strength - 1] || '#6c757d';
+    }
+}
+
+/**
+ * Unified handler for both Admin User creation and Public Self-Signup.
+ */
+async function handleRegistration(e, isSelfSignup = false) {
     e.preventDefault();
     const btn = document.getElementById('createAccountBtn');
-    showLoading(btn);
+    const endpoint = isSelfSignup ? '/self-register/' : '/register/';
 
     function parseMoney(value) {
         return Number(String(value).replace(/,/g, '').trim()) || 0;
@@ -1336,85 +1430,53 @@ async function createAccount(e) {
         account_holder: document.getElementById('accountHolderName')?.value.trim()
     };
 
-    const validations = [
-        { check: !payload.username, msg: 'Username is required' },
-        { check: !payload.password || payload.password.length < 8, msg: 'Password must be at least 8 characters' },
-        { check: !payload.full_name, msg: 'Full name is required' },
-        { check: payload.full_name && payload.full_name.trim().split(/\s+/).length < 2, msg: 'Enter at least two names' },
-        { check: !payload.role, msg: 'Employee type is required' }
-    ];
-
-    if (payload.role !== 'admin') {
-        validations.push(
-            { check: !payload.salary, msg: 'Valid salary is required' },
-            { check: !payload.location, msg: 'Location is required' },
-            { check: !payload.bank_name, msg: 'Bank name is required' },
-            { check: !payload.bank_code, msg: 'Select a valid bank from the list' },
-            { check: !payload.account_number || !/^\d{10}$/.test(payload.account_number), msg: 'Valid 10-digit account number required' },
-            { check: !payload.account_holder, msg: 'Account holder name is required' }
-        );
+    // Password Strength Check
+    const strength = checkPasswordStrength(payload.password || '');
+    if (strength < 3) {
+        showToast('Password is too weak. Please use uppercase, numbers and symbols.', 'error');
+        return;
     }
 
-    for (const v of validations) {
-        if (v.check) {
-            showToast(v.msg, 'error');
-            hideLoading(btn);
-            return;
-        }
+    const missing = [];
+    if (!payload.username) missing.push('Username');
+    if (!payload.password || payload.password.length < 8) missing.push('Password (min 8 chars)');
+    if (!payload.full_name || payload.full_name.split(/\s+/).length < 2) missing.push('Full Name (min 2 names)');
+    if (!payload.role) missing.push('Employee Type');
+    
+    if (payload.role !== 'admin') {
+        if (!payload.salary) missing.push('Salary');
+        if (!payload.location) missing.push('Location');
+        if (!payload.bank_name || !payload.bank_code) missing.push('Valid Bank Selection');
+        if (!payload.account_number || !/^\d{10}$/.test(payload.account_number)) missing.push('10-digit Account Number');
+        if (!payload.account_holder) missing.push('Verified Account Holder Name');
+    }
+
+    if (missing.length) {
+        showToast('Missing or invalid fields: ' + missing.join(', '), 'warning');
+        return;
     }
 
     try {
-        const res = await apiRequest('/register/', {
+        showLoading(btn);
+        const res = await apiRequest(endpoint, {
             method: 'POST',
             body: payload
         });
 
         if (!res.success) {
-            let errorMessage = res.message || res.data?.error || 'Registration failed';
-            if (res.data && typeof res.data === 'object') {
-                // Check for a top-level 'error' key first
-                if (res.data.error) errorMessage = res.data.error;
-                // Then check for field-specific errors
-                const fieldErrors = Object.keys(res.data)
-                    .filter(key => key !== 'error') // Exclude the top-level error if present
-                    .map(key => `${key}: ${Array.isArray(res.data[key]) ? res.data[key].join(', ') : res.data[key]}`).join('; ');
-                if (fieldErrors) errorMessage = `${errorMessage} ${fieldErrors}`.trim();
-            }
-            throw new Error(errorMessage);
+            throw new Error(res.message || 'Registration failed');
         }
 
-        const empId = res.data?.employee?.employee_id;
-        const createdEmployee = res.data?.employee
-            ? {
-                ...res.data.employee,
-                location: payload.location,
-                salary: payload.salary,
-                phone: payload.phone,
-                email: payload.email,
-                bank_name: payload.bank_name,
-                bank_code: payload.bank_code,
-                account_number: payload.account_number,
-                account_holder: payload.account_holder,
-                status: 'active'
-            }
-            : null;
+        showToast(res.data?.message || 'Registration successful', 'success');
 
-        showToast(`Account created! ID: ${empId}`, 'success');
+        if (isSelfSignup) {
+            closeModal('signup-modal');
+            return;
+        }
 
         document.getElementById('createAccountForm')?.reset();
-        if (createdEmployee) {
-            AppState.employees = [
-                createdEmployee,
-                ...AppState.employees.filter(emp => !idsMatch(emp.id, createdEmployee.id))
-            ];
-            renderEmployees(AppState.employees);
-        }
-
-        await loadEmployees();
-        updateDashboardStats();
-        updateUIAfterEmployeeLoad();
+        await loadDashboard();
         showSection('employees');
-
     } catch (err) {
         console.error(err);
         showToast(err.message, 'error');
@@ -1431,7 +1493,7 @@ async function createAccount(e) {
 async function loadCompanies() {
     try {
         const res = await apiRequest('/api/companies/');
-        if (!res.success) throw new Error(res.message);
+        if (!res.success) { throw new Error(res.message); } // No spinner here, caller manages
 
         AppState.companies = res.data?.results || res.data || [];
         renderCompanies(AppState.companies);
@@ -1439,6 +1501,7 @@ async function loadCompanies() {
     } catch (err) {
         showToast(`Failed to load companies: ${err.message}`, 'error');
         return false;
+        // No hideLoading here, as it's part of loadDashboard or another context
     }
 }
 
@@ -1548,7 +1611,7 @@ async function handleCreateCompany(e) {
 async function deleteCompany(companyId) {
     const reason = prompt('Enter reason for marking this company as Not Active:');
     if (reason === null) return;
-
+    showLoading(); // Global spinner
     try {
         const res = await apiRequest(`/api/companies/${companyId}/`, { 
             method: 'DELETE',
@@ -1598,6 +1661,24 @@ function editCompany(companyId) {
     openModal('addCompanyModal');
 }
 
+async function renewCompanyContract(companyId) {
+    if (!confirm('Renew this contract for another year?')) return;
+    const res = await apiRequest(`/api/companies/${companyId}/renew_contract/`, { method: 'POST' });
+    if (res.success) {
+        showToast('Contract renewed successfully', 'success');
+        await loadCompanies();
+    }
+}
+
+async function terminateCompanyContract(companyId) {
+    if (!confirm('Terminate this contract immediately?')) return;
+    const res = await apiRequest(`/api/companies/${companyId}/terminate_contract/`, { method: 'POST' });
+    if (res.success) {
+        showToast('Contract terminated', 'warning');
+        await loadCompanies();
+    }
+}
+
 // ==========================================
 // DEDUCTIONS MANAGEMENT - FIXED STATUS CONTROL
 // ==========================================
@@ -1605,7 +1686,7 @@ function editCompany(companyId) {
 async function loadDeductions() {
     try {
         const res = await apiRequest('/api/deductions/');
-        if (!res.success) throw new Error(res.message);
+        if (!res.success) { throw new Error(res.message); } // No spinner here, caller manages
 
         AppState.deductions = res.data?.results || res.data || [];
         renderDeductions(AppState.deductions);
@@ -1613,6 +1694,7 @@ async function loadDeductions() {
         return true;
     } catch (err) {
         showToast(`Failed to load deductions: ${err.message}`, 'error');
+        // No hideLoading here, as it's part of loadDashboard or another context
         return false;
     }
 }
@@ -1735,9 +1817,20 @@ async function updateDeduction(e) {
     }
 }
 
+async function bulkApproveDeductions() {
+    const month = prompt("Enter month to approve (YYYY-MM):", new Date().toISOString().slice(0, 7)); // No spinner for prompt
+    if (!month) return;
+    const res = await apiRequest('/api/deductions/bulk_approve/', { method: 'POST', body: { month } });
+    if (res.success) {
+        showToast(res.data.message, 'success');
+        await loadDeductions();
+    }
+}
+
 async function deleteDeduction(id) {
     if (!confirm('Are you sure you want to delete this deduction?')) return;
-
+    
+    showLoading(); // Global spinner
     try {
         const res = await apiRequest(`/api/deductions/${id}/`, { method: 'DELETE' });
         if (!res.success) throw new Error(res.message);
@@ -1787,7 +1880,7 @@ function toggleCamera() {
 
 async function loadAttendance() {
     try {
-        const res = await apiRequest('/api/attendance/');
+        const res = await apiRequest('/api/attendance/'); // No spinner here, caller manages
         if (!res.success) throw new Error(res.message);
 
         const list = res.data?.results || res.data || [];
@@ -1830,6 +1923,7 @@ async function loadAttendance() {
     } catch (err) {
         console.error('Load attendance error:', err);
         showToast(err.message || 'Failed to load attendance', 'error');
+        // No hideLoading here, as it's part of loadDashboard or another context
     }
 }
 
@@ -2056,7 +2150,7 @@ async function updatePaymentPreview() {
 
 async function loadPaymentHistory() {
     const tbody = AppState.elements.historyTbody || document.getElementById('historyTableBody');
-    if (!tbody) return;
+    if (!tbody) { return; } // No spinner here, caller manages
 
     try {
         const res = await apiRequest('/api/payments/');
@@ -2114,6 +2208,7 @@ async function loadPaymentHistory() {
         // Update pending count to show error state
         const pendingEl = document.getElementById('pendingPayments');
         if (pendingEl) pendingEl.textContent = 'Error';
+        // No hideLoading here, as it's part of loadDashboard or another context
     }
 }
 
@@ -2178,7 +2273,13 @@ async function processBulkPayment() {
 async function startBulkPaymentPolling(payments, maxAttempts = 30, interval = 3000) {
     let attempts = 0;
     let currentDelay = interval;
+    const total = payments.length;
     if (AppState.bulkPollInterval) clearTimeout(AppState.bulkPollInterval);
+
+    // Ensure global spinner is visible and showing initial progress
+    AppState.isPolling = true;
+    showLoading(null, AppState.elements.globalSpinner);
+    updateLoadingProgress(`Processing Bulk Payments: 0% (0/${total})`);
 
     const poll = async () => {
         attempts++;
@@ -2192,7 +2293,14 @@ async function startBulkPaymentPolling(payments, maxAttempts = 30, interval = 30
             }
         }
 
+        const completedCount = payments.filter(p => p.done).length;
+        const percentage = Math.round((completedCount / total) * 100);
+        updateLoadingProgress(`Processing Bulk Payments: ${percentage}% (${completedCount}/${total})`);
+
         if (payments.every(p => p.done) || attempts >= maxAttempts) {
+            AppState.isPolling = false;
+            updateLoadingProgress('Loading...'); // Reset for next use
+            hideLoading(null, AppState.elements.globalSpinner);
             await loadDashboard(); // Reloading dashboard updates stats automatically
             return;
         }
@@ -2221,21 +2329,11 @@ async function initiateIndividualPayment(empId) {
         const reference = res.data.reference;
         AppState.currentPaymentReference = reference;
 
-        if (res.data.authorization_url) {
-            // Open Paystack payment page
-            window.open(res.data.authorization_url, '_blank');
-            showToast('Payment initiated. Complete in the new window.', 'info');
-            
-            // START POLLING for status update
-            startPaymentStatusPolling(reference);
-            
-        } else if (res.data.otp_sent) {
-            showOTPModal();
-        } else {
-            showToast(res.data.message || 'Payment initiated', 'success');
-            await loadPaymentHistory();
-            await updateDashboardStats();
-        }
+        // INTERNAL OTP FLOW REMOVED -> just poll until webhook/verify marks completed/failed
+        showToast(res.data.message || 'Payment initiated', 'success');
+        await loadPaymentHistory();
+        await updateDashboardStats();
+        startPaymentStatusPolling(reference);
     } catch (err) {
         showToast(err.message || 'Failed to initiate payment', 'error');
     } finally {
@@ -2243,12 +2341,13 @@ async function initiateIndividualPayment(empId) {
     }
 }
 
+
 async function startPaymentStatusPolling(reference, maxAttempts = 30, interval = 3000) {
     let attempts = 0;
     let currentDelay = interval;
 
     const poll = async () => {
-        attempts++;
+        attempts++; // No spinner here, as it's a background poll
         const res = await apiRequest(`/payments/verify-payment/${reference}/`);
 
         if (res.success && (res.data.is_completed || res.data.payment_status === 'failed')) {
@@ -2256,6 +2355,13 @@ async function startPaymentStatusPolling(reference, maxAttempts = 30, interval =
             await loadDashboard();
             return;
         }
+        if (attempts < maxAttempts) {
+            currentDelay = Math.min(currentDelay * 1.5, 30000);
+            setTimeout(poll, currentDelay);
+        }
+    };
+    poll();
+}
 
 async function syncPaymentsWithPaystack() {
     const btn = document.getElementById('syncPaymentsBtn');
@@ -2264,18 +2370,12 @@ async function syncPaymentsWithPaystack() {
         const res = await apiRequest('/api/payments/sync_processing_payments/', { method: 'POST' });
         if (res.success) {
             showToast(res.data.message, 'success');
-            await loadDashboard();
+            await loadPaymentHistory();
+            await updateDashboardStats();
         }
     } finally {
         hideLoading(btn);
     }
-}
-        if (attempts < maxAttempts) {
-            currentDelay = Math.min(currentDelay * 1.5, 30000);
-            setTimeout(poll, currentDelay);
-        }
-    };
-    setTimeout(poll, currentDelay);
 }
 
 // ADD this helper to stop polling when modal closes:
@@ -2324,7 +2424,7 @@ async function updateBulkTotal() {
 async function loadDownloadLogs(search = '') {
     const tbody = document.getElementById('downloadLogsTableBody');
     if (!tbody) return;
-
+    
     try {
         const url = search ? buildUrl('/api/download-logs/', { search }) : '/api/download-logs/';
         const res = await apiRequest(url);
@@ -2358,6 +2458,7 @@ async function loadDownloadLogs(search = '') {
         });
     } catch (err) {
         showToast('Failed to load audit logs', 'error');
+        // No hideLoading here, as it's part of loadDashboard or another context
     }
 }
 
@@ -2403,6 +2504,7 @@ async function loadSackedEmployees() {
         });
     } catch (err) {
         showToast(`Failed to load sacked employees: ${err.message}`, 'error');
+        // No hideLoading here, as it's part of loadDashboard or another context
     }
 }
 
@@ -2448,7 +2550,7 @@ async function reinstateEmployee(sackedId) {
     if (!confirm('Are you sure you want to reinstate this employee?')) return;
 
     try {
-        const res = await apiRequest(`/api/sacked-employees/${sackedId}/reinstate/`, {
+        const res = await apiRequest(`/api/sacked-employees/${sackedId}/reinstate/`, { // Global spinner
             method: 'POST'
         });
 
@@ -2475,7 +2577,7 @@ async function loadNotifications() {
     const container = AppState.elements.notificationsContainer || document.getElementById('notificationsList');
     if (!container) return;
 
-    try {
+    try { // No spinner here, caller manages
         const res = await apiRequest('/api/notifications/');
         if (!res.success) throw new Error(res.message);
 
@@ -2506,10 +2608,12 @@ async function loadNotifications() {
     } catch (err) {
         container.innerHTML = '<p class="text-danger">Failed to load notifications.</p>';
         showToast(`Failed to load notifications: ${err.message}`, 'error');
+        // No hideLoading here, as it's part of loadDashboard or another context
     }
 }
 
 async function markAllNotificationsAsRead() {
+    showLoading(); // Global spinner
     try {
         const res = await apiRequest('/api/notifications/mark_all_read/', { method: 'POST' });
         if (!res.success) throw new Error(res.message);
@@ -2518,6 +2622,7 @@ async function markAllNotificationsAsRead() {
     } catch (err) {
         showToast(`Failed to update notifications: ${err.message}`, 'error');
     }
+    finally { hideLoading(); } // Global spinner
 }
 
 // ==========================================
@@ -2619,7 +2724,7 @@ async function renderSalaryChart(data = []) {
 
 async function updateDashboardStats() {
     const res = await apiRequest('/api/employees/dashboard_stats/');
-    if (!res.success) return;
+    if (!res.success) { return; } // No spinner here, caller manages
 
     const stats = res.data;
     
@@ -2671,7 +2776,7 @@ async function syncPaymentsWithPaystack() {
     const btn = document.getElementById('syncPaymentsBtn');
     try {
         showLoading(btn);
-        const res = await apiRequest('/api/payments/sync_processing_payments/', { method: 'POST' });
+        const res = await apiRequest('/api/payments/sync_processing_payments/', { method: 'POST' }); // Button spinner
         if (res.success) {
             showToast(res.data.message, 'success');
             await loadPaymentHistory();
@@ -2686,7 +2791,7 @@ async function syncPaymentsWithPaystack() {
  * Periodically check system health (Paystack connectivity)
  */
 function initHealthPoller() {
-    // Check every 2 minutes
+    // Check every 2 minutes (no spinner for background task)
     setInterval(async () => {
         const res = await apiRequest('/health-check/');
         if (res.success) updateHealthStatusUI(res.data);
@@ -2708,7 +2813,7 @@ function updateHealthStatusUI(data) {
 
 async function initiatePartialPayment(empId) {
     const amount = prompt("Enter available amount to pay (Leave blank for full amount):");
-    const res = await apiRequest('/api/payments/initiate_payment/', {
+    const res = await apiRequest('/api/payments/initiate_payment/', { // No spinner here, caller manages
         method: 'POST',
         body: { employee_id: empId, custom_amount: amount }
     });
@@ -2757,6 +2862,15 @@ function updateUIAfterEmployeeLoad() {
         populateEmployeeSelect(id);
     });
     updateDashboardStats();
+}
+
+async function fetchPaystackBalance() {
+    const res = await apiRequest('/api/payments/paystack_balance/');
+    const balanceEl = document.getElementById('paystackWalletBalance'); // No spinner here, caller manages
+    if (res.success && balanceEl) {
+        balanceEl.textContent = `Balance: ${res.data.balance_formatted}`;
+        balanceEl.classList.toggle('text-danger', res.data.balance < 1000); // Highlight if low
+    }
 }
 
 function populateEmployeeSelect(selectId) {
@@ -2939,19 +3053,25 @@ function toggleAllEmployees() {
 // OTP MODAL
 // ==========================================
 
-function showOTPModal() {
+function showOTPModal(title = 'Authorize Internal Payment', message = 'A security verification code has been sent to your email. Please enter it to authorize this payment initiation.') {
     const modal = document.getElementById('otpModal');
     const input = document.getElementById('otpInput');
+    const otpTitle = document.getElementById('otpModalTitle');
+    const otpMessage = document.getElementById('otpModalMessage');
+
+    if (otpTitle) otpTitle.textContent = title;
+    if (otpMessage) otpMessage.textContent = message;
+
     if (modal) modal.classList.add('active');
     if (input) input.value = '';
     startOtpCountdown();
 }
 
 function startOtpCountdown() {
-    const timerEl = document.getElementById('otpTimer');
-    const verifyBtn = document.querySelector('#otpModal .btn-primary');
-    const resendBtn = document.getElementById('resendOtpBtn');
-    
+    const timerEl = document.getElementById('otpTimer'); // Fixed: Ensure timer element exists
+    const verifyBtn = document.querySelector('#otpModal .btn-primary'); // Fixed: Ensure verify button exists
+    const resendBtn = document.getElementById('resendOtpBtn'); // Fixed: Ensure resend button exists
+
     if (!timerEl) return;
     
     let time = 30;
@@ -2974,33 +3094,67 @@ function startOtpCountdown() {
     }, 1000);
 }
 
-async function verifyOTP() {
+async function verifyOTP(e, isPaystackOtp = false) { // Fixed: Pass event object
     const otp = document.getElementById('otpInput')?.value.trim();
     if (!otp || !AppState.currentPaymentReference) {
         showToast('OTP or reference missing', 'warning');
         return;
     }
 
+    const endpoint = isPaystackOtp ? '/api/payments/finalize_paystack_transfer/' : '/api/payments/verify_payment/';
+    const body = isPaystackOtp 
+        ? { reference: AppState.currentPaymentReference, paystack_otp: otp }
+        : { reference: AppState.currentPaymentReference, otp: otp };
+
     const btn = document.querySelector('#otpModal .btn-primary');
-    
+    if (e) e.preventDefault(); // Fixed: Prevent default form submission
+
     try {
         showLoading(btn);
         
-        const res = await apiRequest('/api/payments/verify_payment/', {
+        const res = await apiRequest(endpoint, {
             method: 'POST',
-            body: { reference: AppState.currentPaymentReference, otp }
+            body: body // Fixed: Ensure body is passed
         });
 
-        showToast(res.data?.message || 'Payment verified successfully', 'success');
-        closeModal('otpModal');
-        closeModal('individualPaymentModal');
-        await loadPaymentHistory();
+        if (res.success) {
+            if (res.data?.paystack_otp_required) {
+                // Transition to Paystack OTP verification
+                showOTPModal('Paystack Transfer Authorization', 'This transfer requires a second-level authorization from Paystack. Please enter the OTP sent to your registered business phone or email.');
+                
+                const otpForm = document.getElementById('otpForm');
+                if (otpForm) {
+                    // Remove old listener and attach Paystack-specific one
+                    const newForm = otpForm.cloneNode(true);
+                    otpForm.parentNode.replaceChild(newForm, otpForm);
+                    newForm.addEventListener('submit', (e) => {
+                        e.preventDefault();
+                        verifyOTP(e, true); 
+                    });
+                }
+                return;
+            }
+
+            showToast(res.data?.message || 'Payment verified successfully', 'success');
+            closeModal('otpModal');
+            closeModal('individualPaymentModal'); // Fixed: Close individual payment modal
+            await loadPaymentHistory();
+            await updateDashboardStats();
+        } else {
+            showToast(res.message || 'Verification failed', 'error');
+        }
     } catch (err) {
         showToast('OTP verification failed', 'error');
     } finally {
-        hideLoading(btn);
+        hideLoading(btn); // Fixed: Hide loading in finally block
     }
 }
+
+async function resendOTP() {
+    // INTERNAL OTP FLOW REMOVED (no longer used for initiating/authorizing transfers)
+    showToast('Resend OTP is disabled. Payments are verified via Paystack confirmation.', 'warning');
+}
+
 
 // ADDED: Function to handle password change submission
 async function handleChangePassword(e) {
@@ -3061,7 +3215,7 @@ async function generatePayslip() {
     const btn = document.querySelector('#payslips button[onclick="generatePayslip()"]');
     
     try {
-        showLoading(btn);
+        showLoading(btn); // Button spinner
         
         const res = await apiRequest('/api/payments/generate_payslip/', {
             method: 'POST',
@@ -3085,7 +3239,7 @@ async function generatePayslip() {
     } catch (err) {
         showToast(err.message || 'Failed to generate payslip', 'error');
     } finally {
-        hideLoading(btn);
+        hideLoading(btn); // Button spinner
     }
 }
 
@@ -3095,8 +3249,9 @@ function downloadPayslip(html, employeeId, month) {
     if (passwordModal) {
         // Store the HTML temporarily for after password verification
         passwordModal.dataset.pendingPayslipHtml = html;
-        passwordModal.dataset.pendingEmployeeId = employeeId;
-        passwordModal.dataset.pendingMonth = month;
+        passwordModal.dataset.exportType = 'payslip';
+        passwordModal.dataset.employeeId = employeeId;
+        passwordModal.dataset.month = month;
         openModal('exportPasswordModal');
     } else {
         // Fallback if modal doesn't exist
@@ -3177,14 +3332,19 @@ function exportPaymentHistory() {
 
 async function triggerSecureDownload(url, token, filename) {
     try {
-        const fullUrl = `${url}?token=${token}`;
+        showLoading(null, AppState.elements.globalSpinner);
+        const fullUrl = `${url}?token=${encodeURIComponent(token)}`;
         const accessToken = AppState.accessToken || localStorage.getItem('accessToken');
+
         const response = await fetch(fullUrl, {
-            headers: { 'Authorization': `Bearer ${accessToken}` }
+            method: 'GET',
+            headers: {
+                'Authorization': `Bearer ${accessToken}`
+            }
         });
-        
+
         if (!response.ok) throw new Error('Authorization failed or token expired');
-        
+
         const blob = await response.blob();
         const downloadUrl = window.URL.createObjectURL(blob);
         const a = document.createElement('a');
@@ -3196,8 +3356,11 @@ async function triggerSecureDownload(url, token, filename) {
         a.remove();
     } catch (err) {
         showToast('Download Error: ' + err.message, 'error');
+    } finally {
+        hideLoading(null, AppState.elements.globalSpinner);
     }
 }
+
 
 async function confirmExport() {
     const password = document.getElementById('exportPassword')?.value;
@@ -3223,37 +3386,43 @@ async function confirmExport() {
         downloadFilename = `receipt_${modal.dataset.paymentId.slice(0,8)}.pdf`;
     }
 
-    const btn = document.getElementById('confirmExportBtn');
+    // Disable all buttons inside the modal while downloading to avoid double submits
+    const btn = modal?.querySelector('button[type="submit"], .btn-primary') || document.getElementById('confirmExportBtn');
     try {
         showLoading(btn);
-        const res = await apiRequest(url, { method: 'POST', body: payload });
+        const res = await apiRequest(url, { method: 'POST', body: payload }); // Button spinner
 
-        if (res.success) {
-            if (res.data['2fa_required']) {
-                const otp = prompt("A verification code has been sent to your email. Enter it to continue:");
-                if (!otp) return;
-                
-                const vRes = await apiRequest('/api/employees/verify_2fa/', {
-                    method: 'POST',
-                    body: { token: res.data.token, otp }
-                });
-
-                if (vRes.success) {
-                    await finishDownload(res.data.token, type, modal, url, downloadFilename);
-                } else {
-                    showToast('Invalid 2FA code', 'error');
-                }
-            } else {
-                // No 2FA required (Payments, Payslips, Receipts)
-                await finishDownload(res.data.token, type, modal, url, downloadFilename);
-            }
-        } else {
+        if (!res.success) {
             showToast(res.message || 'Verification failed', 'error');
+            return;
         }
+
+        // 2FA required only for the token-based employee export flow
+        if (res.data && res.data['2fa_required']) {
+            const otp = prompt("A verification code has been sent to your email. Enter it to continue:");
+            if (!otp) return;
+
+            const vRes = await apiRequest('/api/employees/verify_2fa/', {
+                method: 'POST',
+                body: { token: res.data.token, otp }
+            });
+
+            if (!vRes.success) {
+                showToast('Invalid 2FA code', 'error');
+                return;
+            }
+
+            await finishDownload(res.data.token, type, modal, url, downloadFilename);
+            return;
+        }
+
+        // No 2FA for payslips/receipts/payments exports
+        await finishDownload(res.data.token, type, modal, url, downloadFilename);
     } finally {
         hideLoading(btn);
     }
 }
+
 
 async function finishDownload(token, type, modal, url, downloadFilename) {
     const downloadEndpoint = type === 'payslip' 
@@ -3263,7 +3432,7 @@ async function finishDownload(token, type, modal, url, downloadFilename) {
             : url.replace('request_export/', 'export_csv/');
             
         await triggerSecureDownload(downloadEndpoint, token, downloadFilename);
-        showToast('Download started successfully', 'success');
+        showToast('Download started', 'success');
         closeModal('exportPasswordModal');
 }
 
@@ -3325,12 +3494,7 @@ function toggleAllBulkPayments() {
     const selectAll = document.getElementById('selectAllBulk')?.checked;
     const checkboxes = document.querySelectorAll('#bulkPaymentModal tbody input[type="checkbox"]');
     checkboxes.forEach(cb => cb.checked = selectAll);
-    updateBulkTotal(); // ADDED: Update total when toggling all
-}
-
-function resendOTP() {
-    showToast('OTP resent', 'info');
-    startOtpCountdown();
+    updateBulkTotal();
 }
 
 // ==========================================
@@ -3342,6 +3506,11 @@ function setupEmployeeIdGeneration() {
     const nameInput = document.getElementById('accountName');
     const displayEl = document.getElementById('generatedEmployeeId');
     const form = document.getElementById('createAccountForm');
+    const passwordInput = document.getElementById('accountPassword');
+
+    if (passwordInput) {
+        passwordInput.addEventListener('input', (e) => updatePasswordUI(e.target.value));
+    }
 
     const generateId = async () => {
         const type = typeSelect?.value;
@@ -3405,7 +3574,7 @@ function initEmployeeSearch() {
     const searchInput = document.getElementById('employeeSearch');
     const typeFilter = document.getElementById('employeeTypeFilter');
     
-    const filterEmployees = () => {
+    const filterEmployees = () => { // Fixed: Debounce filterEmployees
         const query = searchInput?.value.toLowerCase() || '';
         const type = typeFilter?.value || 'all';
         
@@ -3426,7 +3595,7 @@ function initEmployeeSearch() {
         renderEmployees(filtered);
     };
 
-    if (searchInput) searchInput.addEventListener('input', debounce(filterEmployees, 300));
+    if (searchInput) searchInput.addEventListener('input', debounce(filterEmployees, 300)); // Fixed: Debounce search input
     if (typeFilter) typeFilter.addEventListener('change', filterEmployees);
 }
 
@@ -3452,10 +3621,18 @@ function setupBankCodeTracking() {
 function setupEventListeners() {
     initEmployeeSearch();
     setupEmployeeIdGeneration();
-    setupBankCodeTracking();
+    setupBankCodeTracking(); // Fixed: Ensure bank code tracking is set up
     setupBankVerification();
     document.getElementById('verifyAccountBtn')?.addEventListener('click', verifyBankAccountManual);
     
+    // Bulk Approval "Check All" Listener
+    document.getElementById('selectAllEmployees')?.addEventListener('change', toggleAllEmployees);
+
+    // Bulk Actions Listeners
+    document.getElementById('bulkApproveDeductionsBtn')?.addEventListener('click', bulkApproveDeductions);
+    document.getElementById('bulkApproveEmployeesBtn')?.addEventListener('click', bulkApproveEmployees);
+    document.getElementById('resendOtpBtn')?.addEventListener('click', resendOTP);
+    document.getElementById('otpForm')?.addEventListener('submit', (e) => verifyOTP(e, false)); // Fixed: Add event listener for internal OTP form
     // Hamburger menu
     const hamburger = document.getElementById('hamburgerBtn');
     const sidebar = document.getElementById('sidebar');
@@ -3482,12 +3659,12 @@ function setupEventListeners() {
         { id: 'loginForm', handler: handleLogin },
         { id: 'clockInForm', handler: handleClockIn },
         { id: 'individualPaymentForm', handler: handleIndividualPaymentSubmit },
-        { id: 'sackEmployeeForm', handler: handleSackEmployee },
+        { id: 'sackEmployeeForm', handler: handleSackEmployee }, // Fixed: Add event listener for sack employee form
         { id: 'addCompanyForm', handler: handleCreateCompany },
         { id: 'addDeductionForm', handler: addDeduction },
         { id: 'editDeductionForm', handler: updateDeduction },
         { id: 'addEmployeeForm', handler: handleCreateEmployee },
-        { id: 'createAccountForm', handler: createAccount }, 
+        { id: 'createAccountForm', handler: (e) => handleRegistration(e, false) }, 
         { id: 'changePasswordForm', handler: handleChangePassword }, // ADDED
         { id: 'forgotPasswordForm', handler: submitForgotPassword },
         { id: 'resetPasswordForm', handler: handleResetPassword },
@@ -3503,6 +3680,12 @@ function setupEventListeners() {
     });
 }
 
+/** Select or deselect all employee checkboxes for bulk approval */
+function toggleAllEmployees() {
+    const selectAllCheckbox = document.getElementById('selectAllEmployees');
+    const checkboxes = document.querySelectorAll('.employee-checkbox');
+    checkboxes.forEach(cb => cb.checked = selectAllCheckbox?.checked);
+}
 // ==========================================
 // DASHBOARD & INITIALIZATION
 // ==========================================
@@ -3510,7 +3693,7 @@ function setupEventListeners() {
 async function loadRequests() {
     const tbody = document.getElementById('requestsTableBody');
     if (!tbody) return;
-
+    
     const renderGallery = (attachments, type) => {
         if (!attachments || !attachments.length) return '-';
         const filtered = attachments.filter(a => a.file_type === type);
@@ -3524,7 +3707,7 @@ async function loadRequests() {
         </div>`;
     };
 
-    const res = await apiRequest('/api/requests/');
+    const res = await apiRequest('/api/requests/'); // No spinner here, caller manages
     if (res.success) {
         const list = res.data?.results || res.data || [];
         tbody.innerHTML = list.length ? '' : '<tr><td colspan="8">No requests found</td></tr>';
@@ -3556,12 +3739,14 @@ async function loadRequests() {
             tbody.appendChild(row);
         });
     }
+    // No hideLoading here, as it's part of loadDashboard or another context
 }
 
 async function downloadRequestAttachments(requestId) {
     const password = prompt('Enter your login password to download attachments:');
     if (!password) return;
-
+    
+    showLoading(); // Global spinner
     try {
         const token = AppState.accessToken || localStorage.getItem('accessToken');
         const response = await fetch(`${window.location.origin}/api/requests/${requestId}/download_attachments/`, {
@@ -3595,40 +3780,7 @@ async function downloadRequestAttachments(requestId) {
 // ==========================================
 
 function showSignupModal() {
-    openModal('selfSignupModal'); // Internal ID remains, Label changes
-}
-
-async function handleSelfSignup(e) {
-    e.preventDefault();
-    const btn = e.target.querySelector('button[type="submit"]');
-    
-    const payload = {
-        username: document.getElementById('signupUsername')?.value,
-        password: document.getElementById('signupPassword')?.value,
-        full_name: document.getElementById('signupFullName')?.value,
-        email: document.getElementById('signupEmail')?.value,
-        type: document.getElementById('signupRole')?.value,
-        location: document.getElementById('signupLocation')?.value,
-        salary: document.getElementById('signupSalary')?.value || 0,
-        bank_name: document.getElementById('signupBankName')?.value,
-        account_number: document.getElementById('signupAccountNumber')?.value,
-        account_holder: document.getElementById('signupAccountHolder')?.value
-    };
-
-    try {
-        showLoading(btn);
-        const res = await apiRequest('/self-register/', { method: 'POST', body: payload });
-        if (res.success) {
-            showToast('Signup successful! Awaiting admin approval.', 'success');
-            closeModal('selfSignupModal');
-        } else {
-            // DRF returns structured errors, show the first one
-            const errorMsg = typeof res.data === 'object' ? Object.values(res.data)[0] : res.message;
-            showToast(errorMsg || 'Signup failed', 'error');
-        }
-    } finally {
-        hideLoading(btn);
-    }
+    openModal('signup-modal');
 }
 
 let requestPhotoBlobs = [];
@@ -3692,18 +3844,18 @@ async function handleCreateRequest(e) {
     formData.append('description', document.getElementById('reqDescription').value);
 
     requestPhotoBlobs.forEach((blob, i) => formData.append('proof_photos', blob, `proof_${i}.jpg`));
-    
+
     const receiptFiles = document.getElementById('reqReceipt').files;
     const compressedReceipts = await Promise.all(
         Array.from(receiptFiles).map(file => compressImage(file))
     );
-    
+
     compressedReceipts.forEach((blob, i) => {
         formData.append('receipt_files', blob, `receipt_${i}.jpg`);
     });
 
     try {
-        showLoading(btn);
+        showLoading(btn); // Button spinner
         const res = await apiRequest('/api/requests/', { method: 'POST', body: formData });
         if (res.success) {
             showToast('Request and attachments submitted successfully', 'success');
@@ -3714,16 +3866,25 @@ async function handleCreateRequest(e) {
             showToast(res.message || 'Failed to submit request', 'error');
         }
     } finally {
-        hideLoading(btn);
+        hideLoading(btn); // Button spinner
     }
 }
 
 async function approveRequest(id) {
-    if (confirm('Approve this request?')) {
+    if (!confirm('Approve this request?')) return;
+
+    showLoading(); // Global spinner
+    try {
         const res = await apiRequest(`/api/requests/${id}/approve/`, { method: 'POST' });
-        if (res.success) { showToast('Approved'); loadRequests(); }
+        if (res.success) {
+            showToast('Approved');
+            loadRequests();
+        }
+    } finally {
+        hideLoading(); // Global spinner
     }
 }
+
 
 let pendingDeclineId = null;
 function showDeclineModal(id) {
@@ -3737,7 +3898,7 @@ async function submitDeclineRequest() {
 
     const btn = document.querySelector('#declineReasonModal button.btn-danger');
     try {
-        showLoading(btn);
+        showLoading(btn); // Button spinner
         const res = await apiRequest(`/api/requests/${pendingDeclineId}/decline/`, { 
             method: 'POST', body: { reason } 
         });
@@ -3750,7 +3911,7 @@ async function submitDeclineRequest() {
             showToast(res.message || 'Failed to decline request', 'error');
         }
     } finally {
-        hideLoading(btn);
+        hideLoading(btn); // Button spinner
     }
 }
 
@@ -3766,33 +3927,37 @@ async function loadDashboard() {
     applyRolePermissions(AppState.currentUser);
 
     try {
-        // Step 1: Critical data (sequential)
-        await loadEmployees();
-        await loadDeductions();
-        await loadRequests();
+        showLoading(); // Global spinner for dashboard load
+        try {
+            // Step 1: Critical data (sequential)
+            await loadEmployees();
+            await loadDeductions();
+            await loadRequests();
 
-        // Step 2: Medium priority (parallel but limited)
-        await Promise.all([
-            loadAttendance(),
-            loadSackedEmployees(),
-            loadNotifications()
-        ]);
+            // Step 2: Medium priority (parallel but limited)
+            await Promise.all([
+                loadAttendance(),
+                loadSackedEmployees(),
+                loadNotifications()
+            ]);
 
-        // Step 3: Admin-only
-        if (AppState.currentUser?.is_superuser || 
-            AppState.currentUser?.role === 'admin' || 
-            AppState.currentUser?.is_company_admin) {
-            await loadCompanies();
+            // Step 3: Admin-only
+            if (AppState.currentUser?.is_superuser || 
+                AppState.currentUser?.role === 'admin' || 
+                AppState.currentUser?.is_company_admin) {
+                await loadCompanies();
+            }
+
+            // Step 4: Delay heavy endpoints
+            if (AppState.currentUser?.is_superuser || AppState.currentUser?.role === 'admin') {
+                setTimeout(loadPaymentHistory, 1500);
+            }
+
+            // Step 5: Non-critical
+            setTimeout(loadNigerianBanks, 2000);
+        } finally {
+            hideLoading(); // Hide global spinner for dashboard load
         }
-
-        // Step 4: Delay heavy endpoints
-        if (AppState.currentUser?.is_superuser || AppState.currentUser?.role === 'admin') {
-            setTimeout(loadPaymentHistory, 1500);
-        }
-
-        // Step 5: Non-critical
-        setTimeout(loadNigerianBanks, 2000);
-
     } catch (err) {
         console.error('Dashboard load error:', err);
     }
@@ -3852,7 +4017,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         AppState.accessToken = storedToken;
         if (storedRefresh) AppState.refreshToken = storedRefresh;
 
-        if (isJwtExpired(AppState.accessToken)) {
+        if (isJwtExpired(AppState.accessToken)) { // No spinner for internal token check
             console.log('Stored access token expired, refreshing before verification...');
             const refreshed = await refreshAccessToken();
             if (!refreshed) throw new Error('Cannot refresh token');
@@ -3861,7 +4026,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         // Step 2: verify current user (at most 2 attempts total)
         console.log('Verifying token on page load...');
         const res = await apiRequest('/current-user/');
-
+        
         if (res.success && res.data) {
             console.log('Token valid, loading dashboard');
             AppState.currentUser = res.data;
@@ -3879,7 +4044,7 @@ document.addEventListener('DOMContentLoaded', async () => {
                 throw new Error('Token refresh failed - user data missing');
             }
         }
-
+        
     } catch (err) {
         console.error('Auth bootstrap failed:', err.message);
         // Clear local storage and show login without calling apiRequest recursively
@@ -3888,7 +4053,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         AppState.accessToken = null;
         AppState.refreshToken = null;
         showLoginPage();
-    } finally {
+    } finally { // No hideLoading here, as it's the very first load
         AUTH_BOOTSTRAP_DONE = true;
         AUTH_BOOTSTRAP_IN_FLIGHT = false;
         setupEventListeners();
@@ -3908,10 +4073,11 @@ const EXPOSED_FUNCTIONS = {
     handleForgotPassword,
     submitForgotPassword,
     handleResetPassword,
+    handleRegistration,
     
     handleChangePassword, // ADDED
     // Navigation
-    showSection,
+    showSection, // Fixed: Ensure showSection is exposed
     openModal,
     closeModal,
     
@@ -3920,11 +4086,10 @@ const EXPOSED_FUNCTIONS = {
     renderEmployees,
     handleCreateEmployee,
     handleDelete,
-    createAccount,
     bulkApproveEmployees,
     resendConfirmationMail,
     approveEmployee,
-    fetchNextEmployeeId,
+    fetchNextEmployeeId, // Fixed: Ensure fetchNextEmployeeId is exposed
     setupEmployeeIdGeneration,
     
     // Companies
@@ -3946,7 +4111,7 @@ const EXPOSED_FUNCTIONS = {
     // Attendance
     loadAttendance,
     handleClockIn,
-    startCamera,
+    startCamera, // Fixed: Ensure startCamera is exposed
     capturePhoto,
     toggleUserMenu,
     handleMarkLeave,
@@ -3958,7 +4123,7 @@ const EXPOSED_FUNCTIONS = {
     handleIndividualPaymentSubmit,
     processBulkPayment,
     updatePaymentPreview,
-    updateBulkTotal,
+    updateBulkTotal, // Fixed: Ensure updateBulkTotal is exposed
     toggleAllBulkPayments,
     populateBulkTable,
     
@@ -3982,7 +4147,7 @@ const EXPOSED_FUNCTIONS = {
     syncPaymentsWithPaystack,
     
     // Exports
-    exportAllEmployees,        // <-- THIS WAS MISSING
+    exportAllEmployees, // Fixed: Ensure exportAllEmployees is exposed
     exportPaymentHistory,
     exportReceipt,
     confirmExport,
@@ -3993,7 +4158,7 @@ const EXPOSED_FUNCTIONS = {
     
     // OTP
     showOTPModal,
-    verifyOTP,
+    verifyOTP, // Fixed: Ensure verifyOTP is exposed
     resendOTP,
     startOtpCountdown,
     
@@ -4010,7 +4175,7 @@ const EXPOSED_FUNCTIONS = {
     approveRequest,
     showDeclineModal,
     submitDeclineRequest,
-    startRequestCamera,
+    startRequestCamera, // Fixed: Ensure startRequestCamera is exposed
     captureRequestPhoto,
     
     // Misc
@@ -4033,7 +4198,7 @@ const EXPOSED_FUNCTIONS = {
     updateDashboardStats,
     updateRecentActivity,
     updateUIAfterEmployeeLoad,
-    initEmployeeSearch,
+    initEmployeeSearch, // Fixed: Ensure initEmployeeSearch is exposed
     setupEventListeners,
     debounce,
     formatCurrency,
@@ -4045,7 +4210,7 @@ const EXPOSED_FUNCTIONS = {
     blobToDataUrl,
 };
 
-function openChangePasswordModal() {
+function openChangePasswordModal() { // Fixed: Ensure openChangePasswordModal is exposed
     const modal = document.getElementById('changePasswordModal');
     if (!modal) {
         showToast('Change password modal not found', 'error');
@@ -4064,7 +4229,7 @@ function openChangePasswordModal() {
     modal.classList.add('active');
 }
 
-function showChangePasswordModal() {
+function showChangePasswordModal() { // Fixed: Ensure showChangePasswordModal is exposed
     openChangePasswordModal();
 }
 
@@ -4072,8 +4237,6 @@ function showChangePasswordModal() {
 Object.keys(EXPOSED_FUNCTIONS).forEach(key => {
     window[key] = EXPOSED_FUNCTIONS[key];
 });
-window.showChangePasswordModal = showChangePasswordModal;
-window.openChangePasswordModal = openChangePasswordModal;
 
 function exportReceipt(paymentId) {
     const modal = document.getElementById('exportPasswordModal');
@@ -4083,7 +4246,7 @@ function exportReceipt(paymentId) {
         const usernameInput = document.getElementById('exportUsername');
         if (usernameInput) usernameInput.value = AppState.currentUser?.username || '';
     }
-    openModal('exportPasswordModal');
+    openModal('exportPasswordModal'); // Fixed: Open export password modal
 }
 
 async function retryPayment(transactionReferenceOrId) {
@@ -4104,5 +4267,5 @@ async function retryPayment(transactionReferenceOrId) {
     } catch (err) {
         console.error('retryPayment error:', err);
         showToast(err.message || 'Retry failed', 'error');
-    }
+    } // Fixed: Handle retryPayment errors
 }

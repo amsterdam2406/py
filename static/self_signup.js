@@ -38,6 +38,11 @@
               <div class="form-group">
                 <label for="accountPassword">Password</label>
                 <input type="password" id="accountPassword" class="form-control" required autocomplete="new-password">
+                <!-- Password Strength Indicator -->
+                <div class="strength-meter-container" style="height: 4px; background: #eee; margin-top: 5px; border-radius: 2px; overflow: hidden;">
+                    <div id="passwordStrength" style="height: 100%; width: 0; transition: all 0.3s ease;"></div>
+                </div>
+                <small id="passwordFeedback" class="form-text text-muted">Min 8 chars, uppercase, number & symbol</small>
               </div>
             </div>
 
@@ -129,8 +134,19 @@
     // Ensure the modal is hidden until explicitly opened.
     modal.style.display = 'none';
 
+    // CONSOLIDATED: Link to the unified handler in script.js
     const form = modal.querySelector('#createAccountForm');
-    if (form) form.addEventListener('submit', handleSelfSignup);
+    if (form) form.addEventListener('submit', (e) => window.handleRegistration(e, true));
+
+    // Ensure Bank verification is wired up for this dynamic modal
+    setTimeout(() => {
+        if (typeof window.setupBankVerification === 'function') {
+            window.setupBankVerification();
+        }
+        if (typeof window.setupEmployeeIdGeneration === 'function') {
+            window.setupEmployeeIdGeneration();
+        }
+    }, 100);
 
     return modal;
   }
@@ -139,104 +155,6 @@
   function showSelfSignupModal() {
     const modal = ensureModal();
     modal.style.display = 'block';
-  }
-
-  async function handleSelfSignup(e) {
-    e.preventDefault();
-
-    const accountType = document.getElementById('accountType')?.value;
-    const fullName = document.getElementById('accountName')?.value?.trim();
-    const username = document.getElementById('accountUsername')?.value?.trim();
-    const password = document.getElementById('accountPassword')?.value;
-    const location = document.getElementById('accountLocation')?.value?.trim();
-    const salary = document.getElementById('accountSalary')?.value;
-    const phone = document.getElementById('accountPhone')?.value;
-    const email = document.getElementById('accountEmail')?.value;
-    const bankName = document.getElementById('accountBankName')?.value;
-    const bankCode = document.getElementById('accountBankName')?.selectedOptions?.[0]?.dataset?.code || '';
-    const accountNumber = document.getElementById('accountNumber')?.value?.trim();
-    const accountHolder = document.getElementById('accountHolderName')?.value?.trim();
-
-    const missing = [];
-    if (!accountType) missing.push('Employee Type');
-    if (!fullName) missing.push('Full Name');
-    if (fullName && fullName.split(/\s+/).length < 2) missing.push('At least two names');
-    if (!username) missing.push('Username');
-    if (!password) missing.push('Password');
-    if (!location) missing.push('Location/Role');
-    if (!salary) missing.push('Monthly Salary');
-    if (!email) missing.push('Email');
-    if (!bankName) missing.push('Bank Name');
-    if (!bankCode) missing.push('Valid Bank Selection');
-    if (!accountNumber) missing.push('Account Number');
-    if (!accountHolder) missing.push('Account Holder Name');
-
-    if (missing.length) {
-      const msg = 'Missing fields: ' + missing.join(', ');
-      if (typeof window.showToast === 'function') window.showToast(msg, 'warning');
-      else alert(msg);
-      return;
-    }
-
-    const payload = {
-      username,
-      password,
-      full_name: fullName,
-      role: accountType,
-      email,
-      location,
-      salary,
-      phone,
-      bank_name: bankName,
-      bank_code: bankCode,
-      account_number: accountNumber,
-      account_holder: accountHolder,
-    };
-
-    const btn = document.getElementById('createAccountBtn');
-    try {
-      if (typeof window.showLoading === 'function' && btn) window.showLoading(btn);
-
-      const response = await fetch('/self-register/', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload),
-      });
-
-      const result = await response.json().catch(() => ({}));
-
-      const show = typeof window.showToast === 'function'
-        ? window.showToast
-        : (msg, _type = 'info') => alert(msg);
-
-      if (response.ok) {
-        show(result.message || 'Registration successful. Waiting for admin approval.', 'success');
-
-        const modalEl = document.getElementById('signup-modal');
-        if (modalEl) modalEl.style.display = 'none';
-
-        // Refresh admin dashboard stats/tables if those functions exist
-        if (typeof window.loadEmployees === 'function') {
-          await window.loadEmployees();
-        }
-        if (typeof window.loadDeductions === 'function') {
-          await window.loadDeductions();
-        }
-        if (typeof window.updateDashboardStats === 'function') {
-          window.updateDashboardStats();
-        }
-
-      } else {
-        show('Error: ' + (result.error || result.message || 'Self signup failed'), 'error');
-      }
-    } catch (error) {
-      const show = typeof window.showToast === 'function'
-        ? window.showToast
-        : (msg, _type = 'info') => alert(msg);
-      show('Network error: ' + (error?.message || error), 'error');
-    } finally {
-      if (typeof window.hideLoading === 'function' && btn) window.hideLoading(btn);
-    }
   }
 
   // Expose globals expected by inline handlers

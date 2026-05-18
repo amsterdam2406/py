@@ -130,6 +130,7 @@ def login_view(request):
         user = authenticate(request, username=username, password=password)
         
         # Logic: If standard login fails, try login with Employee ID
+        # This is a good fallback handling for user convenience
         if not user:
             try:
                 employee = Employee.objects.get(employee_id=username)
@@ -214,7 +215,7 @@ def register_view(request):
     last_name = data.get('last_name')
     full_name = (data.get('full_name') or '').strip()
     current_user = request.user
-    employee_id = data.get('employee_id')  # May be rovided from frontend
+    employee_id = data.get('employee_id')  # May be provided from frontend
         # Rolevalidation
     if role not in ['admin', 'staff', 'guard']:
         return Response(
@@ -307,8 +308,8 @@ def register_view(request):
                 {'error': verification_error, 'field': 'account_holder'},
                 status=status.HTTP_400_BAD_REQUEST
             )
-        data = data.copy()
-        data['account_holder'] = verified_holder
+        mutable_data = data.copy()
+        mutable_data['account_holder'] = verified_holder
     
     try:
         with transaction.atomic():
@@ -661,36 +662,6 @@ def request_password_reset(request):
     # Return generic success for security (preventing account enumeration)
     return Response({'message': 'If an active account exists with this email, you will receive a reset link.'})
 
-
-@api_view(['POST'])
-@permission_classes([AllowAny])
-@throttle_classes([LoginThrottle])
-def reset_password_confirm(request, uidb64, token):
-    """Confirm reset token and update password"""
-    password = request.data.get('password')
-    if not password:
-        return Response({'error': 'New password is required'}, status=400)
-
-    try:
-        uid = force_str(urlsafe_base64_decode(uidb64))
-        user = User.objects.get(pk=uid)
-    except (TypeError, ValueError, OverflowError, User.DoesNotExist):
-        return Response({'error': 'Invalid reset link'}, status=400)
-
-    if default_token_generator.check_token(user, token):
-        try:
-            validate_password(password, user)
-        except ValidationError as e:
-            return Response({'error': e.messages}, status=400)
-            
-        user.set_password(password)
-        user.save()
-        log_audit(user, "Password reset successfully via email token", request)
-        logger.info(f"Password successfully reset for user: {user.username}")
-        return Response({'message': 'Password has been reset successfully.'})
-    
-    return Response({'error': 'The reset link is invalid or has expired.'}, status=400)
-
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])
 def change_password(request):
@@ -738,3 +709,35 @@ def change_password(request):
     logger.info(f"Password changed for user {user.username} by {request.user.username}")
     
     return Response({'message': 'Password changed successfully'}, status=status.HTTP_200_OK)
+
+@api_view(['POST'])
+@permission_classes([AllowAny])
+def reset_password_confirm(request, uidb64=None, token=None):
+    """Complete the password reset using the token and uid"""
+    # Support both URL params and body params for flexibility
+    uidb64 = uidb64 or request.data.get('uid')
+    token = token or request.data.get('token')
+    # script.js sends 'password', while some older flows might use 'new_password'
+    new_password = request.data.get('password') or request.data.get('new_password')
+    
+    if not all([uidb64, token, new_password]):
+        return Response({'error': 'Missing required fields'}, status=400)
+        
+    try:
+        uid = force_str(urlsafe_base64_decode(uidb64))
+        user = User.objects.get(pk=uid)
+    except (TypeError, ValueError, OverflowError, User.DoesNotExist):
+        user = None
+
+    if user is not None and default_token_generator.check_token(user, token):
+        try:
+            validate_password(new_password, user)
+        except ValidationError as e:
+            return Response({'error': e.messages}, status=400)
+            
+        user.set_password(new_password)
+        user.save()
+        log_audit(user, "Password reset confirmed via token", request)
+        return Response({'message': 'Password has been reset successfully.'})
+    
+    return Response({'error': 'The reset link is invalid or has expired.'}, status=400)

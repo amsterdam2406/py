@@ -38,6 +38,7 @@ class User(AbstractUser):
     is_payment_admin = models.BooleanField(default=False)
     is_deduction_admin = models.BooleanField(default=False)
     is_password_admin = models.BooleanField(default=False)
+    is_hr_admin = models.BooleanField(default=False)
     is_request_admin = models.BooleanField(default=False)
     
     def save(self, *args, **kwargs):
@@ -101,37 +102,42 @@ class Employee(models.Model):
         return f"{self.employee_id} - {self.name}"
     
     def generate_employee_id(self):
-        """
-        Generate unique employee ID format:
-        Staff: FSS-001-STAFF, FSS-002-STAFF...
-        Guard: FSS-001-GRD, FSS-002-GRD...
+        """Generate unique employee ID format with separate sequences per type.
+
+        Examples:
+        - Staff: FSS-001-STAFF, FSS-002-STAFF...
+        - Guard: FSS-001-GRD,   FSS-002-GRD...
         """
         with transaction.atomic():
-            # Get the global last sequence number (shared between staff and guards)
-            last_employee = Employee.objects.select_for_update().order_by('-id_sequence').first()
-            
+            # Lock last rows for the *same type* so staff and guards don't share numbering.
+            # Note: id_sequence is shared by the model, but we treat it as per-type sequence.
+            type_sequence_qs = (
+                Employee.objects.select_for_update()
+                .filter(type=self.type)
+                .exclude(id_sequence__isnull=True)
+                .order_by('-id_sequence')
+            )
+            last_employee = type_sequence_qs.first()
+
             if last_employee and last_employee.id_sequence:
                 next_sequence = last_employee.id_sequence + 1
             else:
-                # Start from 1 if no employees exist
                 next_sequence = 1
-            
-            # Format based on type
+
             if self.type == 'staff':
                 suffix = 'STAFF'
             elif self.type == 'guard':
                 suffix = 'GRD'
             else:
                 suffix = 'EMP'
-            
-            # Format: FSS-001-STAFF (sequence padded to 3 digits)
+
             employee_id = f"FSS-{str(next_sequence).zfill(3)}-{suffix}"
-            
-            # CRITICAL: Check if this ID somehow exists (shouldn't happen with atomic)
+
+            # Safety check in case of legacy/previous data inconsistencies.
             while Employee.objects.filter(employee_id=employee_id).exists():
                 next_sequence += 1
                 employee_id = f"FSS-{str(next_sequence).zfill(3)}-{suffix}"
-            
+
             self.id_sequence = next_sequence
             return employee_id
     
@@ -210,6 +216,7 @@ class Deduction(models.Model):
         ('applied', 'Applied'),
         ('cancelled', 'Cancelled'),      # ADDED: For manual cancellation
         ('terminated', 'Terminated'),    # ADDED: For terminated employees
+        ('pending_hr', 'Pending HR Approval'),
     ]
     
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
@@ -218,6 +225,8 @@ class Deduction(models.Model):
     reason = models.TextField()
     date = models.DateField()
     status = models.CharField(max_length=10, choices=STATUS_CHOICES, default='pending')
+    hr_approved = models.BooleanField(default=False)
+    hr_approved_by = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True, related_name='hr_approved_deductions')
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
     
@@ -236,14 +245,19 @@ class Payment(models.Model):
         ('processing', 'Processing'),
         ('completed', 'Completed'),
         ('failed', 'Failed'),
+        ('pending_paystack_otp', 'Awaiting Paystack OTP'),
+        ('pending_hr', 'Pending HR Approval'),
     ]    
     # Stalte Machine Definition
-    STATUS_TRANSITIONS = {
-        'pending': ['processing', 'failed'],
-        'processing': ['completed', 'failed'],
+    STATUS_TRANSITIONS = { # Corrected transitions
+        'pending': ['processing', 'failed', 'pending_paystack_otp'], 
+        'processing': ['completed', 'failed', 'pending_paystack_otp'], 
+        'pending_paystack_otp': ['completed', 'failed', 'processing'],
         'failed': ['processing'], # Allow retry
         'completed': [] # Terminal state
     }
+    # Transitions for HR Approval
+    STATUS_TRANSITIONS['pending_hr'] = ['pending', 'failed', 'cancelled']
 
     METHOD_CHOICES = [
         ('card', 'Card Payment'),
@@ -284,8 +298,11 @@ class Payment(models.Model):
     payment_method = models.CharField(max_length=20, choices=METHOD_CHOICES)
     transaction_reference = models.CharField(max_length=100, unique=True)
     paystack_reference = models.CharField(max_length=100, blank=True, null=True)
+    paystack_transfer_code = models.CharField(max_length=100, blank=True, null=True)
     
-    status = models.CharField(max_length=15, choices=STATUS_CHOICES, default='pending')
+    status = models.CharField(max_length=25, choices=STATUS_CHOICES, default='pending')
+    hr_approved = models.BooleanField(default=False)
+    hr_approved_by = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True, related_name='hr_approved_payments')
     payment_date = models.DateField()
     processed_by = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, related_name='processed_payments')
     
@@ -439,19 +456,23 @@ class EmployeeRequestAttachment(models.Model):
         db_table = 'employee_request_attachments'
 
 class OTP(models.Model):
-    """OTP Model for payment verification"""
+    """OTP Model (legacy: may still be used for some flows).
+
+    NOTE: For internal payment verification we no longer rely on creating multiple OTP rows
+    per payment reference.
+    """
     email = models.EmailField()
-    code = models.CharField(max_length=6,
-                            validators=[RegexValidator(r'^\d{6}$', 'OTP must be a 6-digit s number.')]
-                            )
-    reference = models.CharField(max_length=100, unique=True)
+    code = models.CharField(
+        max_length=6,
+        validators=[RegexValidator(r'^\d{6}$', 'OTP must be a 6-digit number.')]
+    )
+    reference = models.CharField(max_length=100)  # not unique (prevents UNIQUE constraint crashes)
     is_used = models.BooleanField(default=False)
     expires_at = models.DateTimeField()
     created_at = models.DateTimeField(auto_now_add=True)
     attempt_count = models.IntegerField(default=0)
     max_attempts = models.IntegerField(default=3)
-    
-    
+
     class Meta:
         db_table = 'otps'
         ordering = ['-created_at']
@@ -461,6 +482,7 @@ class OTP(models.Model):
     
     def has_expired(self):
         return timezone.now() > self.expires_at
+
 
 class ExportToken(models.Model):
     """Export Token Model for secure data exports"""

@@ -64,7 +64,8 @@ from .serializers import (
     SackedEmployeeSerializer, NotificationSerializer, EmployeeRequestSerializer,
     SelfSignupSerializer
 )
-from .paystack import PaystackAPI, NIGERIAN_BANKS
+from .paystack import PaystackAPI
+from .services import applied_deductions_for_month, get_employee_bank_code
 from .image_utils import compress_and_validate_image
 from .permissions import (
     IsAdmin, CanCreateEmployee, IsSackAdmin, IsPayrollAdmin,
@@ -75,31 +76,6 @@ from .utils import log_audit, get_client_ip
 
 User = get_user_model()
 logger = logging.getLogger(__name__)
-
-
-def applied_deductions_for_month(employee, month_key):
-    year, month = map(int, month_key.split('-'))
-    return Deduction.objects.filter(
-        employee=employee,
-        status='applied',
-        date__year=year,
-        date__month=month,
-    )
-
-
-def get_employee_bank_code(employee):
-    bank_code = getattr(employee, 'bank_code', None)
-    if bank_code:
-        return bank_code
-
-    normalized_name = (employee.bank_name or '').strip().lower()
-    for code, name in NIGERIAN_BANKS.items():
-        if normalized_name == (name or '').strip().lower():
-            if hasattr(employee, 'bank_code'):
-                employee.bank_code = code
-                employee.save(update_fields=['bank_code'])
-            return code
-    return None
 
 
 class DownloadLogSerializer(serializers.ModelSerializer):
@@ -114,75 +90,6 @@ class DownloadLogSerializer(serializers.ModelSerializer):
             'employee_id', 'doc_type', 'reference', 'ip_address', 'timestamp'
         ]
 
-# ─────────────────────────────────────────
-# PAYSTACK BANK UTILITIES
-# ─────────────────────────────────────────
-@api_view(['POST'])
-@permission_classes([AllowAny])
-def forgot_password_request(request):
-    """Send password reset link to user email"""
-    email = request.data.get('email')
-    if not email:
-        return Response({'error': 'Email is required'}, status=400)
-    
-    user = User.objects.filter(email__iexact=email).first()
-    if user:
-        token = default_token_generator.make_token(user)
-        uid = urlsafe_base64_encode(force_bytes(user.pk))
-        # This link points back to your frontend with action params
-        reset_link = f"{settings.FRONTEND_URL}/?action=reset-password&uid={uid}&token={token}"
-        
-        subject = 'Fotasco Payroll - Password Reset Request'
-        from_email = settings.DEFAULT_FROM_EMAIL
-        
-        # Plain text version for non-HTML clients
-        text_content = (
-            f"Hello {user.username or user.first_name or 'User'},\n\n"
-            f"You requested a password reset for your Fotasco Payroll account. "
-            f"Please click the link below to set a new password:\n\n{reset_link}\n\n"
-            f"This link will expire in 24 hours. If you did not request this, please ignore this email."
-        )
-        
-        context = {
-            'user_display_name': user.username or user.first_name or 'User',
-            'reset_link': reset_link,
-            'current_year': datetime.now().year
-        }
-        html_content = render_to_string('emails/password_reset.html', context)
-
-        try:
-            msg = EmailMultiAlternatives(subject, text_content, from_email, [email])
-            msg.attach_alternative(html_content, "text/html")
-            msg.send(fail_silently=False)
-        except Exception as e:
-            logger.error(f"Email sending failed: {e}")
-            return Response({'error': 'Failed to send reset email. Please try again later.'}, status=500)
-            
-    return Response({'message': 'If an account exists with that email, a password reset link has been sent.'})
-
-@api_view(['POST'])
-@permission_classes([AllowAny])
-def reset_password_confirm(request):
-    """Complete the password reset using the token and uid"""
-    uidb64 = request.data.get('uid')
-    token = request.data.get('token')
-    new_password = request.data.get('new_password')
-    
-    if not all([uidb64, token, new_password]):
-        return Response({'error': 'Missing required fields'}, status=400)
-        
-    try:
-        uid = force_str(urlsafe_base64_decode(uidb64))
-        user = User.objects.get(pk=uid)
-    except (TypeError, ValueError, OverflowError, User.DoesNotExist):
-        user = None
-
-    if user is not None and default_token_generator.check_token(user, token):
-        user.set_password(new_password)
-        user.save()
-        return Response({'message': 'Password has been reset successfully.'})
-    
-    return Response({'error': 'The reset link is invalid or has expired.'}, status=400)
 
 @api_view(['GET'])
 @permission_classes([AllowAny])
@@ -430,12 +337,10 @@ def _handle_transfer_success(data):
             payment = Payment.objects.select_for_update().get(transaction_reference=reference)
             logger.info(f"Handling transfer.success for payment {payment.id}, current status: {payment.status}")
 
-            # change_status handles the save operation
+            payment.paystack_reference = str(data.get('id', ''))
+            # change_status handles the save operation, now including the reference
             if not payment.change_status('completed'):
                 return
-
-            payment.paystack_reference = str(data.get('id', ''))
-            payment.save()
             
             # Automate Receipt Email
             send_payment_receipt_email(payment)
@@ -470,8 +375,6 @@ def _handle_transfer_failed(data):
             if not payment.change_status('failed'):
                 return
             
-            payment.save()
-
             # Keep deductions as 'pending' unless they are cancelled manually by deduction admin.
 
             Notification.objects.create(
@@ -502,8 +405,6 @@ def _handle_transfer_reversed(data):
             # change_status handles the save operation
             if not payment.change_status('failed'):
                 return
-
-            payment.save()
 
             Notification.objects.create(
                 user=payment.employee.user,
@@ -638,6 +539,8 @@ class UserViewSet(viewsets.ModelViewSet):
             return User.objects.all().order_by('id')
         if user.role == 'admin':
             return User.objects.filter(role__in=['staff', 'guard']).order_by('id')
+        if getattr(user, 'is_hr_admin', False):
+             return User.objects.all().order_by('id')
         return User.objects.filter(id=user.id).order_by('id')
 
     @action(detail=False, methods=['get'], permission_classes=[IsAuthenticated])
@@ -692,7 +595,7 @@ class EmployeeViewSet(viewsets.ModelViewSet):
 
     def get_queryset(self):
         user = self.request.user
-        if user.is_superuser or user.role == 'admin':
+        if user.is_superuser or user.role == 'admin' or getattr(user, 'is_hr_admin', False) or getattr(user, 'is_employee_admin', False):
             return Employee.objects.filter(status__in=['active', 'pending']).order_by('-created_at')
         return Employee.objects.filter(user=user).order_by('-created_at')
 
@@ -1379,8 +1282,10 @@ class PaymentViewSet(viewsets.ModelViewSet):
 
     def get_queryset(self):
         user = self.request.user
-        if user.is_superuser or user.role == 'admin' or getattr(user, 'is_payment_admin', False):
+        if user.is_superuser or user.role == 'admin' or getattr(user, 'is_hr_admin', False):
             return Payment.objects.all().order_by('id')
+        if getattr(user, 'is_payment_admin', False):
+             return Payment.objects.all().order_by('id')
         return Payment.objects.filter(employee__user=user).order_by('id')
 
     @action(detail=False, methods=['get'], permission_classes=[IsAuthenticated, IsPayrollAdmin])
@@ -1455,6 +1360,11 @@ class PaymentViewSet(viewsets.ModelViewSet):
             is_partial = False
             total_deductions = 0
 
+            # Set initial status based on role
+            initial_status = 'pending'
+            if not (request.user.is_superuser or getattr(request.user, 'is_hr_admin', False)):
+                initial_status = 'pending_hr'
+
             if custom_amount:
                 try:
                     net_salary = Decimal(str(custom_amount))
@@ -1496,102 +1406,37 @@ class PaymentViewSet(viewsets.ModelViewSet):
                 payment_date=timezone.now().date(),
                 payment_month=payment_month,
                 processed_by=request.user,
-                status='processing',
-                is_partial=is_partial,
+                status=initial_status,
+                is_partial=is_partial, # Initial status is 'pending' before internal OTP verification
                 payment_method='bank_transfer'
             )
 
+            # Generate Internal OTP for security verification
+            otp_code = ''.join(random.choices(string.digits, k=6))
+            # INTERNAL OTP REMOVED
+            # Security now relies on authentication + Paystack transfer webhook confirmation.
+            return Response({
+                'message': 'Payment initiated. Awaiting Paystack confirmation via webhook.',
+                'reference': payment.transaction_reference,
+                'amount': float(net_salary),
+                'otp_sent': False,
+                'employee': employee.name,
+                'bank': employee.bank_name,
+                'account': employee.account_number,
+                'note': 'Payment will be confirmed automatically via webhook'
+            })
 
-            try:
-                paystack = PaystackAPI()
-            except Exception as e:
-                logger.error(f"Paystack API Init Error: {e}")
-                return Response({'error': 'Payment service is currently unavailable'}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
-
-            # Step 1: Get or create recipient
-            # Reuse stored recipient_code if available to avoid duplicates
-            recipient_code = getattr(employee, 'paystack_recipient_code', None)
-
-            if not recipient_code:
-                try:
-                    recipient_result = paystack.create_recipient(
-                        name=employee.name,
-                        account_number=employee.account_number,
-                        bank_code=bank_code
-                    )
-
-                    if not recipient_result or not recipient_result.get('status'):
-                        payment.status = 'failed'
-                        payment.save()
-                        return Response(
-                            {'error': f"Failed to create recipient: {recipient_result.get('message') if recipient_result else 'Unknown error'}"},
-                            status=status.HTTP_400_BAD_REQUEST
-                        )
-                except Exception as e:
-                    payment.status = 'failed'
-                    payment.save()
-                    logger.error(f"Paystack Recipient Error: {e}")
-                    return Response({'error': 'Failed to communicate with payment provider'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
-
-                recipient_code = recipient_result.get('recipient_code')
-
-                # Save recipient_code to employee if field exists
-                if hasattr(employee, 'paystack_recipient_code'):
-                    employee.paystack_recipient_code = recipient_code
-                    employee.save(update_fields=['paystack_recipient_code'])
-
-            # Step 2: Initiate transfer
-            try:
-                transfer_result = paystack.initiate_transfer(
-                    amount=int(net_salary * 100),
-                    recipient_code=recipient_code,
-                    reference=payment.transaction_reference,
-                    reason=f"Salary - {employee.name} ({employee.employee_id})"
-                )
-            except Exception as e:
-                payment.status = 'failed'
-                payment.save()
-                logger.error(f"Paystack Transfer Error: {e}")
-                return Response({'error': 'Transfer initiation failed'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
-
-            if transfer_result.get('status'):
-                transfer_status = transfer_result.get('data', {}).get('status', 'pending')
-                if transfer_status == 'success':
-                    payment.status = 'completed'
-                    payment.paystack_reference = str(transfer_result.get('data', {}).get('id', '') or '')
-                    payment.save(update_fields=['status', 'paystack_reference', 'updated_at'])
-                elif transfer_status in ['failed', 'reversed']:
-                    payment.status = 'failed'
-                    payment.save(update_fields=['status', 'updated_at'])
-                logger.info(
-                    f"{request.user.username} initiated salary transfer for "
-                    f"{employee.name}: NGN {net_salary} (status={transfer_status})"
-                )
-                return Response({
-                    'message': 'Salary transfer initiated successfully',
-                    'reference': payment.transaction_reference,
-                    'transfer_status': transfer_status,
-                    'amount': float(net_salary),
-                    'employee': employee.name,
-                    'bank': employee.bank_name,
-                    'account': employee.account_number,
-                    # transfer.success webhook will mark it completed
-                    'note': 'Payment will be confirmed automatically via webhook'
-                })
-            else:
-                payment.status = 'failed'
-                payment.save()
-                return Response(
-                    {'error': f"Transfer failed: {transfer_result.get('message')}"},
-                    status=status.HTTP_400_BAD_REQUEST
-                )
 
     @action(detail=False, methods=['post'], permission_classes=[IsAuthenticated, IsPayrollAdmin])
     def bulk_payment(self, request):
         """
-        UPDATED: Uses bulk_transfer for efficiency instead of
-        looping individual transfers.
+        Initiate multiple transfers.
+
+        Internal OTP authorization has been removed; security is handled by:
+        - authenticated access (IsPayrollAdmin)
+        - Paystack transfer status + webhook confirmation
         """
+
         employee_ids = request.data.get('employee_ids', [])
         if not employee_ids:
             return Response({'error': 'No employees selected'}, status=status.HTTP_400_BAD_REQUEST)
@@ -1716,76 +1561,143 @@ class PaymentViewSet(viewsets.ModelViewSet):
         reference = request.data.get('reference')
         otp_code = request.data.get('otp')
 
-        if not reference:
+        if not reference or not otp_code: # OTP is now mandatory for this endpoint
             return Response({'error': 'Reference required'}, status=status.HTTP_400_BAD_REQUEST)
 
         try:
             payment = Payment.objects.get(transaction_reference=reference)
 
             # OTP verification (kept for collection payments)
-            if otp_code:
+            if otp_code: # This is the internal OTP verification
                 try:
                     otp = OTP.objects.get(reference=reference, code=otp_code, is_used=False)
-                    if otp.attempt_count >= 3:
+                    if otp.attempt_count >= 3: # Max 3 attempts for internal OTP
                         raise ValidationError('Too many failed OTP attempts. Request a new OTP.')
                     if otp.has_expired():
                         return Response({'error': 'OTP has expired'}, status=status.HTTP_400_BAD_REQUEST)
                     if otp.code != otp_code:
                         otp.attempt_count += 1
                         otp.save()
-                        raise ValidationError('Incorrect OTP')
+                        return Response({'error': 'Incorrect OTP'}, status=status.HTTP_400_BAD_REQUEST)
                     otp.is_used = True
                     otp.save()
                 except OTP.DoesNotExist:
-                    return Response({'error': 'Invalid OTP'}, status=status.HTTP_400_BAD_REQUEST)
+                    return Response({'error': 'Invalid Internal OTP'}, status=status.HTTP_400_BAD_REQUEST)
+            else:
+                return Response({'error': 'Internal OTP is required to proceed'}, status=status.HTTP_400_BAD_REQUEST)
 
-            # If already completed by webhook, just return success
-            if payment.status == 'completed':
-                return Response({'message': 'Payment already verified and completed'})
+            # --- Internal OTP verified, now initiate Paystack transfer ---
+            if payment.status != 'pending': # Ensure payment is in the correct state
+                return Response({'error': 'Payment is not in a pending state for initiation.'}, status=status.HTTP_400_BAD_REQUEST)
 
             paystack = PaystackAPI()
+            employee = payment.employee
+            bank_code = get_employee_bank_code(employee)
+            if not bank_code:
+                return Response({'error': 'Employee bank_code is missing.'}, status=status.HTTP_400_BAD_REQUEST)
 
-            # For bank transfers use verify_transfer, for card use verify_transaction
-            if payment.payment_method == 'bank_transfer':
-                verification = paystack.verify_transfer(reference)
-                transfer_data = verification.get('data') if isinstance(verification.get('data'), dict) else {}
-                transfer_status = transfer_data.get('status', '')
+            # Get or create recipient
+            recipient_code = getattr(employee, 'paystack_recipient_code', None)
+            if not recipient_code:
+                recipient_result = paystack.create_recipient(
+                    name=employee.name, account_number=employee.account_number, bank_code=bank_code
+                )
+                if not recipient_result or not recipient_result.get('status'):
+                    payment.status = 'failed'
+                    payment.save()
+                    return Response({'error': f"Failed to create recipient: {recipient_result.get('message')}"}, status=status.HTTP_400_BAD_REQUEST)
+                recipient_code = recipient_result.get('recipient_code')
+                if hasattr(employee, 'paystack_recipient_code'):
+                    employee.paystack_recipient_code = recipient_code
+                    employee.save(update_fields=['paystack_recipient_code'])
 
-                if verification.get('status') is True and transfer_status == 'success':
+            # Initiate transfer with Paystack
+            transfer_result = paystack.initiate_transfer(
+                amount=int(payment.net_amount * 100),
+                recipient_code=recipient_code,
+                reference=payment.transaction_reference,
+                reason=f"Salary - {employee.name} ({employee.employee_id})"
+            )
+
+            if transfer_result.get('status'):
+                paystack_transfer_status = transfer_result.get('data', {}).get('status')
+                paystack_transfer_code = transfer_result.get('data', {}).get('transfer_code')
+
+                payment.paystack_transfer_code = paystack_transfer_code # Store Paystack's transfer code
+                payment.status = 'pending_paystack_otp' if paystack_transfer_status == 'otp' else 'processing'
+                payment.save()
+                
+                # Check status and return correct frontend instruction
+                if paystack_transfer_status == 'otp':
+                    return Response({
+                        'message': 'Paystack requires OTP to finalize transfer.',
+                        'paystack_otp_required': True,
+                        'paystack_transfer_code': paystack_transfer_code,
+                        'reference': reference
+                    }, status=status.HTTP_200_OK) # Frontend will use this to show Paystack OTP modal
+
+                elif paystack_transfer_status == 'success':
                     with transaction.atomic():
                         payment.status = 'completed'
-                        payment.paystack_reference = str(transfer_data.get('id', ''))
+                        payment.paystack_reference = str(transfer_result.get('data', {}).get('id', '') or '')
                         payment.save()
-
                         Notification.objects.create(
                             user=payment.employee.user,
                             message=f"Salary payment of ₦{payment.net_amount:,.2f} confirmed.",
                             type='success'
                         )
+                    logger.info(f"Transfer initiated and completed for {payment.employee.name} (Ref: {reference})")
+                    return Response({'message': 'Payment initiated and completed successfully', 'payment_completed': True}, status=status.HTTP_200_OK)
 
-                    logger.info(f"Transfer manually verified for {payment.employee.name}")
-                    return Response({'message': 'Payment verified successfully'})
+                elif paystack_transfer_status in ['failed', 'reversed']:
+                    payment.status = 'failed'
+                    payment.save()
+                    logger.error(f"Paystack transfer failed for {payment.employee.name} (Ref: {reference})")
+                    return Response({'error': 'Paystack transfer failed', 'payment_failed': True}, status=status.HTTP_400_BAD_REQUEST) # Frontend will show error
 
-                return Response(
-                    {'error': f'Transfer not yet completed. Status: {transfer_status}'},
-                    status=status.HTTP_400_BAD_REQUEST
-                )
-
+                else: # 'processing' or 'pending'
+                    payment.status = 'processing'
+                    payment.save()
+                    logger.info(f"Paystack transfer initiated, status: {paystack_transfer_status} (Ref: {reference})")
+                    # Frontend will poll verify_payment_status
+                    return Response({'message': 'Payment initiated, awaiting Paystack confirmation', 'payment_processing': True})
             else:
-                # Card payment via initialize_transaction
-                verification = paystack.verify_transaction(reference)
+                payment.status = 'failed'
+                payment.save()
+                return Response({'error': f"Paystack transfer initiation failed: {transfer_result.get('message')}"}, status=status.HTTP_400_BAD_REQUEST)
 
-                # FIXED: Safe data extraction
-                paystack_status = (
-                    verification.get('data', {}).get('status')
-                    if isinstance(verification.get('data'), dict)
-                    else None
-                )
+        except Payment.DoesNotExist:
+            return Response({'error': 'Payment not found'}, status=status.HTTP_404_NOT_FOUND)
+        except Exception as e:
+            logger.error(f"Error in verify_payment after internal OTP: {e}")
+            return Response({'error': 'An error occurred during payment initiation'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
-                if verification.get('status') is True and paystack_status == 'success':
+    @action(detail=False, methods=['post'], permission_classes=[IsAuthenticated, IsPayrollAdmin])
+    def finalize_paystack_transfer(self, request):
+        """
+        Finalize a Paystack transfer that is pending an OTP from Paystack.
+        This is called after the admin enters the OTP received from Paystack.
+        """
+        reference = request.data.get('reference')
+        paystack_otp = request.data.get('paystack_otp')
+
+        if not reference or not paystack_otp:
+            return Response({'error': 'Reference and Paystack OTP are required'}, status=status.HTTP_400_BAD_REQUEST)
+
+        try: # Ensure payment is in the correct state for finalization
+            payment = Payment.objects.get(transaction_reference=reference, status='pending_paystack_otp')
+            if not payment.paystack_transfer_code:
+                return Response({'error': 'No Paystack transfer code found for this payment'}, status=status.HTTP_400_BAD_REQUEST)
+
+            paystack = PaystackAPI()
+            finalize_result = paystack.finalize_transfer(payment.paystack_transfer_code, paystack_otp)
+
+            if finalize_result.get('status'):
+                finalize_status = finalize_result.get('data', {}).get('status')
+                if finalize_status == 'success':
                     with transaction.atomic():
                         payment.status = 'completed'
-                        payment.paystack_reference = verification['data'].get('reference', '')
+                        payment.paystack_reference = str(finalize_result.get('data', {}).get('id', '') or '')
                         payment.save()
 
                         Notification.objects.create(
@@ -1794,21 +1706,30 @@ class PaymentViewSet(viewsets.ModelViewSet):
                                 f"Payment credited for {payment.employee.employee_id} - "
                                 f"{payment.employee.name}: ₦{payment.net_amount}"
                             ),
-                            type='success'
-                        )
+                            type='success')
+                    logger.info(f"Paystack transfer finalized and completed for {payment.employee.name} (Ref: {reference})")
+                    return Response({'message': 'Payment finalized and completed successfully', 'payment_completed': True})
 
-                    logger.info(f"Payment verified for {payment.employee.name}")
-                    return Response({'message': 'Payment verified successfully'})
+                elif finalize_status in ['failed', 'reversed']:
+                    payment.status = 'failed'
+                    payment.save()
+                    logger.error(f"Paystack transfer failed during finalization for {payment.employee.name} (Ref: {reference})")
+                    return Response({'error': 'Paystack transfer failed during finalization', 'payment_failed': True}, status=status.HTTP_400_BAD_REQUEST)
 
+                else: # e.g., 'pending' from Paystack
+                    payment.status = 'processing' # Still processing, webhook will update
+                    payment.save()
+                    return Response({'message': 'Paystack transfer finalized, awaiting confirmation', 'payment_processing': True})
+
+            else:
                 payment.status = 'failed'
                 payment.save()
-                return Response(
-                    {'error': 'Payment verification failed'},
-                    status=status.HTTP_400_BAD_REQUEST
-                )
-
+                return Response({'error': f"Paystack finalization failed: {finalize_result.get('message')}"}, status=status.HTTP_400_BAD_REQUEST)
         except Payment.DoesNotExist:
-            return Response({'error': 'Payment not found'}, status=status.HTTP_404_NOT_FOUND)
+            return Response({'error': 'Payment not found or not in pending_paystack_otp status'}, status=status.HTTP_404_NOT_FOUND)
+        except Exception as e:
+            logger.error(f"Error finalizing Paystack transfer: {e}")
+            return Response({'error': 'An error occurred during Paystack transfer finalization'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     @action(detail=False, methods=['post'], permission_classes=[IsAuthenticated])
     def resend_otp(self, request):
@@ -1819,23 +1740,23 @@ class PaymentViewSet(viewsets.ModelViewSet):
         try:
             payment = Payment.objects.get(transaction_reference=reference)
 
-            if not payment.employee.email:
-                return Response({'error': 'Employee has no email'}, status=status.HTTP_400_BAD_REQUEST)
+            # OTP is sent to the admin who initiated the payment
+            if not request.user.email:
+                return Response({'error': 'Your user account has no email configured to send OTPs.'}, status=status.HTTP_400_BAD_REQUEST)
 
             otp_code = ''.join(random.choices(string.digits, k=6))
             OTP.objects.create(
-                email=payment.employee.email,
+                email=request.user.email,
                 code=otp_code,
                 reference=reference,
                 expires_at=timezone.now() + timezone.timedelta(minutes=5)
             )
-
             try:
                 send_mail(
-                    'Payment Verification OTP - Resent',
+                    'Internal Payment Verification OTP - Resent',
                     f'Your new OTP for payment verification is: {otp_code}\n\nExpires in 5 minutes.',
                     settings.DEFAULT_FROM_EMAIL,
-                    [payment.employee.email],
+                    [request.user.email],
                     fail_silently=False,
                 )
                 return Response({'message': 'OTP sent successfully'})
@@ -2267,8 +2188,32 @@ class DeductionViewSet(viewsets.ModelViewSet):
         except Exception as e:
             return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
 
+    @action(detail=True, methods=['post'], permission_classes=[IsAuthenticated])
+    def hr_approve(self, request, pk=None):
+        """Action for HR Admin to approve a deduction awaiting clearance"""
+        if not (request.user.is_superuser or getattr(request.user, 'is_hr_admin', False)):
+            return Response({'error': 'Only HR Admin can approve deductions'}, status=403)
+            
+        deduction = self.get_object()
+        if deduction.status != 'pending_hr':
+            return Response({'error': 'Deduction is not awaiting HR approval'}, status=400)
+            
+        with transaction.atomic():
+            deduction.hr_approved = True
+            deduction.hr_approved_by = request.user
+            deduction.status = 'applied'
+            deduction.save()
+            
+        log_audit(request.user, f"HR Approved deduction for {deduction.employee.name}", request)
+        return Response({'status': 'Approved and applied by HR'})
+
     def perform_create(self, serializer):
-        deduction = serializer.save(status='applied')
+        # Determine status based on user role
+        status_val = 'applied'
+        if not (self.request.user.is_superuser or getattr(self.request.user, 'is_hr_admin', False)):
+            status_val = 'pending_hr'
+            
+        deduction = serializer.save(status=status_val)
         
         # Logic to check if deduction is heavy (>40% of salary)
         threshold = deduction.employee.salary * Decimal('0.4')
