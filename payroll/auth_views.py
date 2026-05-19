@@ -142,7 +142,7 @@ def login_view(request):
                 # e.g. "column employees.is_self_registered does not exist".
                 logger.error(f"Employee lookup failed during login for {username}: {e}")
                 return Response(
-                    {'error': 'Server database is not up to date (run migrations).'},
+                    {'error': 'Server database is not up to date (run migrations).', 'details': str(e)},
                     status=status.HTTP_500_INTERNAL_SERVER_ERROR
                 )
 

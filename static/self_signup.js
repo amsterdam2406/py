@@ -1,7 +1,12 @@
 (() => {
-  function ensureModal() {
-    return document.getElementById('signup-modal') || createSignupModal();
+  // Use the static modal markup from index.html (selfSignupModal)
+  function showSelfSignupModal() {
+    const modal = document.getElementById('selfSignupModal');
+    if (!modal) return;
+    modal.style.display = 'block';
+    modal.classList.add('active');
   }
+
 
   function createSignupModal() {
     const modal = document.createElement('div');
@@ -152,13 +157,9 @@
   }
 
 
-  function showSelfSignupModal() {
-    const modal = ensureModal();
-    modal.style.display = 'block';
-  }
-
-  // Expose globals expected by inline handlers
+  // Expose global expected by inline handlers in index.html
   window.showSelfSignupModal = showSelfSignupModal;
+
 
   document.addEventListener('DOMContentLoaded', () => {
     const signupBtn = document.getElementById('signup-btn');
