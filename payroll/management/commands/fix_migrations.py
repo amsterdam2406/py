@@ -124,8 +124,8 @@ class Command(BaseCommand):
         self.add_column_if_not_exists('attendance', 'leave_end', 'DATE NULL')
         self.add_column_if_not_exists('attendance', 'clock_in_photo', 'VARCHAR(100) NULL')
         self.add_column_if_not_exists('attendance', 'clock_out_photo', 'VARCHAR(100) NULL')
-        self.add_column_if_not_exists('otp', 'attempt_count', 'INTEGER DEFAULT 0')
-        self.add_column_if_not_exists('otp', 'max_attempts', 'INTEGER DEFAULT 3')
+        self.add_column_if_not_exists('otps', 'attempt_count', 'INTEGER DEFAULT 0')  # FIXED: was 'otp'
+        self.add_column_if_not_exists('otps', 'max_attempts', 'INTEGER DEFAULT 3')   # FIXED: was 'otp'
         self.add_column_if_not_exists('deductions', 'hr_approved', 'BOOLEAN DEFAULT FALSE')
         self.add_column_if_not_exists('deductions', 'hr_approved_by_id', 'BIGINT NULL')
         self.add_column_if_not_exists('payments', 'hr_approved', 'BOOLEAN DEFAULT FALSE')
