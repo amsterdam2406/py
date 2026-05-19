@@ -1,73 +1,63 @@
 from django.core.management.base import BaseCommand
-from django.db import connection, transaction
+from django.db import connection
 from django.core.management import call_command
-from django.db.utils import ProgrammingError
+
 
 class Command(BaseCommand):
-    help = 'Safely fix partial migration state on PostgreSQL'
+    help = 'Fix partial migration state by adding missing columns and tables manually'
 
-    def handle(self, *args, **options):
+    def add_column_if_not_exists(self, table, column, definition):
         with connection.cursor() as cursor:
-            # Get list of columns that already exist in attendance table
             cursor.execute("""
-                SELECT column_name 
-                FROM information_schema.columns 
-                WHERE table_name = 'attendance'
-            """)
-            attendance_columns = {row[0] for row in cursor.fetchall()}
+                SELECT column_name FROM information_schema.columns 
+                WHERE table_name = %s AND column_name = %s
+            """, [table, column])
+            if not cursor.fetchone():
+                self.stdout.write(self.style.WARNING(f'Adding {column} to {table}...'))
+                cursor.execute(f'ALTER TABLE {table} ADD COLUMN {column} {definition}')
+                return True
+            else:
+                self.stdout.write(self.style.NOTICE(f'{column} already exists in {table}'))
+                return False
 
-            # Get list of columns in employees table
-            cursor.execute("""
-                SELECT column_name 
-                FROM information_schema.columns 
-                WHERE table_name = 'employees'
-            """)
-            employee_columns = {row[0] for row in cursor.fetchall()}
-
-            # Check what migrations are recorded as applied
-            cursor.execute("""
-                SELECT name FROM django_migrations WHERE app = 'payroll'
-            """)
-            applied_migrations = {row[0] for row in cursor.fetchall()}
-
-        self.stdout.write(self.style.NOTICE(f"Attendance columns: {attendance_columns}"))
-        self.stdout.write(self.style.NOTICE(f"Employee columns: {employee_columns}"))
-        self.stdout.write(self.style.NOTICE(f"Applied migrations: {applied_migrations}"))
-
-        # Strategy: If 0025 is in applied but is_self_registered is missing,
-        # the migrations are faked. We need to manually add missing columns.
-        
-        missing_in_employees = []
-        if 'is_self_registered' not in employee_columns:
-            missing_in_employees.append('is_self_registered')
-        
-        # Add other known missing columns from 0007-0025
-        # These are columns that might be missing if migrations were partially faked
-        
+    def table_exists(self, table_name):
         with connection.cursor() as cursor:
-            # Fix employees table
-            if 'is_self_registered' not in employee_columns:
-                self.stdout.write(self.style.WARNING('Adding missing is_self_registered to employees...'))
-                cursor.execute("ALTER TABLE employees ADD COLUMN is_self_registered BOOLEAN DEFAULT FALSE")
-            
-            # Check and add payment columns from 0017
-            cursor.execute("SELECT column_name FROM information_schema.columns WHERE table_name = 'payments'")
-            payment_columns = {row[0] for row in cursor.fetchall()}
-            
-            if 'amount_paid' not in payment_columns:
-                self.stdout.write(self.style.WARNING('Adding missing amount_paid to payments...'))
-                cursor.execute("ALTER TABLE payments ADD COLUMN amount_paid NUMERIC(10, 2) NULL")
-            
-            if 'is_partial' not in payment_columns:
-                self.stdout.write(self.style.WARNING('Adding missing is_partial to payments...'))
-                cursor.execute("ALTER TABLE payments ADD COLUMN is_partial BOOLEAN DEFAULT FALSE")
-
-            # Check and add auditlog table from 0018
             cursor.execute("""
                 SELECT table_name FROM information_schema.tables 
-                WHERE table_name = 'audit_logs'
-            """)
-            if not cursor.fetchone():
+                WHERE table_name = %s
+            """, [table_name])
+            return cursor.fetchone() is not None
+
+    def handle(self, *args, **options):
+        # Add all missing columns from migrations 0007-0025
+        self.add_column_if_not_exists('employees', 'is_self_registered', 'BOOLEAN DEFAULT FALSE')
+        self.add_column_if_not_exists('payments', 'amount_paid', 'NUMERIC(10, 2) NULL')
+        self.add_column_if_not_exists('payments', 'is_partial', 'BOOLEAN DEFAULT FALSE')
+        self.add_column_if_not_exists('attendance', 'clock_method', 'VARCHAR(10) NULL')
+        self.add_column_if_not_exists('attendance', 'leave_start', 'DATE NULL')
+        self.add_column_if_not_exists('attendance', 'leave_end', 'DATE NULL')
+        self.add_column_if_not_exists('attendance', 'clock_in_photo', 'VARCHAR(100) NULL')
+        self.add_column_if_not_exists('attendance', 'clock_out_photo', 'VARCHAR(100) NULL')
+        self.add_column_if_not_exists('otp', 'attempt_count', 'INTEGER DEFAULT 0')
+        self.add_column_if_not_exists('otp', 'max_attempts', 'INTEGER DEFAULT 3')
+        self.add_column_if_not_exists('deductions', 'hr_approved', 'BOOLEAN DEFAULT FALSE')
+        self.add_column_if_not_exists('deductions', 'hr_approved_by_id', 'BIGINT NULL')
+        self.add_column_if_not_exists('payments', 'hr_approved', 'BOOLEAN DEFAULT FALSE')
+        self.add_column_if_not_exists('payments', 'hr_approved_by_id', 'BIGINT NULL')
+        self.add_column_if_not_exists('payments', 'paystack_transfer_code', 'VARCHAR(100) NULL')
+        self.add_column_if_not_exists('payments', 'payment_month', 'VARCHAR(7) NULL')
+        self.add_column_if_not_exists('companies', 'email', 'VARCHAR(254) NULL')
+        self.add_column_if_not_exists('companies', 'phone', 'VARCHAR(15) NULL')
+        self.add_column_if_not_exists('companies', 'status', "VARCHAR(15) DEFAULT 'active'")
+        self.add_column_if_not_exists('companies', 'termination_reason', 'TEXT NULL')
+        self.add_column_if_not_exists('companies', 'contract_start', 'DATE NULL')
+        self.add_column_if_not_exists('companies', 'contract_end', 'DATE NULL')
+        self.add_column_if_not_exists('users', 'is_request_admin', 'BOOLEAN DEFAULT FALSE')
+        
+        # Create missing tables
+        with connection.cursor() as cursor:
+            # audit_logs table (from 0018)
+            if not self.table_exists('audit_logs'):
                 self.stdout.write(self.style.WARNING('Creating audit_logs table...'))
                 cursor.execute("""
                     CREATE TABLE audit_logs (
@@ -81,37 +71,73 @@ class Command(BaseCommand):
                 """)
                 cursor.execute("CREATE INDEX audit_logs_timestamp_idx ON audit_logs(timestamp DESC)")
 
-            # Check and add employee_request_attachments from 0020
-            cursor.execute("""
-                SELECT table_name FROM information_schema.tables 
-                WHERE table_name = 'employee_request_attachments'
-            """)
-            if not cursor.fetchone():
-                self.stdout.write(self.style.WARNING('Creating employee_request_attachments table...'))
+            # employee_requests table (from 0016) - MUST exist before attachments
+            if not self.table_exists('employee_requests'):
+                self.stdout.write(self.style.WARNING('Creating employee_requests table...'))
                 cursor.execute("""
-                    CREATE TABLE employee_request_attachments (
+                    CREATE TABLE employee_requests (
                         id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-                        file VARCHAR(100) NOT NULL,
-                        file_type VARCHAR(10) NOT NULL,
-                        request_id UUID NOT NULL REFERENCES employee_requests(id) ON DELETE CASCADE
+                        request_type VARCHAR(20) NOT NULL,
+                        amount NUMERIC(10, 2) NULL,
+                        description TEXT NOT NULL,
+                        proof_photo VARCHAR(100) NULL,
+                        receipt_file VARCHAR(100) NULL,
+                        status VARCHAR(10) DEFAULT 'pending',
+                        decline_reason TEXT NULL,
+                        created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+                        updated_at TIMESTAMP NOT NULL DEFAULT NOW(),
+                        action_by_id BIGINT NULL REFERENCES users(id) ON DELETE SET NULL,
+                        employee_id UUID NOT NULL REFERENCES employees(id) ON DELETE CASCADE
                     )
                 """)
 
-            # Now fix the django_migrations table to match reality
-            # Mark all 0007-0025 as applied since we've fixed the schema
-            for i in range(7, 26):
-                migration_name = f"{i:04d}_"
-                # Find exact migration name
-                cursor.execute("""
-                    SELECT name FROM django_migrations 
-                    WHERE app = 'payroll' AND name LIKE %s
-                """, [f"{i:04d}_%"])
-                if not cursor.fetchone():
-                    # Migration not recorded, we need to insert it
-                    # But we need the exact name - let's get from migration files
-                    pass  # We'll handle this differently
+            # employee_request_attachments table (from 0020)
+            if not self.table_exists('employee_request_attachments'):
+                if self.table_exists('employee_requests'):
+                    self.stdout.write(self.style.WARNING('Creating employee_request_attachments table...'))
+                    cursor.execute("""
+                        CREATE TABLE employee_request_attachments (
+                            id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                            file VARCHAR(100) NOT NULL,
+                            file_type VARCHAR(10) NOT NULL,
+                            request_id UUID NOT NULL REFERENCES employee_requests(id) ON DELETE CASCADE
+                        )
+                    """)
+                else:
+                    self.stdout.write(self.style.ERROR('Skipping employee_request_attachments - employee_requests table missing!'))
 
-        # Now run migrations normally - they should skip because schema matches
-        self.stdout.write(self.style.NOTICE('Running normal migrate...'))
-        call_command('migrate', '--noinput')
-        self.stdout.write(self.style.SUCCESS('Migration fix complete!'))
+        # Fix migration history - mark all as applied
+        with connection.cursor() as cursor:
+            migrations_to_ensure = [
+                '0007_attendance_clock_in_timestamp_and_more',
+                '0008_otp_attempt_count_otp_max_attempts_alter_otp_code',
+                '0009_alter_deduction_status',
+                '0010_employee_id_sequence_alter_employee_status_and_more',
+                '0011_company_contact_email_company_contact_number',
+                '0012_employee_bank_code_recipient',
+                '0013_attendance_clock_method_attendance_leave_end_and_more',
+                '0014_payment_payment_month_and_more',
+                '0015_rename_contact_email_company_email_and_more',
+                '0016_user_is_request_admin_employeerequest',
+                '0017_employee_is_self_registered_payment_amount_paid_and_more',
+                '0018_auditlog',
+                '0019_alter_company_profit_and_more',
+                '0020_employeerequestattachment',
+                '0021_exporttoken_is_2fa_verified_exporttoken_otp_code_and_more',
+                '0022_payment_paystack_transfer_code_alter_otp_code_and_more',
+                '0023_deduction_hr_approved_deduction_hr_approved_by_and_more',
+                '0024_alter_otp_reference',
+                '0025_alter_employee_status',
+            ]
+            
+            for migration in migrations_to_ensure:
+                cursor.execute("""
+                    INSERT INTO django_migrations (app, name, applied)
+                    SELECT 'payroll', %s, NOW()
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM django_migrations 
+                        WHERE app = 'payroll' AND name = %s
+                    )
+                """, [migration, migration])
+        
+        self.stdout.write(self.style.SUCCESS('All missing columns/tables added and migration history fixed!'))
