@@ -169,15 +169,66 @@ else:
         }
     }
 
-# Celery Beat Schedule Configuration
+# # Celery Beat Schedule Configuration
+# CELERY_BEAT_SCHEDULE = {
+#     'monitor-paystack-health-every-minute': {
+#         'task': 'payroll.tasks.monitor_paystack_health',
+#         'schedule': 60.0, # Run every 60 seconds
+#     },
+#     'verify-stale-payments-every-10-minutes': {
+#         'task': 'payroll.tasks.verify_processing_payments',
+#         'schedule': 600.0,
+#     },
+# }
+
+# REDIS & CELERY CONFIGURATION
+# ==============================
+
+# Get Redis URL from environment (Render auto-injects this)
+REDIS_URL = os.environ.get('REDIS_URL', 'redis://127.0.0.1:6379/0')
+
+# Cache (using Redis)
+if REDIS_URL and 'localhost' not in REDIS_URL and '127.0.0.1' not in REDIS_URL:
+    # Production: Use Redis
+    CACHES = {
+        'default': {
+            'BACKEND': 'django_redis.cache.RedisCache',
+            'LOCATION': REDIS_URL,
+            'OPTIONS': {
+                'CLIENT_CLASS': 'django_redis.client.DefaultClient',
+                'IGNORE_EXCEPTIONS': True,
+            },
+            'TIMEOUT': 300,
+        }
+    }
+else:
+    # Local dev: Use memory cache
+    CACHES = {
+        "default": {
+            "BACKEND": "django.core.cache.backends.locmem.LocMemCache",
+        }
+    }
+
+# Celery
+CELERY_BROKER_URL = REDIS_URL
+CELERY_RESULT_BACKEND = REDIS_URL
+CELERY_ACCEPT_CONTENT = ['json']
+CELERY_TASK_SERIALIZER = 'json'
+CELERY_RESULT_SERIALIZER = 'json'
+CELERY_TASK_TRACK_STARTED = True
+CELERY_TASK_TIME_LIMIT = 30 * 60  # 30 minutes max
+CELERY_TIMEZONE = 'Africa/Lagos'
+CELERY_ENABLE_UTC = True
+
+# Beat Schedule
 CELERY_BEAT_SCHEDULE = {
     'monitor-paystack-health-every-minute': {
         'task': 'payroll.tasks.monitor_paystack_health',
-        'schedule': 60.0, # Run every 60 seconds
+        'schedule': 60.0,
     },
-    'verify-stale-payments-every-30-minutes': {
+    'verify-stale-payments-every-10-minutes': {
         'task': 'payroll.tasks.verify_processing_payments',
-        'schedule': 1800.0,
+        'schedule': 600.0,
     },
 }
 
@@ -372,11 +423,22 @@ CONTENT_SECURITY_POLICY = {
 #     default='redis://127.0.0.1:6379/0'
 # ) 2
 
-CELERY_BROKER_URL = 'memory://'
-CELERY_RESULT_BACKEND = 'cache+memory://'
+# CELERY_BROKER_URL = 'memory://'
+# CELERY_RESULT_BACKEND = 'cache+memory://'
+# # Only True in dev/testing, False in production
+# # CELERY_TASK_ALWAYS_EAGER = DEBUG  # Run tasks synchronously when DEBUG=True
 
-CELERY_TIMEZONE = 'Africa/Lagos'
-CELERY_ENABLE_UTC = True
+# CELERY_ACCEPT_CONTENT = ['json']
+# CELERY_TASK_SERIALIZER = 'json'
+# CELERY_RESULT_SERIALIZER = 'json'
+
+# # Task settings
+# CELERY_TASK_TRACK_STARTED = True
+# CELERY_TASK_TIME_LIMIT = 30 * 60  # 30 minutes max per task
+# CELERY_WORKER_PREFETCH_MULTIPLIER = 1  # Better for small tasks
+
+# CELERY_TIMEZONE = 'Africa/Lagos'
+# CELERY_ENABLE_UTC = True
 
 # Ensure logs directory exists
 LOGS_DIR = os.path.join(BASE_DIR, 'logs')

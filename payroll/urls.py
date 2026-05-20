@@ -3,7 +3,6 @@ from rest_framework.routers import DefaultRouter
 from . import views
 from . import auth_views
 
-# Create a router and register our iewsets with it.
 router = DefaultRouter()
 router.register(r'users', views.UserViewSet)
 router.register(r'employees', views.EmployeeViewSet)
@@ -13,10 +12,9 @@ router.register(r'payments', views.PaymentViewSet)
 router.register(r'companies', views.CompanyViewSet)
 router.register(r'sacked-employees', views.SackedEmployeeViewSet)
 router.register(r'notifications', views.NotificationViewSet)
-router.register(r'requests', views.EmployeeRequestViewSet) # ADDED: EmployeeRequestViewSet
+router.register(r'requests', views.EmployeeRequestViewSet)
 router.register(r'download-logs', views.DownloadLogViewSet, basename='download-logs')
 
-# The API URLs are nowdetermined automatically by the router.
 urlpatterns = [
     path('', views.frontend, name='frontend'),
     path('api/', include(router.urls)),
@@ -31,7 +29,11 @@ urlpatterns = [
     path('paystack/banks/', views.paystack_banks, name='paystack_banks'),
     path('paystack/verify-account/', views.paystack_verify_account, name='paystack_verify_account'),
     path('paystack/clear-cache/', views.clear_paystack_cache, name='clear_paystack_cache'),
+    # Support both URL paths for webhook (fix the mismatch)
+    # Add this alongside your existing paystack/webhook/ path
+path('api/payments/webhook/', views.paystack_webhook, name='paystack_webhook_api'),
     path('paystack/webhook/', views.paystack_webhook, name='paystack_webhook'),
+    path('api/payments/webhook/', views.paystack_webhook, name='paystack_webhook_alt'),
     path('verify-password/', auth_views.verify_password, name='verify_password'),
     path('change-password/', auth_views.change_password, name='change_password'),
     path('next-employee-id/', auth_views.get_next_employee_id, name='next_employee_id'),
