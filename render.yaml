@@ -21,11 +21,7 @@ services:
         fromDatabase:
           name: fotasco-db
           property: connectionString
-      - key: REDIS_URL
-        fromService:
-          type: redis
-          name: fotasco-redis
-          property: connectionString
+      # REDIS_URL will be added manually after creating Redis
       - key: PAYSTACK_SECRET_KEY
         sync: false
       - key: PAYSTACK_PUBLIC_KEY
@@ -48,11 +44,6 @@ services:
       - key: DATABASE_URL
         fromDatabase:
           name: fotasco-db
-          property: connectionString
-      - key: REDIS_URL
-        fromService:
-          type: redis
-          name: fotasco-redis
           property: connectionString
       - key: SECRET_KEY
         fromService:
@@ -79,11 +70,6 @@ services:
         fromDatabase:
           name: fotasco-db
           property: connectionString
-      - key: REDIS_URL
-        fromService:
-          type: redis
-          name: fotasco-redis
-          property: connectionString
       - key: SECRET_KEY
         fromService:
           type: web
@@ -97,10 +83,5 @@ services:
 
 databases:
   - name: fotasco-db
-    plan: free
-    ipAllowList: []
-
-redis:
-  - name: fotasco-redis
     plan: free
     ipAllowList: []
