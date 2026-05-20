@@ -335,8 +335,9 @@ function openModal(id) {
     }
     if (id === 'individualPaymentModal') {
         populateEmployeeSelect('paymentEmployee');
-        document.getElementById('paymentPreview').style.display = 'none'; // Fixed: Hide preview initially
+    document.getElementById('paymentPreview').style.display = 'none'; // Fixed: Hide preview initially
         fetchPaystackBalance(); // Check balance when opening payment modal
+        updatePaymentPreview().catch(console.error);
     }
     if (id === 'bulkPaymentModal') {
         populateBulkTable();
@@ -1136,6 +1137,11 @@ async function resignEmployee(empId) {
         showToast(err.message || 'Failed to process resignation', 'error');
     } finally {
         hideLoading(); // Global spinner
+        try {
+            updateUIAfterEmployeeLoad();
+        } catch (uiErr) {
+            console.warn('UI refresh after resignation failed:', uiErr);
+        }
     }
 }
 
@@ -2956,8 +2962,11 @@ function populateBulkTable() {
         const monthlyPayment = (AppState.payments || []).find(p => 
             idsMatch(p.employee, emp.id) && p.payment_month === currentMonth
         );
-        const baseSalary = Number(emp.salary || 0);
-        const netSalary = Number.isFinite(Number(emp.net_salary)) ? Number(emp.net_salary) : baseSalary;
+    const baseSalary = Number(emp.salary || 0);
+    const netSalary = (emp.net_salary != null && 
+    Number.isFinite(Number(emp.net_salary))) 
+        ? Number(emp.net_salary) 
+        : baseSalary;
         
         const row = document.createElement('tr');
         row.innerHTML = `
@@ -2993,7 +3002,11 @@ function populatePaymentsTable() {
             idsMatch(p.employee, emp.id) && p.payment_month === currentMonth
         );
         const baseSalary = Number(emp.salary || 0);
-        const netSalary = Number.isFinite(Number(emp.net_salary)) ? Number(emp.net_salary) : baseSalary;
+        const netSalary = (emp.net_salary !== null &&
+        emp.net_salary !== undefined &&
+        Number.isFinite(Number(emp.net_salary)))
+            ? Number(emp.net_salary) 
+            : baseSalary;
         const deductions = Number.isFinite(Number(emp.applied_deductions))
             ? Number(emp.applied_deductions)
             : Math.max(baseSalary - netSalary, 0);
@@ -3243,36 +3256,58 @@ async function generatePayslip() {
     }
 }
 
-function downloadPayslip(html, employeeId, month) {
-    // Show password modal for payslip download
-    const passwordModal = document.getElementById('exportPasswordModal');
-    if (passwordModal) {
-        // Store the HTML temporarily for after password verification
-        passwordModal.dataset.pendingPayslipHtml = html;
-        passwordModal.dataset.exportType = 'payslip';
-        passwordModal.dataset.employeeId = employeeId;
-        passwordModal.dataset.month = month;
-        openModal('exportPasswordModal');
-    } else {
-        // Fallback if modal doesn't exist
-        const element = document.createElement('div');
-        element.innerHTML = html;
-        element.style.padding = '20px';
-        document.body.appendChild(element);
-        
-        const opt = {
-            margin: 1,
-            filename: `payslip_${employeeId}_${month}.pdf`,
-            image: { type: 'jpeg', quality: 0.98 },
-            html2canvas: { scale: 2 },
-            jsPDF: { unit: 'in', format: 'letter', orientation: 'portrait' }
-        };
+async function downloadPayslip(html, employeeId, month) {
+    const element = document.createElement('div');
+    element.innerHTML = html;
+    element.style.padding = '20px';
+    document.body.appendChild(element);
+    
+    const opt = {
+        margin: 1,
+        filename: `payslip_${employeeId}_${month}.pdf`,
+        image: { type: 'jpeg', quality: 0.98 },
+        html2canvas: { scale: 2 },
+        jsPDF: { unit: 'in', format: 'letter', orientation: 'portrait' }
+    };
 
-        html2pdf().set(opt).from(element).save().then(() => {
-            element.remove();
-        });
+    if (typeof html2pdf !== 'undefined') {
+        await html2pdf().set(opt).from(element).save();
+    } else {
+        showToast('PDF generator not loaded. Please refresh.', 'error');
     }
+    element.remove();
 }
+
+// function downloadPayslip(html, employeeId, month) {
+//     // Show password modal for payslip download
+//     const passwordModal = document.getElementById('exportPasswordModal');
+//     if (passwordModal) {
+//         // Store the HTML temporarily for after password verification
+//         passwordModal.dataset.pendingPayslipHtml = html;
+//         passwordModal.dataset.exportType = 'payslip';
+//         passwordModal.dataset.employeeId = employeeId;
+//         passwordModal.dataset.month = month;
+//         openModal('exportPasswordModal');
+//     } else {
+//         // Fallback if modal doesn't exist
+//         const element = document.createElement('div');
+//         element.innerHTML = html;
+//         element.style.padding = '20px';
+//         document.body.appendChild(element);
+        
+//         const opt = {
+//             margin: 1,
+//             filename: `payslip_${employeeId}_${month}.pdf`,
+//             image: { type: 'jpeg', quality: 0.98 },
+//             html2canvas: { scale: 2 },
+//             jsPDF: { unit: 'in', format: 'letter', orientation: 'portrait' }
+//         };
+
+//         html2pdf().set(opt).from(element).save().then(() => {
+//             element.remove();
+//         });
+//     }
+// }
 
 // ADDED: Print payslip
 function printPayslip() {
@@ -3626,7 +3661,7 @@ function setupEventListeners() {
     document.getElementById('verifyAccountBtn')?.addEventListener('click', verifyBankAccountManual);
     
     // Bulk Approval "Check All" Listener
-    document.getElementById('selectAllEmployees')?.addEventListener('change', toggleAllEmployees);
+    // document.getElementById('selectAllEmployees')?.addEventListener('change', toggleAllEmployees);
 
     // Bulk Actions Listeners
     document.getElementById('bulkApproveDeductionsBtn')?.addEventListener('click', bulkApproveDeductions);
@@ -3926,8 +3961,10 @@ async function loadDashboard() {
     showDashboardPage();
     applyRolePermissions(AppState.currentUser);
 
+    let loadError = null;
+
     try {
-        showLoading(); // Global spinner for dashboard load
+        showLoading();
         try {
             // Step 1: Critical data (sequential)
             await loadEmployees();
@@ -3955,11 +3992,23 @@ async function loadDashboard() {
 
             // Step 5: Non-critical
             setTimeout(loadNigerianBanks, 2000);
+        } catch (innerErr) {
+            loadError = innerErr;
+            throw innerErr; // Re-throw so outer catch gets it
         } finally {
-            hideLoading(); // Hide global spinner for dashboard load
+            // FIX: Wrap hideLoading so it NEVER throws
+            try {
+                hideLoading();
+            } catch (hideErr) {
+                console.error('hideLoading failed in finally:', hideErr);
+            }
         }
     } catch (err) {
         console.error('Dashboard load error:', err);
+        // Show user-facing error if critical data failed
+        if (loadError) {
+            showToast('Dashboard failed to load fully. Some data may be missing.', 'warning');
+        }
     }
 }
 
@@ -4080,6 +4129,7 @@ const EXPOSED_FUNCTIONS = {
     showSection, // Fixed: Ensure showSection is exposed
     openModal,
     closeModal,
+    showSignupModal,  // ADD
     
     // Employees
     loadEmployees,
@@ -4267,5 +4317,5 @@ async function retryPayment(transactionReferenceOrId) {
     } catch (err) {
         console.error('retryPayment error:', err);
         showToast(err.message || 'Retry failed', 'error');
-    } // Fixed: Handle retryPayment errors
+    }
 }
