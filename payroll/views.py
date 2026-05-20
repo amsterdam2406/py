@@ -1396,19 +1396,67 @@ class PaymentViewSet(viewsets.ModelViewSet):
                 payment_method='bank_transfer'
             )
 
-            # Generate Internal OTP for security verification
-            otp_code = ''.join(random.choices(string.digits, k=6))
-            # INTERNAL OTP REMOVED
-            # Security now relies on authentication + Paystack transfer webhook confirmation.
+            # Since Internal OTP flow is removed, trigger Paystack immediately if no HR approval is required
+            if initial_status == 'pending':
+                paystack = PaystackAPI()
+                
+                # 1. Ensure Paystack Recipient exists for this employee
+                recipient_code = getattr(employee, 'paystack_recipient_code', None)
+                if not recipient_code:
+                    recipient_result = paystack.create_recipient(
+                        name=employee.name,
+                        account_number=employee.account_number,
+                        bank_code=bank_code
+                    )
+                    if not recipient_result.get('status'):
+                        payment.status = 'failed'
+                        payment.save()
+                        return Response({'error': f"Paystack recipient creation failed: {recipient_result.get('message')}"}, status=status.HTTP_400_BAD_REQUEST)
+                    
+                    recipient_code = recipient_result.get('data', {}).get('recipient_code')
+                    employee.paystack_recipient_code = recipient_code
+                    employee.save(update_fields=['paystack_recipient_code'])
+
+                # 2. Initiate the actual transfer with Paystack
+                transfer_result = paystack.initiate_transfer(
+                    amount=int(payment.net_amount * 100),
+                    recipient_code=recipient_code,
+                    reference=payment.transaction_reference,
+                    reason=f"Salary - {employee.name} ({employee.employee_id})"
+                )
+
+                if transfer_result.get('status'):
+                    data = transfer_result.get('data', {})
+                    transfer_status = data.get('status')
+                    
+                    payment.paystack_transfer_code = data.get('transfer_code')
+                    # If Paystack requires an OTP (configured on their dashboard), move to that state
+                    if transfer_status == 'otp':
+                        payment.status = 'pending_paystack_otp'
+                    else:
+                        payment.status = 'processing'
+                    payment.save()
+
+                    return Response({
+                        'message': 'Payment initiated on Paystack.',
+                        'reference': payment.transaction_reference,
+                        'amount': float(net_salary),
+                        'status': payment.status,
+                        'paystack_otp_required': transfer_status == 'otp',
+                        'employee': employee.name
+                    })
+                else:
+                    payment.status = 'failed'
+                    payment.save()
+                    return Response({'error': f"Paystack API error: {transfer_result.get('message')}"}, status=status.HTTP_400_BAD_REQUEST)
+
             return Response({
-                'message': 'Payment initiated. Awaiting Paystack confirmation via webhook.',
+                'message': 'Payment initiated and awaiting HR approval.',
                 'reference': payment.transaction_reference,
                 'amount': float(net_salary),
-                'otp_sent': False,
                 'employee': employee.name,
                 'bank': employee.bank_name,
                 'account': employee.account_number,
-                'note': 'Payment will be confirmed automatically via webhook'
             })
 
 
