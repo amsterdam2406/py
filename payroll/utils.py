@@ -1,5 +1,5 @@
 from typing import Optional, Dict, Any
-from .models import AuditLogNew  # optional(or keep inside function)
+from .models import AuditLog  # optional(or keep inside function)
 
 def get_client_ip(request):
     x_forwarded_for = request.META.get('HTTP_X_FORWARDED_FOR')
@@ -10,7 +10,7 @@ def get_client_ip(request):
 
 
 def log_audit(user, action: str, request, extra: Optional[Dict[str, Any]] = None):
-    AuditLogNew.objects.create(
+    AuditLog.objects.create(
         user=user,
         action=action,
         ip_address=get_client_ip(request),

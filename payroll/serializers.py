@@ -3,8 +3,7 @@ import logging
 from rest_framework import serializers
 from .models import (
     Employee, Attendance, Deduction, Payment, Company, 
-    SackedEmployee, Notification, OTP, ExportToken, EmployeeRequestNew,
-    EmployeeRequestAttachmentNew, AuditLogNew, DownloadLogNew
+    SackedEmployee, Notification, OTP, ExportToken, EmployeeRequest, EmployeeRequestAttachment
 )
 from django.contrib.auth import get_user_model
 import base64
@@ -545,7 +544,7 @@ class ExportTokenSerializer(serializers.ModelSerializer):
 
 class EmployeeRequestAttachmentSerializer(serializers.ModelSerializer):
     class Meta:
-        model = EmployeeRequestAttachmentNew
+        model = EmployeeRequestAttachment
         fields = '__all__'
 
 class EmployeeRequestSerializer(serializers.ModelSerializer):
@@ -555,6 +554,6 @@ class EmployeeRequestSerializer(serializers.ModelSerializer):
     attachments = EmployeeRequestAttachmentSerializer(many=True, read_only=True)
 
     class Meta:
-        model = EmployeeRequestNew
+        model = EmployeeRequest
         fields = '__all__'
         read_only_fields = ['id', 'employee', 'status', 'decline_reason', 'action_by', 'created_at', 'updated_at', 'attachments']
