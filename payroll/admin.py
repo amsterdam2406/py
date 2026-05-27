@@ -2,7 +2,8 @@
 from django.contrib import admin, messages
 from django.contrib.auth.admin import UserAdmin as BaseUserAdmin
 from django.core.cache import cache
-from django.db import models
+from django.contrib.auth.forms import AuthenticationForm
+from django import forms
 from django.db.models import ProtectedError, RestrictedError
 from .models import (
     User, Employee, Attendance, Deduction, 
@@ -14,15 +15,56 @@ from .models import (
 # ─────────────────────────────────────────────
 # USER ADMIN (SAFE DELETE)
 # ─────────────────────────────────────────────
+
+class EmailAuthenticationForm(AuthenticationForm):
+    """Custom admin login form that accepts email or username"""
+    username = forms.CharField(
+        label="Email / Username",
+        widget=forms.TextInput(attrs={"autofocus": True})
+    )
+    
+    def clean(self):
+        username = self.cleaned_data.get('username')
+        password = self.cleaned_data.get('password')
+        
+        if username and password:
+            # Try to find user by email first, then username
+            try:
+                user = User.objects.get(email__iexact=username)
+                username = user.username  # Get the actual username for authenticate()
+            except User.DoesNotExist:
+                pass  # Keep original username
+            
+            self.cleaned_data['username'] = username
+            
+        return super().clean()
+
+class CustomAdminSite(admin.AdminSite):
+    login_form = EmailAuthenticationForm
+    site_header = "Fotasco Payroll Administration"
+    site_title = "Fotasco Admin"
+
+# Use custom admin site
+admin_site = CustomAdminSite(name='customadmin')
+
+# Or override the default admin login form
+admin.site.login_form = EmailAuthenticationForm
+admin.site.site_header = "Fotasco Payroll Administration"
+admin.site.site_title = "Fotasco Admin"
+
+
+
 @admin.register(User)
 class UserAdmin(BaseUserAdmin):
-    list_display = ('username', 'email', 'role', 'is_staff', 'is_active')
-    list_filter = ('role', 'is_staff', 'is_active', 'is_superuser')
+    list_display = ['username', 'email', 'role', 'is_staff', 'is_superuser', 'date_joined']
+    list_filter = ['role', 'is_superuser', 'is_active']
+    search_fields = ['username', 'email', 'first_name', 'last_name']
+    ordering = ['-date_joined']
     
     fieldsets = BaseUserAdmin.fieldsets + (
         ('Role & Permissions', {
             'fields': (
-                'role', 'employee_id',
+                'role',
                 'is_company_admin', 'is_employee_admin',
                 'is_payment_admin', 'is_deduction_admin',
                 'is_hr_admin', 'is_request_admin',
@@ -31,6 +73,11 @@ class UserAdmin(BaseUserAdmin):
         }),
         ('Contact Info', {'fields': ('phone',)}),
     )
+    
+    #  ('Custom Fields', {'fields': ('role', 'phone', 'is_company_admin', 'is_notification_admin', 
+                                    #    'is_payment_admin', 'is_deduction_admin', 'is_employee_admin',
+                                    #    'is_request_admin', 'is_hr_admin')}),
+    # )
     
     # Prevent bulk delete — handle one at a time with proper error messaging
     actions = ['safe_delete_users']
@@ -44,14 +91,17 @@ class UserAdmin(BaseUserAdmin):
         
         for user in queryset:
             try:
-                # Check for critical related objects that would block deletion
-                related_issues = []
+                employee = user.employee_profile
+            except Employee.DoesNotExist:
+                employee = None
                 
-                if hasattr(user, 'employee_profile'):
-                    related_issues.append(f"Employee profile ({user.employee_profile.employee_id})")
-                
-                if user.processed_payments.exists():
-                    related_issues.append(f"{user.processed_payments.count()} processed payments")
+            try:
+                if employee:
+                    related_issues = []
+                    
+                count = user.processed_payments.count()
+                if count:
+                    related_issues.append(f"{count}  processed payments")
                 
                 if user.hr_approved_payments.exists():
                     related_issues.append(f"{user.hr_approved_payments.count()} HR-approved payments")
@@ -146,9 +196,11 @@ class UserAdmin(BaseUserAdmin):
 # ─────────────────────────────────────────────
 @admin.register(Employee)
 class EmployeeAdmin(admin.ModelAdmin):
-    list_display = ['employee_id', 'name', 'type', 'status', 'location', 'salary']
-    list_filter = ['type', 'status', 'location']
+    list_display = ['employee_id', 'name', 'type', 'location', 'salary', 'status', 'join_date']
+    list_filter = ['type', 'status', 'location', 'join_date']
     search_fields = ['employee_id', 'name', 'email', 'phone']
+    date_hierarchy = 'join_date'
+    readonly_fields = ['employee_id', 'id_sequence', 'created_at', 'updated_at', 'user']  # Employee ID should not be editable after creation
     actions = ['clear_verification_cache']
 
     @admin.action(description='Clear Paystack verification cache for selected employees')
@@ -169,6 +221,7 @@ class EmployeeAdmin(admin.ModelAdmin):
 class AttendanceAdmin(admin.ModelAdmin):
     list_display = ['employee', 'date', 'status', 'clock_in', 'clock_out', 'clock_method']
     list_filter = ['status', 'clock_method', 'date']
+    autocomplete_fields = ['employee']
     search_fields = ['employee__name', 'employee__employee_id']
     date_hierarchy = 'date'
 
@@ -180,6 +233,7 @@ class AttendanceAdmin(admin.ModelAdmin):
 class DeductionAdmin(admin.ModelAdmin):
     list_display = ['employee', 'amount', 'date', 'status', 'hr_approved', 'hr_approved_by']
     list_filter = ['status', 'hr_approved', 'date']
+    autocomplete_fields = ['employee']
     search_fields = ['employee__name', 'employee__employee_id', 'reason']
     date_hierarchy = 'date'
 
@@ -190,12 +244,20 @@ class DeductionAdmin(admin.ModelAdmin):
 @admin.register(Payment)
 class PaymentAdmin(admin.ModelAdmin):
     list_display = [
-        'employee', 'net_amount', 'status', 'hr_approved',
+        'employee', 'transaction_reference', 'net_amount', 'status', 'hr_approved',
         'payment_month', 'payment_method', 'payment_date'
     ]
-    list_filter = ['status', 'hr_approved', 'payment_method', 'payment_date']
+    list_filter = ['status', 'hr_approved', 'payment_month', 'payment_method', 'payment_date']
     search_fields = ['employee__name', 'employee__employee_id', 'transaction_reference']
+    list_select_related = ['employee']
     date_hierarchy = 'payment_date'
+    autocomplete_fields = ['employee']
+
+    def has_add_permission(self, request):
+        return False
+
+    def has_delete_permission(self, request, obj=None):
+        return False
 
 
 # ─────────────────────────────────────────────
@@ -203,7 +265,7 @@ class PaymentAdmin(admin.ModelAdmin):
 # ─────────────────────────────────────────────
 @admin.register(Company)
 class CompanyAdmin(admin.ModelAdmin):
-    list_display = ['name', 'location', 'status', 'guards_count', 'profit']
+    list_display = ['name', 'location', 'status', 'guards_count', 'payment_to_us', 'profit']
     list_filter = ['status']
     search_fields = ['name', 'location']
     filter_horizontal = ['assigned_guards']
@@ -218,6 +280,7 @@ class SackedEmployeeAdmin(admin.ModelAdmin):
     list_filter = ['date_sacked']
     search_fields = ['employee__name', 'employee__employee_id']
     date_hierarchy = 'date_sacked'
+    autocomplete_fields = ['employee']
 
 
 # ─────────────────────────────────────────────
@@ -240,6 +303,9 @@ class OTPAdmin(admin.ModelAdmin):
     list_filter = ['is_used']
     search_fields = ['email', 'reference']
     date_hierarchy = 'created_at'
+    
+    def masked_code(self, obj):
+        return f"***{obj.code[-2:]}"
 
 
 # ─────────────────────────────────────────────
@@ -262,6 +328,7 @@ class EmployeeRequestAdmin(admin.ModelAdmin):
     list_filter = ['status', 'request_type']
     search_fields = ['employee__name', 'employee__employee_id', 'description']
     date_hierarchy = 'created_at'
+    autocomplete_fields = ['employee']
 
 
 # ─────────────────────────────────────────────
@@ -272,16 +339,23 @@ class EmployeeRequestAttachmentAdmin(admin.ModelAdmin):
     list_display = ['request', 'file_type', 'file']
     list_filter = ['file_type']
 
-
 # ─────────────────────────────────────────────
 # DOWNLOAD LOG ADMIN
 # ─────────────────────────────────────────────
 @admin.register(DownloadLog)
 class DownloadLogAdmin(admin.ModelAdmin):
-    list_display = ['user', 'employee', 'doc_type', 'reference', 'ip_address', 'timestamp']
+    list_display = ['user', 'employee', 'doc_type', 'reference', 'ip_address', 'created_at']
     list_filter = ['doc_type']
     search_fields = ['user__username', 'employee__name', 'reference']
-    date_hierarchy = 'timestamp'
+    date_hierarchy = 'created_at'
+    readonly_fields = ('user', 'created_at')
+    autocomplete_fields = ['employee']
+
+    def has_add_permission(self, request):
+        return False
+
+    def has_delete_permission(self, request, obj=None):
+        return False
 
 
 # ─────────────────────────────────────────────
@@ -289,6 +363,16 @@ class DownloadLogAdmin(admin.ModelAdmin):
 # ─────────────────────────────────────────────
 @admin.register(AuditLog)
 class AuditLogAdmin(admin.ModelAdmin):
-    list_display = ['user', 'action', 'ip_address', 'timestamp']
+    list_display = ['user', 'action', 'ip_address', 'created_at']
     search_fields = ['user__username', 'action']
-    date_hierarchy = 'timestamp'
+    date_hierarchy = 'created_at'
+    readonly_fields = [field.name for field in AuditLog._meta.fields]
+
+    def has_add_permission(self, request):
+        return False
+
+    def has_delete_permission(self, request, obj=None):
+        return False
+        
+        
+        

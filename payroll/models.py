@@ -1,11 +1,247 @@
+from django.db.models import Count
+from django.core.validators import FileExtensionValidator
 from django.core.validators import RegexValidator, MinValueValidator, MaxValueValidator
-from django.db import models
+from django.db import models, IntegrityError, transaction
 from django.contrib.auth.models import AbstractUser
+from django.utils.crypto import constant_time_compare
 import uuid
 from django.conf import settings
-from django.db import transaction
-from django.utils import timezone
 from django.core.exceptions import ValidationError
+from django.utils.translation import gettext_lazy as _
+from .managers import UserManager
+from simple_history.models import HistoricalRecords
+from datetime import timedelta
+from django.utils import timezone
+from django.contrib.auth.hashers import make_password, check_password
+
+
+# ==================== BASE / UTILITIES ====================
+
+class TimeStampedModel(models.Model):
+    """Abstract base model with auto timestamp fields."""
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        abstract = True
+
+
+# ADD this block (replace the deleted section):
+class SoftDeleteQuerySet(models.QuerySet):
+    """QuerySet that provides both active and deleted record access."""
+    def active(self):
+        return self.filter(is_deleted=False)
+
+    def deleted(self):
+        return self.filter(is_deleted=True)
+
+
+class SoftDeleteManager(models.Manager):
+    """Manager that returns SoftDeleteQuerySet (no default filtering)."""
+    def get_queryset(self):
+        return SoftDeleteQuerySet(self.model, using=self._db).filter(is_deleted=False)
+
+
+class SoftDeleteModel(models.Model):
+    """Abstract model with soft-delete capability."""
+    is_deleted = models.BooleanField(default=False)
+    deleted_at = models.DateTimeField(null=True, blank=True)
+
+    objects = SoftDeleteManager()
+    all_objects = SoftDeleteQuerySet.as_manager()
+
+    class Meta:
+        abstract = True
+
+    def soft_delete(self):
+        """Soft delete the record instead of hard deleting."""
+        self.is_deleted = True
+        self.deleted_at = timezone.now()
+        self.save(update_fields=['is_deleted', 'deleted_at'])
+
+    def restore(self):
+        """Restore a soft-deleted record."""
+        self.is_deleted = False
+        self.deleted_at = None
+        self.save(update_fields=['is_deleted', 'deleted_at'])
+
+
+# ==================== FILE VALIDATORS ====================
+
+def validate_file_size(file, limit_mb=5):
+    """Validate uploaded file size. Default limit: 5MB."""
+    limit = limit_mb * 1024 * 1024
+    if file.size > limit:
+        raise ValidationError(
+            _(f"File too large. Maximum size is {limit_mb}MB.")
+        )
+
+
+# ==================== REUSABLE CHOICES ====================
+
+class ApprovalStatus(models.TextChoices):
+    """Reusable approval status choices."""
+    PENDING = 'pending', _('Pending')
+    APPROVED = 'approved', _('Approved')
+    DECLINED = 'declined', _('Declined')
+
+
+class NotificationType(models.TextChoices):
+    """Reusable notification type choices."""
+    INFO = 'info', _('Info')
+    SUCCESS = 'success', _('Success')
+    WARNING = 'warning', _('Warning')
+    ERROR = 'error', _('Error')
+
+
+class EmployeeType(models.TextChoices):
+    """Employee type choices."""
+    STAFF = 'staff', _('Staff')
+    GUARD = 'guard', _('Guard')
+    EMPLOYEE = 'employee', _('Employee')
+
+
+class EmployeeStatus(models.TextChoices):
+    """Employee status choices."""
+    ACTIVE = 'active', _('Active')
+    SUSPENDED = 'suspended', _('Suspended')
+    INACTIVE = 'inactive', _('Inactive')
+    TERMINATED = 'terminated', _('Terminated')
+    SACKED = 'sacked', _('Sacked')
+    RESIGNED = 'resigned', _('Resigned')
+    PENDING = 'pending', _('Pending')
+    PENDING_HR = 'pending_hr', _('Pending HR Approval')
+    ON_LEAVE = 'on_leave', _('On Leave')
+
+
+class AttendanceStatus(models.TextChoices):
+    """Attendance status choices."""
+    PRESENT = 'present', _('Present')
+    ABSENT = 'absent', _('Absent')
+    LEAVE = 'leave', _('Leave')
+
+
+class ClockMethod(models.TextChoices):
+    """Clock-in method choices."""
+    SELFIE = 'selfie', _('Selfie')
+    BOXMARK = 'boxmark', _('Boxmark')
+
+
+class DeductionStatus(models.TextChoices):
+    """Deduction status choices."""
+    PENDING = 'pending', _('Pending')
+    APPLIED = 'applied', _('Applied')
+    CANCELLED = 'cancelled', _('Cancelled')
+    TERMINATED = 'terminated', _('Terminated')
+    PENDING_HR = 'pending_hr', _('Pending HR Approval')
+
+
+class PaymentStatus(models.TextChoices):
+    """Payment status choices."""
+    PENDING = 'pending', _('Pending')
+    PROCESSING = 'processing', _('Processing')
+    COMPLETED = 'completed', _('Completed')
+    FAILED = 'failed', _('Failed')
+    PENDING_PAYSTACK_OTP = 'pending_paystack_otp', _('Awaiting Paystack OTP')
+    PENDING_HR = 'pending_hr', _('Pending HR Approval')
+    CANCELLED = 'cancelled', _('Cancelled')
+
+
+class PaymentMethod(models.TextChoices):
+    """Payment method choices."""
+    CARD = 'card', _('Card Payment')
+    BANK_TRANSFER = 'bank_transfer', _('Bank Transfer')
+
+
+class CompanyStatus(models.TextChoices):
+    """Company status choices."""
+    ACTIVE = 'active', _('Active')
+    TERMINATED = 'terminated', _('Terminated')
+    REACTIVATED = 'reactivated', _('Reactivated')
+
+
+class RequestType(models.TextChoices):
+    """Employee request type choices."""
+    SALARY_ADVANCE = 'salary_advance', _('Salary Advance')
+    LOAN = 'loan', _('Loan')
+    COMPANY_EXPENSE = 'company_expense', _('Company Expense')
+    OTHER = 'other', _('Other')
+
+
+class FileAttachmentType(models.TextChoices):
+    """File attachment type choices."""
+    PROOF = 'proof', _('Proof')
+    RECEIPT = 'receipt', _('Receipt')
+
+
+# ==================== QUERYSET MANAGERS ====================
+
+class EmployeeQuerySet(models.QuerySet):
+    def active(self):
+        return self.filter(status=EmployeeStatus.ACTIVE)
+
+    def with_user(self):
+        return self.select_related('user')
+
+
+class PaymentQuerySet(models.QuerySet):
+    def with_employee(self):
+        return self.select_related('employee__user')
+    def with_related(self):
+        return self.select_related(
+            'employee',
+            'employee__user',
+            'processed_by'
+        )
+
+    def pending(self):
+        return self.filter(status=PaymentStatus.PENDING)
+
+    def completed(self):
+        return self.filter(status=PaymentStatus.COMPLETED)
+
+
+class DeductionQuerySet(models.QuerySet):
+    def with_employee(self):
+        return self.select_related('employee__user')
+
+    # def pending(self):
+    #     return self.filter(status=DeductionStatus.PENDING)
+    # def applied(self):
+    #     return self.filter(status=DeductionStatus.APPLIED)
+    # def cancelled(self):
+    #     return self.filter(status=DeductionStatus.CANCELLED)
+    # def terminated(self):
+    #     return self.filter(status=DeductionStatus.TERMINATED)
+    # def pending_hr(self):
+    #     return self.filter(status=DeductionStatus.PENDING_HR)
+
+class CompanyQuerySet(models.QuerySet):
+    def active(self):
+        return self.filter(status=CompanyStatus.ACTIVE)
+
+    def with_guards(self):
+        return self.prefetch_related('assigned_guards')
+
+
+class AttendanceQuerySet(models.QuerySet):
+    def with_employee(self):
+        return self.select_related('employee__user')
+
+class NotificationQuerySet(models.QuerySet):
+    def unread(self):
+        return self.filter(is_read=False)
+
+    def for_user(self, user):
+        return self.filter(user=user)
+
+
+class EmployeeRequestQuerySet(models.QuerySet):
+    def with_employee(self):
+        return self.select_related('employee')
+
+    def pending(self):
+        return self.filter(status=ApprovalStatus.PENDING)
 
 
 # ==================== USER ====================
@@ -16,19 +252,35 @@ class User(AbstractUser):
     ROLE_ADMIN = 'admin'
     ROLE_STAFF = 'staff'
     ROLE_GUARD = 'guard'
+    ROLE_MANAGER = 'manager'
+    ROLE_ACCOUNTANT = 'accountant'
+    ROLE_HR = 'hr'
+    ROLE_OPC = 'opc'
 
     ROLE_CHOICES = [
-        (ROLE_ADMIN, 'Admin'),
-        (ROLE_STAFF, 'Staff'),
-        (ROLE_GUARD, 'Guard'),
+        (ROLE_ADMIN, _('Admin')),
+        (ROLE_STAFF, _('Staff')),
+        (ROLE_GUARD, _('Guard')),
+        (ROLE_MANAGER, _('Manager')),
+        (ROLE_ACCOUNTANT, _('Accountant')),
+        (ROLE_HR, _('HR')),
+        (ROLE_OPC, _('OPC')),
     ]
 
     role = models.CharField(
-        max_length=10, 
-        choices=ROLE_CHOICES, 
-        default='staff'
+        _('role'),
+        max_length=20,
+        choices=ROLE_CHOICES,
+        default=ROLE_STAFF
     )
-    phone = models.CharField(max_length=15, blank=True, null=True)
+    email = models.EmailField(_('email address'), unique=True, db_index=True)
+    full_name = models.CharField(_('full name'), max_length=150, blank=True)
+    phone = models.CharField(_('phone number'), max_length=20, blank=True)
+
+    objects = UserManager()
+
+    USERNAME_FIELD = 'email'
+    REQUIRED_FIELDS = ['full_name']
 
     # Admin permission flags
     is_company_admin = models.BooleanField(default=False)
@@ -40,81 +292,143 @@ class User(AbstractUser):
     is_hr_admin = models.BooleanField(default=False)
     is_request_admin = models.BooleanField(default=False)
 
-    def save(self, *args, **kwargs):
-        self.is_staff = (self.role == self.ROLE_ADMIN)
-        super().save(*args, **kwargs)
-
     class Meta:
         db_table = 'users'
-        verbose_name = 'User'
-        verbose_name_plural = 'Users'
+        verbose_name = _('User')
+        verbose_name_plural = _('Users')
+        permissions = [
+            ('approve_payment', _('Can approve payment')),
+            ('process_salary', _('Can process salary')),
+        ]
+
+    def __str__(self):
+        return self.email
+
+    def get_full_name(self):
+        return self.full_name or self.email
+
+    def get_short_name(self):
+        return self.full_name or self.email
+
+    def save(self, *args, **kwargs):
+        if not self.username:
+            base = self.email.split('@')[0]
+            self.username = f"{base[:20]}_{uuid.uuid4().hex[:6]}"[:30]
+        super().save(*args, **kwargs)
+
+    @property
+    def has_staff_access(self):
+        return any([
+            self.is_superuser,
+            self.role == self.ROLE_ADMIN,
+            self.is_company_admin,
+            self.is_payment_admin,
+            self.is_deduction_admin,
+            self.is_employee_admin,
+            self.is_request_admin,
+            self.is_hr_admin,
+            self.is_notification_admin,
+        ])
+
+    @property
+    def is_admin(self):
+        return self.role == self.ROLE_ADMIN or self.is_superuser
+
+    @property
+    def is_manager(self):
+        return self.role == self.ROLE_MANAGER
+    
+    
+# ==================== EMPLOYEE SEQUENCE COUNTER ====================
+
+class EmployeeSequence(models.Model):
+    """Thread-safe sequence counter for employee ID generation."""
+    type = models.CharField(max_length=10, choices=EmployeeType.choices)
+    last_value = models.PositiveIntegerField(default=0)
+
+    class Meta:
+        db_table = 'employee_sequences'
+        verbose_name = _('Employee Sequence')
+        verbose_name_plural = _('Employee Sequences')
+        constraints = [
+            models.UniqueConstraint(
+                fields=['type'],
+                name='unique_employee_sequence_type'
+            ),
+        ]
+
+    def __str__(self):
+        return f"{self.type} - {self.last_value}"
 
 
 # ==================== EMPLOYEE ====================
 
-class Employee(models.Model):
-    """Employee Model — Staff, Guard, and Employee records with ID generation."""
-
-    TYPE_CHOICES = [
-        ('staff', 'Staff'),
-        ('guard', 'Guard'),
-        ('employee', 'Employee'),
-    ]
-
-    STATUS_CHOICES = [
-        ('active', 'Active'),
-        ('terminated', 'Terminated'),
-        ('sacked', 'Sacked'),
-        ('resigned', 'Resigned'),
-        ('pending', 'Pending'),
-    ]
+class Employee(TimeStampedModel, SoftDeleteModel):
+    """Employee Model - Staff, Guard, and Employee records with ID generation."""
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     id_sequence = models.PositiveIntegerField(
-        editable=False, 
-        null=True, 
+        editable=False,
+        null=True,
         blank=True,
-        help_text='Auto-incrementing sequence per employee type for ID generation.'
+        help_text=_('Auto-incrementing sequence per employee type for ID generation.')
     )
-    employee_id = models.CharField(max_length=20, unique=True)
+    history = HistoricalRecords(excluded_fields=['updated_at'])
+    employee_id = models.CharField(max_length=20, unique=True, db_index=True)
     user = models.OneToOneField(
-        User, 
-        on_delete=models.CASCADE, 
+        User,
+        on_delete=models.CASCADE,
         related_name='employee_profile'
     )
     name = models.CharField(max_length=200)
-    type = models.CharField(max_length=10, choices=TYPE_CHOICES)
+    type = models.CharField(max_length=10, choices=EmployeeType.choices)
     location = models.CharField(max_length=200)
     salary = models.DecimalField(
-        max_digits=10, 
-        decimal_places=2, 
+        max_digits=10,
+        decimal_places=2,
         validators=[MinValueValidator(0)]
     )
-    phone = models.CharField(max_length=15, blank=True, null=True)
+
+    phone_validator = RegexValidator(
+        regex=r'^(\+234|0)[789][01]\d{8}$',
+        message=_('Enter a valid Nigerian phone number (e.g., +2348012345678 or 08012345678).')
+    )
+    phone = models.CharField(
+        max_length=15,
+        validators=[phone_validator]
+    )
     email = models.EmailField(blank=True, null=True)
 
-    # Bank Details (Nigerian Banks — Naira)
+    # Bank Details (Nigerian Banks - Naira)
     bank_name = models.CharField(max_length=100)
     bank_code = models.CharField(max_length=20, blank=True, null=True)
     paystack_recipient_code = models.CharField(max_length=100, blank=True, null=True)
-    account_number = models.CharField(max_length=10)
+    account_number = models.CharField(
+        max_length=10,
+        validators=[
+            RegexValidator(
+                regex=r'^\d{10}$',
+                message=_('Account number must be exactly 10 digits.')
+            )
+        ]
+    )
     account_holder = models.CharField(max_length=200)
 
     is_self_registered = models.BooleanField(default=False)
     status = models.CharField(
-        max_length=15, 
-        choices=STATUS_CHOICES, 
-        default='pending'
+        max_length=15,
+        choices=EmployeeStatus.choices,
+        default=EmployeeStatus.PENDING
     )
     join_date = models.DateField()
-    created_at = models.DateTimeField(auto_now_add=True)
-    updated_at = models.DateTimeField(auto_now=True)
+
+    objects = EmployeeQuerySet.as_manager()
 
     class Meta:
         db_table = 'employees'
         ordering = ['-created_at']
-        verbose_name = 'Employee'
-        verbose_name_plural = 'Employees'
+        verbose_name = _('Employee')
+        verbose_name_plural = _('Employees')
         indexes = [
             models.Index(fields=['type', 'status'], name='emp_type_status_idx'),
             models.Index(fields=['employee_id'], name='emp_id_idx'),
@@ -124,71 +438,78 @@ class Employee(models.Model):
             models.UniqueConstraint(
                 fields=['employee_id'],
                 name='unique_employee_id',
-                violation_error_message='Employee ID must be unique.'
+                violation_error_message=_('Employee ID must be unique.')
+            ),
+            models.CheckConstraint(
+                check=models.Q(salary__gte=0),
+                name='employee_salary_positive'
             ),
         ]
 
     def __str__(self):
         return f"{self.employee_id} - {self.name}"
 
-    def generate_employee_id(self):
-        """Generate unique employee ID with separate sequences per type.
+    def clean(self):
+        """Validate employee data before saving."""
+        super().clean()
+        if self.type == EmployeeType.EMPLOYEE and not self.employee_id:
+            raise ValidationError(
+                {"employee_id": _("Employee ID is required for type 'employee'.")}
+            )
+        if not self.pk and self.type in [EmployeeType.STAFF, EmployeeType.GUARD] and self.employee_id:
+            raise ValidationError(
+                {"employee_id": _("Employee ID is auto-generated for staff and guard.")}
+            )
 
+    def generate_employee_id(self):
+        """Generate unique employee ID using locked sequence counter.
+        
         Staff & Guard: Auto-generated with format FSS-001-STAFF, FSS-001-GRD
         Employee: Must be manually input (no auto-generation)
         """
         with transaction.atomic():
-            type_sequence_qs = (
-                Employee.objects.select_for_update()
-                .filter(type=self.type)
-                .exclude(id_sequence__isnull=True)
-                .order_by('-id_sequence')
+            seq, _ = EmployeeSequence.objects.select_for_update().get_or_create(
+                type=self.type,
+                defaults={'last_value': 0}
             )
-            last_employee = type_sequence_qs.first()
+            seq.last_value += 1
+            seq.save(update_fields=['last_value'])
 
-            if last_employee and last_employee.id_sequence:
-                next_sequence = last_employee.id_sequence + 1
-            else:
-                next_sequence = 1
+            suffix = {
+                EmployeeType.STAFF: 'STAFF',
+                EmployeeType.GUARD: 'GRD',
+                EmployeeType.EMPLOYEE: 'EMP'
+            }.get(self.type, 'EMP')
 
-            suffix = 'STAFF' if self.type == 'staff' else 'GRD' if self.type == 'guard' else 'EMP'
-            employee_id = f"FSS-{str(next_sequence).zfill(3)}-{suffix}"
+            employee_id = f"FSS-{str(seq.last_value).zfill(3)}-{suffix}"
 
-            while Employee.objects.filter(employee_id=employee_id).exists():
-                next_sequence += 1
-                employee_id = f"FSS-{str(next_sequence).zfill(3)}-{suffix}"
+            # Final collision check (should never happen with sequences)
+            if self.type == EmployeeType.EMPLOYEE:
+                raise ValueError(_("Employee type should not auto-generate employee_id."))
+            if Employee.all_objects.filter(employee_id=employee_id).exists():
+                raise IntegrityError(
+                    f"Employee ID collision: {employee_id}. Sequence may be corrupted."
+                )
 
-            self.id_sequence = next_sequence
+            self.id_sequence = seq.last_value
             return employee_id
 
     def save(self, *args, **kwargs):
-        # Auto-generate ID only for staff and guard types
-        # Employee type must input ID manually
-        if not self.employee_id and self.type in ('staff', 'guard'):
+        self.full_clean()
+        if not self.employee_id and self.type in (EmployeeType.STAFF, EmployeeType.GUARD):
             self.employee_id = self.generate_employee_id()
         super().save(*args, **kwargs)
 
 
 # ==================== ATTENDANCE ====================
 
-class Attendance(models.Model):
+class Attendance(TimeStampedModel):
     """Attendance Model with selfie capture and timestamp tracking."""
-
-    STATUS_CHOICES = [
-        ('present', 'Present'),
-        ('absent', 'Absent'),
-        ('leave', 'Leave'),
-    ]
-
-    CLOCK_METHOD_CHOICES = [
-        ('selfie', 'Selfie'),
-        ('boxmark', 'Boxmark'),
-    ]
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     employee = models.ForeignKey(
-        Employee, 
-        on_delete=models.CASCADE, 
+        Employee,
+        on_delete=models.PROTECT,
         related_name='attendances'
     )
     date = models.DateField()
@@ -196,42 +517,43 @@ class Attendance(models.Model):
     clock_in = models.TimeField(blank=True, null=True)
     clock_in_timestamp = models.DateTimeField(blank=True, null=True)
     clock_in_photo = models.ImageField(
-        upload_to='attendance/clock_in/%Y/%m/', 
-        blank=True, 
-        null=True
+        upload_to='attendance/clock_in/%Y/%m/',
+        blank=True,
+        null=True,
+        validators=[validate_file_size]
     )
 
     clock_out = models.TimeField(blank=True, null=True)
     clock_out_timestamp = models.DateTimeField(blank=True, null=True)
     clock_out_photo = models.ImageField(
-        upload_to='attendance/clock_out/%Y/%m/', 
-        blank=True, 
-        null=True
+        upload_to='attendance/clock_out/%Y/%m/',
+        blank=True,
+        null=True,
+        validators=[validate_file_size]
     )
 
     clock_method = models.CharField(
-        max_length=10, 
-        choices=CLOCK_METHOD_CHOICES, 
-        blank=True, 
+        max_length=10,
+        choices=ClockMethod.choices,
+        blank=True,
         null=True
     )
 
     leave_start = models.DateField(blank=True, null=True)
     leave_end = models.DateField(blank=True, null=True)
     status = models.CharField(
-        max_length=10, 
-        choices=STATUS_CHOICES, 
-        default='present'
+        max_length=10,
+        choices=AttendanceStatus.choices,
+        default=AttendanceStatus.PRESENT
     )
 
-    created_at = models.DateTimeField(auto_now_add=True)
-    updated_at = models.DateTimeField(auto_now=True)
+    objects = AttendanceQuerySet.as_manager()
 
     class Meta:
         db_table = 'attendance'
         ordering = ['-date']
-        verbose_name = 'Attendance Record'
-        verbose_name_plural = 'Attendance Records'
+        verbose_name = _('Attendance Record')
+        verbose_name_plural = _('Attendance Records')
         indexes = [
             models.Index(fields=['employee', 'date'], name='att_emp_date_idx'),
             models.Index(fields=['date', 'status'], name='att_date_status_idx'),
@@ -246,149 +568,249 @@ class Attendance(models.Model):
     def __str__(self):
         return f"{self.employee.employee_id} - {self.date}"
 
+    def clean(self):
+        """Validate clock timestamps are consistent with attendance date.
+        Supports overnight shifts (clock-out after midnight)."""
+        from datetime import datetime, timedelta
+        super().clean()
+        if self.clock_in and self.clock_in_timestamp:
+            if self.clock_in_timestamp.date() != self.date:
+                raise ValidationError(
+                    {"clock_in_timestamp": _("Clock-in timestamp date must match attendance date.")}
+                )
+        if self.clock_out and self.clock_out_timestamp:
+            # Allow clock-out on next day for overnight shifts
+            if self.clock_out_timestamp.date() not in [self.date, self.date + timedelta(days=1)]:
+                raise ValidationError(
+                    {"clock_out_timestamp": _("Clock-out timestamp must be on attendance date or next day for overnight shifts.")}
+                )
+        # Validate clock-out is after clock-in (supports overnight)
+        if self.clock_in and self.clock_out:
+            in_dt = datetime.combine(self.date, self.clock_in)
+            out_dt = datetime.combine(self.date, self.clock_out)
+            if out_dt < in_dt:
+                out_dt += timedelta(days=1)
+            duration = out_dt - in_dt
+            if duration.total_seconds() <= 0:
+                raise ValidationError(
+                    {"clock_out": _("Clock-out time must be after clock-in time.")}
+                )
+
+    def save(self, *args, **kwargs):
+        self.full_clean()
+        super().save(*args, **kwargs)
+
 
 # ==================== DEDUCTION ====================
 
-class Deduction(models.Model):
+class Deduction(TimeStampedModel):
     """Deduction Model for salary deductions and penalties."""
-
-    STATUS_CHOICES = [
-        ('pending', 'Pending'),
-        ('applied', 'Applied'),
-        ('cancelled', 'Cancelled'),
-        ('terminated', 'Terminated'),
-        ('pending_hr', 'Pending HR Approval'),
-    ]
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     employee = models.ForeignKey(
-        Employee, 
-        on_delete=models.CASCADE, 
+        Employee,
+        on_delete=models.PROTECT,
         related_name='deductions'
     )
     amount = models.DecimalField(
-        max_digits=10, 
-        decimal_places=2, 
+        max_digits=10,
+        decimal_places=2,
         validators=[MinValueValidator(0)]
     )
     reason = models.TextField()
     date = models.DateField()
     status = models.CharField(
-        max_length=20, 
-        choices=STATUS_CHOICES, 
-        default='pending'
+        max_length=20,
+        choices=DeductionStatus.choices,
+        default=DeductionStatus.PENDING
     )
-    hr_approved = models.BooleanField(default=False)
+    # hr_approved is synced with status - do not set manually, use transition methods
+    hr_approved = models.BooleanField(default=False, editable=False)
     hr_approved_by = models.ForeignKey(
-        settings.AUTH_USER_MODEL, 
-        on_delete=models.SET_NULL, 
-        null=True, 
-        blank=True, 
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
         related_name='hr_approved_deductions'
     )
-    created_at = models.DateTimeField(auto_now_add=True)
-    updated_at = models.DateTimeField(auto_now=True)
+    history = HistoricalRecords(excluded_fields=['updated_at'])
+
+    objects = DeductionQuerySet.as_manager()
 
     class Meta:
         db_table = 'deductions'
         ordering = ['-date']
-        verbose_name = 'Deduction'
-        verbose_name_plural = 'Deductions'
+        verbose_name = _('Deduction')
+        verbose_name_plural = _('Deductions')
         indexes = [
             models.Index(fields=['employee', 'status'], name='ded_emp_status_idx'),
             models.Index(fields=['date'], name='ded_date_idx'),
         ]
+        constraints = [
+            models.CheckConstraint(
+                check=models.Q(amount__gte=0),
+                name='deduction_amount_positive'
+            ),
+            models.CheckConstraint(
+                check=models.Q(
+                    models.Q(status=DeductionStatus.PENDING) |
+                    models.Q(status=DeductionStatus.APPLIED) |
+                    models.Q(status=DeductionStatus.CANCELLED) |
+                    models.Q(status=DeductionStatus.TERMINATED) |
+                    models.Q(status=DeductionStatus.PENDING_HR)
+                ),
+                name='deduction_status_valid'
+            ),
+        ]
 
     def __str__(self):
-        return f"{self.employee.employee_id} - ₦{self.amount}"
+        return f"{self.employee.employee_id} - N{self.amount}"
+
+    def clean(self):
+        """Sync hr_approved with status to maintain single source of truth."""
+        super().clean()
+        if self.status == DeductionStatus.PENDING_HR:
+            self.hr_approved = False
+        elif self.status == DeductionStatus.APPLIED:
+            self.hr_approved = True
+
+    @transaction.atomic
+    def apply(self, approved_by):
+        """Apply the deduction after HR approval."""
+        if self.status != DeductionStatus.PENDING_HR:
+            raise ValueError(_(f"Cannot apply deduction with status: {self.status}"))
+        self.status = DeductionStatus.APPLIED
+        self.hr_approved = True
+        self.hr_approved_by = approved_by
+        self.save(update_fields=['status', 'hr_approved', 'hr_approved_by', 'updated_at'])
+
+    @transaction.atomic
+    def cancel(self):
+        """Cancel a pending deduction."""
+        if self.status not in [DeductionStatus.PENDING, DeductionStatus.PENDING_HR]:
+            raise ValueError(_(f"Cannot cancel deduction with status: {self.status}"))
+        self.status = DeductionStatus.CANCELLED
+        self.save(update_fields=['status', 'updated_at'])
+
+    def save(self, *args, **kwargs):
+        self.full_clean()
+        super().save(*args, **kwargs)
 
 
 # ==================== PAYMENT ====================
 
-class Payment(models.Model):
+class Payment(TimeStampedModel):
     """Payment Model for salary processing with Paystack integration."""
 
-    STATUS_CHOICES = [
-        ('pending', 'Pending'),
-        ('processing', 'Processing'),
-        ('completed', 'Completed'),
-        ('failed', 'Failed'),
-        ('pending_paystack_otp', 'Awaiting Paystack OTP'),
-        ('pending_hr', 'Pending HR Approval'),
-    ]
-
     STATUS_TRANSITIONS = {
-        'pending': ['processing', 'failed', 'pending_paystack_otp'],
-        'processing': ['completed', 'failed', 'pending_paystack_otp'],
-        'pending_paystack_otp': ['completed', 'failed', 'processing'],
-        'failed': ['processing'],
-        'completed': [],
-        'pending_hr': ['pending', 'failed', 'cancelled'],
+        PaymentStatus.PENDING: [
+            PaymentStatus.PROCESSING,
+            PaymentStatus.FAILED,
+            PaymentStatus.PENDING_PAYSTACK_OTP,
+            PaymentStatus.CANCELLED,
+        ],
+        PaymentStatus.PROCESSING: [
+            PaymentStatus.COMPLETED,
+            PaymentStatus.FAILED,
+            PaymentStatus.PENDING_PAYSTACK_OTP,
+        ],
+        PaymentStatus.PENDING_PAYSTACK_OTP: [
+            PaymentStatus.COMPLETED,
+            PaymentStatus.FAILED,
+            PaymentStatus.PROCESSING,
+        ],
+        PaymentStatus.FAILED: [
+            PaymentStatus.PROCESSING,
+            PaymentStatus.CANCELLED,
+        ],
+        PaymentStatus.COMPLETED: [],
+        PaymentStatus.PENDING_HR: [
+            PaymentStatus.PENDING,
+            PaymentStatus.FAILED,
+            PaymentStatus.CANCELLED,
+        ],
+        PaymentStatus.CANCELLED: [],
     }
-
-    METHOD_CHOICES = [
-        ('card', 'Card Payment'),
-        ('bank_transfer', 'Bank Transfer'),
-    ]
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     employee = models.ForeignKey(
-        Employee, 
-        on_delete=models.CASCADE, 
+        Employee,
+        on_delete=models.PROTECT,
         related_name='payments'
     )
     payment_month = models.CharField(
-        max_length=7, 
-        help_text='Format: YYYY-MM', 
-        null=True, 
-        blank=True
+        max_length=7,
+        help_text=_('Format: YYYY-MM'),
+        null=True,
+        blank=True,
+        validators=[
+            RegexValidator(
+                regex=r'^\d{4}-(0[1-9]|1[0-2])$',
+                message=_('Format must be YYYY-MM (e.g., 2024-01)')
+            )
+        ]
     )
-    base_salary = models.DecimalField(max_digits=10, decimal_places=2)
+    base_salary = models.DecimalField(
+        max_digits=10,
+        decimal_places=2,
+        validators=[MinValueValidator(0)]
+    )
     total_deductions = models.DecimalField(
-        max_digits=10, 
-        decimal_places=2, 
-        default=0
+        max_digits=10,
+        decimal_places=2,
+        default=0,
+        validators=[MinValueValidator(0)]
     )
-    net_amount = models.DecimalField(max_digits=10, decimal_places=2)
+    net_amount = models.DecimalField(
+        max_digits=10,
+        decimal_places=2,
+        validators=[MinValueValidator(0)]
+    )
     amount_paid = models.DecimalField(
-        max_digits=10, 
-        decimal_places=2, 
-        null=True, 
-        blank=True
+        max_digits=10,
+        decimal_places=2,
+        null=True,
+        blank=True,
+        validators=[MinValueValidator(0)]
     )
     is_partial = models.BooleanField(default=False)
-    payment_method = models.CharField(max_length=20, choices=METHOD_CHOICES)
-    transaction_reference = models.CharField(max_length=100, unique=True)
+    payment_method = models.CharField(max_length=20, choices=PaymentMethod.choices)
+    transaction_reference = models.CharField(max_length=100, unique=True, db_index=True)
     paystack_reference = models.CharField(max_length=100, blank=True, null=True)
     paystack_transfer_code = models.CharField(max_length=100, blank=True, null=True)
     status = models.CharField(
-        max_length=25, 
-        choices=STATUS_CHOICES, 
-        default='pending'
+        max_length=25,
+        choices=PaymentStatus.choices,
+        default=PaymentStatus.PENDING
     )
-    hr_approved = models.BooleanField(default=False)
+    hr_approved = models.BooleanField(default=False, editable=False)
     hr_approved_by = models.ForeignKey(
-        settings.AUTH_USER_MODEL, 
-        on_delete=models.SET_NULL, 
-        null=True, 
-        blank=True, 
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
         related_name='hr_approved_payments'
     )
     payment_date = models.DateField()
     processed_by = models.ForeignKey(
-        settings.AUTH_USER_MODEL, 
-        on_delete=models.SET_NULL, 
-        null=True, 
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
         related_name='processed_payments'
     )
-    created_at = models.DateTimeField(auto_now_add=True)
-    updated_at = models.DateTimeField(auto_now=True)
+    history = HistoricalRecords(excluded_fields=['updated_at'])
+
+    objects = PaymentQuerySet.as_manager()
 
     class Meta:
         db_table = 'payments'
         ordering = ['-payment_date']
-        verbose_name = 'Payment'
-        verbose_name_plural = 'Payments'
+        verbose_name = _('Payment')
+        verbose_name_plural = _('Payments')
+        permissions = [
+            ('approve_payment', _('Can approve payment')),
+            ('process_salary', _('Can process salary')),
+        ]
         indexes = [
             models.Index(fields=['employee', 'payment_month'], name='pay_emp_month_idx'),
             models.Index(fields=['status', 'payment_date'], name='pay_status_date_idx'),
@@ -398,30 +820,76 @@ class Payment(models.Model):
             models.UniqueConstraint(
                 fields=['employee', 'payment_month'],
                 name='unique_payment_per_employee_per_month'
+            ),
+            models.CheckConstraint(
+                check=models.Q(base_salary__gte=0),
+                name='payment_base_salary_positive'
+            ),
+            models.CheckConstraint(
+                check=models.Q(total_deductions__gte=0),
+                name='payment_deductions_positive'
+            ),
+            models.CheckConstraint(
+                check=models.Q(net_amount__gte=0),
+                name='payment_net_amount_positive'
+            ),
+            models.CheckConstraint(
+                check=models.Q(
+                    models.Q(status=PaymentStatus.PENDING) |
+                    models.Q(status=PaymentStatus.PROCESSING) |
+                    models.Q(status=PaymentStatus.COMPLETED) |
+                    models.Q(status=PaymentStatus.FAILED) |
+                    models.Q(status=PaymentStatus.PENDING_PAYSTACK_OTP) |
+                    models.Q(status=PaymentStatus.PENDING_HR) |
+                    models.Q(status=PaymentStatus.CANCELLED)
+                ),
+                name='payment_status_valid'
+            ),
+            models.CheckConstraint(
+                check=(
+                    models.Q(is_partial=False) |
+                    models.Q(amount_paid__lt=models.F('net_amount'))
+                ),
+                name='partial_payment_consistency'
             )
         ]
 
+    def __str__(self):
+        emp_id = getattr(self.employee, "employee_id", "UNKNOWN")
+        return f"{emp_id} - N{self.net_amount or 0}"
+
+    def clean(self):
+        """Validate payment data."""
+        super().clean()
+                # Validate net_amount is set and non-negative
+        if self.net_amount is None:
+            raise ValidationError({"net_amount": _("Net amount is required.")})
+        if self.net_amount is not None and self.net_amount< 0:
+            raise ValidationError({"net_amount": _("Net amount cannot be negative.")})
+
+    def save(self, *args, **kwargs):
+        # Auto-calculate net_amount only on initial creation if not provided
+        if not self.pk and self.net_amount is None:
+            self.net_amount = self.base_salary - self.total_deductions
+        self.full_clean()
+        super().save(*args, **kwargs)
+
+    @transaction.atomic
     def change_status(self, new_status):
-        """Centralized state machine transition logic.
-
-        Args:
-            new_status: Target status to transition to.
-
-        Returns:
-            bool: True if status changed, False if already same status.
-
-        Raises:
-            ValueError: If transition is not allowed.
-        """
-        if new_status == self.status:
+        """Centralized state machine transition logic."""
+        payment = Payment.objects.select_for_update().get(pk=self.pk)
+        if new_status == payment.status:
             return False
-        allowed = self.STATUS_TRANSITIONS.get(self.status, [])
+        
+        allowed = self.STATUS_TRANSITIONS.get(payment.status, [])
         if new_status not in allowed:
             raise ValueError(
-                f"Illegal status transition from {self.status} to {new_status}"
+                _(f"Illegal status transition from {self.status} to {new_status}")
             )
-        self.status = new_status
-        self.save(update_fields=['status', 'updated_at'])
+        payment.status = new_status
+        payment.save(update_fields=['status', 'updated_at'])
+        
+        self.status = payment.status
         return True
 
     def can_transition_to(self, new_status):
@@ -434,36 +902,44 @@ class Payment(models.Model):
         """Return list of allowed next statuses from current state."""
         return self.STATUS_TRANSITIONS.get(self.status, [])
 
+    @transaction.atomic
     def mark_as_paid(self, amount=None):
         """Mark payment as completed with optional amount tracking."""
+        if self.net_amount is None:
+            raise ValueError(_("Cannot mark as paid: net_amount is not set."))
         if amount is not None:
             self.amount_paid = amount
             self.is_partial = (amount < self.net_amount)
         else:
             self.amount_paid = self.net_amount
             self.is_partial = False
-        return self.change_status('completed')
+        self.status = PaymentStatus.COMPLETED
+        self.save(update_fields=['status', 'amount_paid', 'is_partial', 'updated_at'])
+        return True
 
+    @transaction.atomic
     def retry_payment(self):
         """Retry a failed payment."""
-        if self.status != 'failed':
-            raise ValueError(f"Cannot retry payment with status: {self.status}")
-        return self.change_status('processing')
+        if self.status != PaymentStatus.FAILED:
+            raise ValueError(_(f"Cannot retry payment with status: {self.status}"))
+        return self.change_status(PaymentStatus.PROCESSING)
 
-    def __str__(self):
-        return f"{self.employee.employee_id} - ₦{self.net_amount}"
+    @transaction.atomic
+    def cancel_payment(self):
+        """Cancel a pending or failed payment."""
+        if self.status not in [
+            PaymentStatus.PENDING,
+            PaymentStatus.FAILED,
+            PaymentStatus.PENDING_HR
+        ]:
+            raise ValueError(_(f"Cannot cancel payment with status: {self.status}"))
+        return self.change_status(PaymentStatus.CANCELLED)
 
 
 # ==================== COMPANY ====================
 
-class Company(models.Model):
+class Company(TimeStampedModel, SoftDeleteModel):
     """Company/Client Model for guard assignments and profit tracking."""
-
-    STATUS_CHOICES = [
-        ('active', 'Active'),
-        ('terminated', 'Terminated'),
-        ('reactivated', 'Reactivated'),
-    ]
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     name = models.CharField(max_length=200)
@@ -471,56 +947,78 @@ class Company(models.Model):
     email = models.EmailField(blank=True, null=True)
     phone = models.CharField(max_length=15, blank=True, null=True)
     status = models.CharField(
-        max_length=15, 
-        choices=STATUS_CHOICES, 
-        default='active'
+        max_length=15,
+        choices=CompanyStatus.choices,
+        default=CompanyStatus.ACTIVE
     )
     termination_reason = models.TextField(blank=True, null=True)
     contract_start = models.DateField(null=True, blank=True)
     contract_end = models.DateField(null=True, blank=True)
     guards_count = models.IntegerField(
-        validators=[MinValueValidator(0)], 
+        validators=[MinValueValidator(0)],
         default=0,
-        help_text='Expected number of guards. Can be 0 if not yet assigned.'
+        help_text=_('Expected/contracted number of guards. Used for profit calculation.')
     )
     payment_to_us = models.DecimalField(
-        max_digits=10, 
-        decimal_places=2, 
+        max_digits=10,
+        decimal_places=2,
         validators=[MinValueValidator(0)]
     )
     payment_per_guard = models.DecimalField(
-        max_digits=10, 
-        decimal_places=2, 
+        max_digits=10,
+        decimal_places=2,
         validators=[MinValueValidator(0)]
     )
     total_payment_to_guards = models.DecimalField(
-        max_digits=10, 
-        decimal_places=2, 
-        null=True, 
-        blank=True
+        max_digits=10,
+        decimal_places=2,
+        null=True,
+        blank=True,
+        editable=False
     )
     profit = models.DecimalField(
-        max_digits=10, 
-        decimal_places=2, 
-        null=True, 
-        blank=True
+        max_digits=10,
+        decimal_places=2,
+        null=True,
+        blank=True,
+        editable=False
     )
     assigned_guards = models.ManyToManyField(
-        Employee, 
-        related_name='assigned_companies', 
-        blank=True
+        Employee,
+        related_name='assigned_companies',
+        blank=True,
+        limit_choices_to={'type': 'guard', 'status': 'active'}
     )
-    created_at = models.DateTimeField(auto_now_add=True)
-    updated_at = models.DateTimeField(auto_now=True)
+    history = HistoricalRecords(excluded_fields=['updated_at'])
+
+    objects = CompanyQuerySet.as_manager()
 
     class Meta:
         db_table = 'companies'
         ordering = ['-created_at']
-        verbose_name = 'Company'
-        verbose_name_plural = 'Companies'
+        verbose_name = _('Company')
+        verbose_name_plural = _('Companies')
         indexes = [
             models.Index(fields=['status'], name='comp_status_idx'),
             models.Index(fields=['name'], name='comp_name_idx'),
+        ]
+        constraints = [
+            models.CheckConstraint(
+                check=models.Q(payment_to_us__gte=0),
+                name='company_payment_positive'
+            ),
+            models.CheckConstraint(
+                check=models.Q(payment_per_guard__gte=0),
+                name='company_payment_per_guard_positive'
+            ),
+            models.CheckConstraint(
+                check=models.Q(
+                    models.Q(status=CompanyStatus.ACTIVE) |
+                    models.Q(status=CompanyStatus.TERMINATED) |
+                    models.Q(status=CompanyStatus.REACTIVATED)
+                ),
+                name='company_status_valid'
+            ),
         ]
 
     def __str__(self):
@@ -528,64 +1026,70 @@ class Company(models.Model):
 
     def clean(self):
         """Validate contract dates and guard count consistency."""
-        if self.contract_end and self.contract_start and self.contract_end < self.contract_start:
-            raise ValidationError("Contract end date must be after start date.")
         super().clean()
-
-    def calculate_financials(self):
-        """Calculate total payment to guards and profit based on current state."""
-        assigned_count = self.assigned_guards.count()
-        effective_count = max(assigned_count, self.guards_count)
-        self.total_payment_to_guards = effective_count * self.payment_per_guard
-        self.profit = self.payment_to_us - self.total_payment_to_guards
-        return self.total_payment_to_guards, self.profit
+        if self.contract_end and self.contract_start and self.contract_end < self.contract_start:
+            raise ValidationError(
+                {"contract_end": _("Contract end date must be after start date.")}
+            )
 
     def save(self, *args, **kwargs):
-        self.calculate_financials()
+        self.full_clean()
         super().save(*args, **kwargs)
 
+    @property
+    def calculated_profit(self):
+        """Calculate profit without mutating fields."""
+        # Company.objects.annotate(
+            # assigned_count=models.Count('assigned_guards')
+            # ).filter(pk=self.pk).first()
+        assigned_count = self.assigned_guards.count()
+        effective_count = max(assigned_count, self.guards_count)
+        total_payment = effective_count * self.payment_per_guard
+        return self.payment_to_us - total_payment
+
+    @transaction.atomic
     def reactivate(self):
         """Reactivate a terminated company."""
-        if self.status != 'terminated':
-            raise ValueError(f"Cannot reactivate company with status: {self.status}")
-        self.status = 'reactivated'
+        if self.status != CompanyStatus.TERMINATED:
+            raise ValueError(_(f"Cannot reactivate company with status: {self.status}"))
+        self.status = CompanyStatus.REACTIVATED
         self.termination_reason = None
-        self.save()
+        self.save(update_fields=['status', 'termination_reason', 'updated_at'])
 
+    @transaction.atomic
     def terminate(self, reason=''):
-        """Terminate an active company."""
-        if self.status not in ['active', 'reactivated']:
-            raise ValueError(f"Cannot terminate company with status: {self.status}")
-        self.status = 'terminated'
+        """Terminate an active or reactivated company."""
+        if self.status not in [CompanyStatus.ACTIVE, CompanyStatus.REACTIVATED]:
+            raise ValueError(_(f"Cannot terminate company with status: {self.status}"))
+        self.status = CompanyStatus.TERMINATED
         self.termination_reason = reason
-        self.save()
+        self.save(update_fields=['status', 'termination_reason', 'updated_at'])
 
 
 # ==================== SACKED EMPLOYEE ====================
 
-class SackedEmployee(models.Model):
+class SackedEmployee(TimeStampedModel):
     """Archive for terminated/sacked employees."""
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     employee = models.ForeignKey(
-        Employee, 
-        on_delete=models.CASCADE, 
+        Employee,
+        on_delete=models.PROTECT,
         related_name='termination_records'
     )
     date_sacked = models.DateField()
     offense = models.TextField()
     terminated_by = models.ForeignKey(
-        settings.AUTH_USER_MODEL, 
-        on_delete=models.SET_NULL, 
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
         null=True
     )
-    created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
         db_table = 'sacked_employees'
         ordering = ['-date_sacked']
-        verbose_name = 'Terminated Employee'
-        verbose_name_plural = 'Terminated Employees'
+        verbose_name = _('Terminated Employee')
+        verbose_name_plural = _('Terminated Employees')
         indexes = [
             models.Index(fields=['employee'], name='sack_emp_idx'),
             models.Index(fields=['date_sacked'], name='sack_date_idx'),
@@ -594,41 +1098,39 @@ class SackedEmployee(models.Model):
     def __str__(self):
         return f"{self.employee.employee_id} - Terminated on {self.date_sacked}"
 
+    def save(self, *args, **kwargs):
+        self.full_clean()
+        super().save(*args, **kwargs)
+
 
 # ==================== NOTIFICATION ====================
 
-class Notification(models.Model):
+class Notification(TimeStampedModel):
     """Notification Model for user alerts."""
-
-    TYPE_CHOICES = [
-        ('info', 'Info'),
-        ('success', 'Success'),
-        ('warning', 'Warning'),
-        ('error', 'Error'),
-    ]
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     user = models.ForeignKey(
-        settings.AUTH_USER_MODEL, 
-        on_delete=models.CASCADE, 
-        related_name='notifications', 
-        null=True, 
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name='notifications',
+        null=True,
         blank=True
     )
-    message = models.TextField()
+    message = models.TextField(max_length=1000)
     type = models.CharField(
-        max_length=10, 
-        choices=TYPE_CHOICES, 
-        default='info'
+        max_length=10,
+        choices=NotificationType.choices,
+        default=NotificationType.INFO
     )
     is_read = models.BooleanField(default=False)
-    created_at = models.DateTimeField(auto_now_add=True)
+
+    objects = NotificationQuerySet.as_manager()
 
     class Meta:
         db_table = 'notifications'
         ordering = ['-created_at']
-        verbose_name = 'Notification'
-        verbose_name_plural = 'Notifications'
+        verbose_name = _('Notification')
+        verbose_name_plural = _('Notifications')
         indexes = [
             models.Index(fields=['user', 'is_read'], name='notif_user_read_idx'),
             models.Index(fields=['created_at'], name='notif_date_idx'),
@@ -646,66 +1148,69 @@ class Notification(models.Model):
 
 # ==================== EMPLOYEE REQUEST ====================
 
-class EmployeeRequest(models.Model):
-    """Model for employee requests — loans, advances, expenses."""
-
-    REQUEST_TYPES = [
-        ('salary_advance', 'Salary Advance'),
-        ('loan', 'Loan'),
-        ('company_expense', 'Company Expense'),
-        ('other', 'Other'),
-    ]
-    STATUS_CHOICES = [
-        ('pending', 'Pending'),
-        ('approved', 'Approved'),
-        ('declined', 'Declined'),
-    ]
+class EmployeeRequest(TimeStampedModel):
+    """Model for employee requests - loans, advances, expenses."""
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     employee = models.ForeignKey(
-        Employee, 
-        on_delete=models.CASCADE, 
+        Employee,
+        on_delete=models.PROTECT,
         related_name='requests'
     )
-    request_type = models.CharField(max_length=20, choices=REQUEST_TYPES)
+    request_type = models.CharField(max_length=20, choices=RequestType.choices)
     amount = models.DecimalField(
-        max_digits=10, 
-        decimal_places=2, 
-        null=True, 
-        blank=True
+        max_digits=10,
+        decimal_places=2,
+        null=True,
+        blank=True,
+        validators=[MinValueValidator(0)]
     )
     description = models.TextField()
     proof_photo = models.ImageField(
-        upload_to='requests/proof/%Y/%m/', 
-        blank=True, 
+        upload_to='requests/proof/%Y/%m/',
+        validators=[
+            FileExtensionValidator(
+                allowed_extensions=['jpg', 'jpeg', 'png'],
+                message=_('Proof photo must be a JPG or PNG image.')
+            ),
+            validate_file_size
+        ],
+        blank=True,
         null=True
     )
-    receipt_file = models.ImageField(
-        upload_to='requests/receipts/%Y/%m/', 
-        blank=True, 
+    receipt_file = models.FileField(
+        upload_to='requests/receipts/%Y/%m/',
+        validators=[
+            FileExtensionValidator(
+                allowed_extensions=['pdf', 'doc', 'docx'],
+                message=_('Receipt file must be a PDF, DOC, or DOCX document.')
+            ),
+            validate_file_size
+        ],
+        blank=True,
         null=True
     )
     status = models.CharField(
-        max_length=10, 
-        choices=STATUS_CHOICES, 
-        default='pending'
+        max_length=10,
+        choices=ApprovalStatus.choices,
+        default=ApprovalStatus.PENDING
     )
     decline_reason = models.TextField(blank=True, null=True)
     action_by = models.ForeignKey(
-        settings.AUTH_USER_MODEL, 
-        on_delete=models.SET_NULL, 
-        null=True, 
-        blank=True, 
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
         related_name='handled_requests'
     )
-    created_at = models.DateTimeField(auto_now_add=True)
-    updated_at = models.DateTimeField(auto_now=True)
+
+    objects = EmployeeRequestQuerySet.as_manager()
 
     class Meta:
         db_table = 'employee_requests'
         ordering = ['-created_at']
-        verbose_name = 'Employee Request'
-        verbose_name_plural = 'Employee Requests'
+        verbose_name = _('Employee Request')
+        verbose_name_plural = _('Employee Requests')
         indexes = [
             models.Index(fields=['employee', 'status'], name='req_emp_status_idx'),
             models.Index(fields=['request_type'], name='req_type_idx'),
@@ -714,45 +1219,51 @@ class EmployeeRequest(models.Model):
     def __str__(self):
         return f"{self.employee.name} - {self.request_type} ({self.status})"
 
+    @transaction.atomic
     def approve(self, approved_by):
         """Approve the request."""
-        if self.status != 'pending':
-            raise ValueError(f"Cannot approve request with status: {self.status}")
-        self.status = 'approved'
+        if self.status != ApprovalStatus.PENDING:
+            raise ValueError(_(f"Cannot approve request with status: {self.status}"))
+        self.status = ApprovalStatus.APPROVED
         self.action_by = approved_by
         self.save(update_fields=['status', 'action_by', 'updated_at'])
 
+    @transaction.atomic
     def decline(self, declined_by, reason=''):
         """Decline the request with reason."""
-        if self.status != 'pending':
-            raise ValueError(f"Cannot decline request with status: {self.status}")
-        self.status = 'declined'
+        if self.status != ApprovalStatus.PENDING:
+            raise ValueError(_(f"Cannot decline request with status: {self.status}"))
+        self.status = ApprovalStatus.DECLINED
         self.decline_reason = reason
         self.action_by = declined_by
         self.save(update_fields=['status', 'decline_reason', 'action_by', 'updated_at'])
 
+    def save(self, *args, **kwargs):
+        self.full_clean()
+        super().save(*args, **kwargs)
+
 
 # ==================== EMPLOYEE REQUEST ATTACHMENT ====================
 
-class EmployeeRequestAttachment(models.Model):
+class EmployeeRequestAttachment(TimeStampedModel):
     """Model for multiple file attachments per request."""
-
-    FILE_TYPE_CHOICES = [('proof', 'Proof'), ('receipt', 'Receipt')]
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     request = models.ForeignKey(
-        EmployeeRequest, 
-        on_delete=models.CASCADE, 
+        EmployeeRequest,
+        on_delete=models.CASCADE,
         related_name='attachments'
     )
-    file = models.FileField(upload_to='requests/attachments/%Y/%m/')
-    file_type = models.CharField(max_length=10, choices=FILE_TYPE_CHOICES)
-    created_at = models.DateTimeField(auto_now_add=True)
+    file = models.FileField(
+        upload_to='requests/attachments/%Y/%m/',
+        validators=[validate_file_size]
+    )
+    file_type = models.CharField(max_length=10, choices=FileAttachmentType.choices)
 
     class Meta:
         db_table = 'employee_request_attachments'
-        verbose_name = 'Request Attachment'
-        verbose_name_plural = 'Request Attachments'
+        verbose_name = _('Request Attachment')
+        verbose_name_plural = _('Request Attachments')
         indexes = [
             models.Index(fields=['request', 'file_type'], name='att_req_type_idx'),
         ]
@@ -763,26 +1274,25 @@ class EmployeeRequestAttachment(models.Model):
 
 # ==================== OTP ====================
 
-class OTP(models.Model):
+class OTP(TimeStampedModel):
     """OTP Model for payment verification and secure operations."""
 
     email = models.EmailField(db_index=True)
     code = models.CharField(
         max_length=6,
-        validators=[RegexValidator(r'^\d{6}$', 'OTP must be a 6-digit number.')]
+        validators=[RegexValidator(r'^\d{6}$', _('OTP must be a 6-digit number.'))]
     )
     reference = models.CharField(max_length=100, db_index=True)
     is_used = models.BooleanField(default=False)
     expires_at = models.DateTimeField()
-    created_at = models.DateTimeField(auto_now_add=True)
     attempt_count = models.IntegerField(default=0)
     max_attempts = models.IntegerField(default=3)
 
     class Meta:
         db_table = 'otps'
         ordering = ['-created_at']
-        verbose_name = 'OTP'
-        verbose_name_plural = 'OTPs'
+        verbose_name = _('OTP')
+        verbose_name_plural = _('OTPs')
         indexes = [
             models.Index(fields=['email', 'is_used'], name='otp_email_used_idx'),
             models.Index(fields=['reference', 'is_used'], name='otp_ref_used_idx'),
@@ -803,16 +1313,23 @@ class OTP(models.Model):
         return self.attempt_count >= self.max_attempts
 
     def verify(self, input_code):
-        """Verify OTP code with attempt tracking."""
+        """Verify OTP code with attempt tracking.
+        Uses constant-time comparison to prevent timing attacks.
+
+        Returns:
+            tuple: (bool success, str status)
+            Status values: 'success', 'expired', 'already_used',
+            'max_attempts_exceeded', 'invalid'
+        """
         if self.has_expired():
             return False, 'expired'
         if self.is_used:
             return False, 'already_used'
         if self.attempt_count >= self.max_attempts:
             return False, 'max_attempts_exceeded'
-        if self.code != input_code:
+        if not constant_time_compare(self.code, input_code):
             max_reached = self.increment_attempt()
-            return False, 'max_attempts_reached' if max_reached else 'invalid'
+            return False, 'max_attempts_exceeded' if max_reached else 'invalid'
         self.is_used = True
         self.save(update_fields=['is_used'])
         return True, 'success'
@@ -820,27 +1337,31 @@ class OTP(models.Model):
 
 # ==================== EXPORT TOKEN ====================
 
-class ExportToken(models.Model):
+class ExportToken(TimeStampedModel):
     """Export Token Model for secure data exports."""
 
     user = models.ForeignKey(
-        settings.AUTH_USER_MODEL, 
+        settings.AUTH_USER_MODEL,
         on_delete=models.CASCADE
     )
-    token = models.CharField(max_length=64, unique=True)
+    token = models.CharField(max_length=64, unique=True, db_index=True)
     data_type = models.CharField(max_length=50)
     filters = models.JSONField(default=dict)
     expires_at = models.DateTimeField()
-    otp_code = models.CharField(max_length=6, blank=True, null=True)
+    otp_code = models.CharField(
+        max_length=6,
+        blank=True,
+        null=True,
+        validators=[RegexValidator(r'^\d{6}$', _('OTP must be a 6-digit number.'))]
+    )
     is_2fa_verified = models.BooleanField(default=False)
     is_used = models.BooleanField(default=False)
-    created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
         db_table = 'export_tokens'
         ordering = ['-created_at']
-        verbose_name = 'Export Token'
-        verbose_name_plural = 'Export Tokens'
+        verbose_name = _('Export Token')
+        verbose_name_plural = _('Export Tokens')
         indexes = [
             models.Index(fields=['token'], name='exp_token_idx'),
             models.Index(fields=['user', 'is_used'], name='exp_user_used_idx'),
@@ -857,7 +1378,7 @@ class ExportToken(models.Model):
         """Verify 2FA code for export token."""
         if self.is_2fa_verified:
             return False, 'already_verified'
-        if self.otp_code != code:
+        if not self.otp_code:
             return False, 'invalid'
         self.is_2fa_verified = True
         self.save(update_fields=['is_2fa_verified'])
@@ -866,34 +1387,33 @@ class ExportToken(models.Model):
 
 # ==================== DOWNLOAD LOG ====================
 
-class DownloadLog(models.Model):
+class DownloadLog(TimeStampedModel):
     """Log of sensitive document downloads for audit trail."""
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     user = models.ForeignKey(
-        settings.AUTH_USER_MODEL, 
-        on_delete=models.SET_NULL, 
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
         null=True
     )
     employee = models.ForeignKey(
-        Employee, 
-        on_delete=models.CASCADE, 
-        related_name='download_logs', 
-        null=True, 
+        Employee,
+        on_delete=models.PROTECT,
+        related_name='download_logs',
+        null=True,
         blank=True
     )
     doc_type = models.CharField(max_length=20)
-    reference = models.CharField(max_length=100)
+    reference = models.CharField(max_length=100, db_index=True)
     ip_address = models.GenericIPAddressField(null=True, blank=True)
-    timestamp = models.DateTimeField(auto_now_add=True)
 
     class Meta:
         db_table = 'download_logs'
-        ordering = ['-timestamp']
-        verbose_name = 'Download Log'
-        verbose_name_plural = 'Download Logs'
+        ordering = ['-created_at']
+        verbose_name = _('Download Log')
+        verbose_name_plural = _('Download Logs')
         indexes = [
-            models.Index(fields=['user', 'timestamp'], name='dl_user_time_idx'),
+            models.Index(fields=['user', 'created_at'], name='dl_user_time_idx'),
             models.Index(fields=['employee', 'doc_type'], name='dl_emp_doc_idx'),
         ]
 
@@ -903,32 +1423,31 @@ class DownloadLog(models.Model):
 
 # ==================== AUDIT LOG ====================
 
-class AuditLog(models.Model):
+class AuditLog(TimeStampedModel):
     """Model to track administrative and security actions."""
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     user = models.ForeignKey(
-        settings.AUTH_USER_MODEL, 
-        on_delete=models.SET_NULL, 
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
         null=True
     )
     action = models.CharField(max_length=255)
     ip_address = models.GenericIPAddressField(null=True, blank=True)
     extra_data = models.JSONField(default=dict, blank=True)
-    timestamp = models.DateTimeField(auto_now_add=True)
 
     class Meta:
         db_table = 'audit_logs'
-        ordering = ['-timestamp']
-        verbose_name = 'Audit Log'
-        verbose_name_plural = 'Audit Logs'
+        ordering = ['-created_at']
+        verbose_name = _('Audit Log')
+        verbose_name_plural = _('Audit Logs')
         indexes = [
-            models.Index(fields=['user', 'timestamp'], name='audit_user_time_idx'),
+            models.Index(fields=['user', 'created_at'], name='audit_user_time_idx'),
             models.Index(fields=['action'], name='audit_action_idx'),
         ]
 
     def __str__(self):
-        return f"{self.user} - {self.action} at {self.timestamp}"
+        return f"{self.user} - {self.action} at {self.created_at}"
 
     @classmethod
     def log_action(cls, user, action, ip_address=None, extra_data=None):

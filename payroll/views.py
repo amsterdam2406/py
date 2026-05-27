@@ -862,7 +862,7 @@ class EmployeeViewSet(viewsets.ModelViewSet):
         return Response({'token': token, '2fa_required': True})
 
     @action(detail=False, methods=['get'], permission_classes=[IsAuthenticated],
-            authentication_classes=[SessionAuthentication, BasicAuthentication])
+            authentication_classes=[JWTAuthentication, SessionAuthentication, BasicAuthentication])
     def export_csv(self, request):
         """Export employee data as CSV using token"""
         token = request.query_params.get('token')
@@ -2570,7 +2570,7 @@ class DownloadLogViewSet(viewsets.ReadOnlyModelViewSet):
     """
     ViewSet for administrators to monitor document download history.
     """
-    queryset = DownloadLog.objects.all().order_by('-timestamp')
+    queryset = DownloadLog.objects.all().order_by('-created_at')
     serializer_class = DownloadLogSerializer
     permission_classes = [IsAdmin]
     filterset_fields = ['doc_type', 'employee']
