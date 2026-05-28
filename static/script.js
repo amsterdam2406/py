@@ -358,6 +358,7 @@ function openModal(id) {
     console.warn(`Modal not found: ${id}`);
     return;
   }
+  modal.style.display = "flex";
   modal.classList.add("active");
   if (id === "clockInModal") {
     startCamera();
@@ -401,9 +402,8 @@ function closeModal(id) {
   ) {
     AppState.cameraStream.getTracks().forEach((track) => track.stop());
     AppState.cameraStream = null;
-  } // Fixed: Stop camera stream
+  }
 
-  // Stop payment polling when closing payment modals
   if (id === "individualPaymentModal" || id === "bulkPaymentModal") {
     if (AppState.paymentPollInterval) {
       clearInterval(AppState.paymentPollInterval);
@@ -413,10 +413,13 @@ function closeModal(id) {
       clearInterval(AppState.bulkPollInterval);
       AppState.bulkPollInterval = null;
     }
-  } // Fixed: Clear polling intervals
+  }
 
   const modal = document.getElementById(id);
-  if (modal) modal.classList.remove("active");
+  if (modal) {
+    modal.classList.remove("active");
+    modal.style.display = "none";
+  }
 }
 
 // ==========================================
@@ -1033,6 +1036,58 @@ async function handleLogin(e) {
   } catch (err) {
     console.error("Login error:", err);
     showToast("Login failed. Please try again.", "error");
+  } finally {
+    hideLoading(btn);
+  }
+}
+
+async function handleSelfSignup(e) {
+  e.preventDefault();
+  const btn = e.target.querySelector('button[type="submit"]');
+
+  const payload = {
+    username: document.getElementById("signupUsername")?.value.trim(),
+    password: document.getElementById("signupPassword")?.value,
+    full_name: document.getElementById("signupFullName")?.value.trim(),
+    role: document.getElementById("signupRole")?.value,
+    location: document.getElementById("signupLocation")?.value.trim(),
+    salary: 0,
+    email: document.getElementById("signupEmail")?.value.trim(),
+    phone: "",
+    bank_name: "",
+    bank_code: "",
+    account_number: "",
+    account_holder: "",
+  };
+
+  const missing = [];
+  if (!payload.username) missing.push("Username");
+  if (!payload.password || payload.password.length < 8) missing.push("Password (min 8 chars)");
+  if (!payload.full_name || payload.full_name.split(/\s+/).length < 2) missing.push("Full Name (min 2 names)");
+  if (!payload.role) missing.push("Role");
+  if (!payload.location) missing.push("Location");
+
+  if (missing.length) {
+    showToast("Missing or invalid fields: " + missing.join(", "), "warning");
+    return;
+  }
+
+  try {
+    showLoading(btn);
+    const res = await apiRequest("/self-register/", {
+      method: "POST",
+      body: payload,
+    });
+
+    if (!res.success) {
+      throw new Error(res.message || "Self-registration failed");
+    }
+
+    showToast(res.data?.message || "Registration successful! Awaiting admin approval.", "success");
+    closeSelfSignupModal();
+    document.getElementById("selfSignupForm")?.reset();
+  } catch (err) {
+    showToast(err.message, "error");
   } finally {
     hideLoading(btn);
   }
@@ -4392,6 +4447,7 @@ function setupEventListeners() {
     // FIX: Ensure export confirm submit actually triggers confirmExport()
     { id: "exportPasswordForm", handler: confirmExport },
   ];
+  document.getElementById("selfSignupForm")?.addEventListener("submit", handleSelfSignup);
 
   forms.forEach(({ id, handler }) => {
     const form = document.getElementById(id);
@@ -5018,14 +5074,12 @@ const EXPOSED_FUNCTIONS = {
 };
 
 function openChangePasswordModal() {
-  // Fixed: Ensure openChangePasswordModal is exposed
   const modal = document.getElementById("changePasswordModal");
   if (!modal) {
     showToast("Change password modal not found", "error");
     return;
   }
 
-  // Accessibility: include username on password forms (optionally hidden)
   const usernameInput = document.getElementById("changePasswordUsername");
   if (usernameInput) {
     usernameInput.value =
@@ -5035,6 +5089,7 @@ function openChangePasswordModal() {
   document.getElementById("oldPassword").value = "";
   document.getElementById("newPassword").value = "";
   document.getElementById("confirmPassword").value = "";
+  modal.style.display = "flex";
   modal.classList.add("active");
 }
 

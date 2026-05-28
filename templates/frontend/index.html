@@ -59,7 +59,7 @@
                     <i class="fas fa-sign-in-alt"></i> Login
                 </button>
                 <div style="text-align:center; margin-top: 14px;">
-<button type="button" onclick="showSelfSignupModal()" class="btn btn-primary btn-block" style="display: inline-flex; align-items:center; justify-content:center; gap: 8px; padding: 10px 18px;">
+                    <button type="button" onclick="showSelfSignupModal()" class="btn btn-primary btn-block" style="display: inline-flex; align-items:center; justify-content:center; gap: 8px; padding: 10px 18px;">
                         <i class="fas fa-user-plus"></i> Signup
                     </button>
                 </div>
@@ -343,7 +343,7 @@
                     </section>
 
                     <!-- Edit Deduction Modal -->
-                    <div id="editDeductionModal" class="modal">
+                    <div id="editDeductionModal" class="modal" style="display: none;">
                         <div class="modal-content">
                             <h3>Edit Deduction</h3>
                             <form id="editDeductionForm">
@@ -647,7 +647,7 @@
         </div>
 
         <!-- Request Modal -->
-        <div id="requestModal" class="modal">
+        <div id="requestModal" class="modal" style="display: none;">
             <div class="modal-content">
                 <div class="modal-header">
                     <h3>New Employee Request</h3>
@@ -698,7 +698,7 @@
         </div>
 
         <!-- Decline Reason Modal -->
-        <div id="declineReasonModal" class="modal">
+        <div id="declineReasonModal" class="modal" style="display: none;">
             <div class="modal-content modal-sm">
                 <h3>Decline Request</h3>
                 <textarea id="declineReasonText" class="form-control" placeholder="Reason for declining..." rows="3"></textarea>
@@ -710,7 +710,7 @@
         <!-- MODALS -->
 
         <!-- Add Employee Modal -->
-        <div id="addEmployeeModal" class="modal">
+        <div id="addEmployeeModal" class="modal" style="display: none;">
             <div class="modal-content">
                 <div class="modal-header">
                     <h3>Add New Employee</h3>
@@ -771,7 +771,7 @@
         </div>
 
         <!-- Clock In/Out Modal -->
-        <div id="clockInModal" class="modal">
+        <div id="clockInModal" class="modal" style="display: none;">
             <div class="modal-content">
                 <div class="modal-header">
                     <h3>Clock In/Out with Selfie</h3>
@@ -815,7 +815,7 @@
         </div>
 
         <!-- ADDED: On Leave Modal -->
-        <div id="leaveModal" class="modal">
+        <div id="leaveModal" class="modal" style="display: none;">
             <div class="modal-content">
                 <div class="modal-header">
                     <h3>Mark Employee On Leave</h3>
@@ -846,7 +846,7 @@
         </div>
 
         <!-- Add Deduction Modal -->
-        <div id="addDeductionModal" class="modal">
+        <div id="addDeductionModal" class="modal" style="display: none;">
             <div class="modal-content">
                 <div class="modal-header">
                     <h3>Add Deduction</h3>
@@ -871,7 +871,7 @@
         </div>
 
         <!-- FIXED: Individual Payment Modal - Removed card fields, added Paystack flow -->
-        <div id="individualPaymentModal" class="modal">
+        <div id="individualPaymentModal" class="modal" style="display: none;">
             <div class="modal-content">
                 <div class="modal-header">
                     <h3>Individual Payment</h3>
@@ -919,7 +919,7 @@
         </div>
 
         <!-- OTP Verification Modal -->
-        <div id="otpModal" class="modal">
+        <div id="otpModal" class="modal" style="display: none;">
             <div class="modal-content modal-sm">
                 <div class="modal-header">
                     <h3>OTP Verification</h3>
@@ -936,7 +936,7 @@
         </div>
 
         <!-- FIXED: Bulk Payment Modal - Proper columns and dynamic total -->
-        <div id="bulkPaymentModal" class="modal">
+        <div id="bulkPaymentModal" class="modal" style="display: none;">
             <div class="modal-content modal-lg">
                 <div class="modal-header">
                     <h3>Bulk Payment Processing</h3>
@@ -978,7 +978,7 @@
         </div>
 
         <!-- Add Company Modal -->
-        <div id="addCompanyModal" class="modal">
+        <div id="addCompanyModal" class="modal" style="display: none;">
             <div class="modal-content">
                 <div class="modal-header">
                     <h3 id="companyModalTitle">Add Company/Client</h3>
@@ -1043,7 +1043,7 @@
         </div>
 
         <!-- Sack Employee Modal -->
-        <div id="sackEmployeeModal" class="modal">
+        <div id="sackEmployeeModal" class="modal" style="display: none;">
             <div class="modal-content">
                 <div class="modal-header">
                     <h3>Sack/Resign Employee</h3>
@@ -1069,7 +1069,7 @@
         </div>
 
         <!-- Export Password Modal -->
-        <div id="exportPasswordModal" class="modal">
+        <div id="exportPasswordModal" class="modal" style="display: none;">
             <div class="modal-content modal-sm">
                 <div class="modal-header">
                     <h3>Authentication Required</h3>
@@ -1085,7 +1085,7 @@
             </div>
         </div>
                 <!-- Employee Detail Modal -->
-        <div id="employeeDetailModal" class="modal">
+        <div id="employeeDetailModal" class="modal" style="display: none;">
             <div class="modal-content modal-lg">
                 <div class="modal-header">
                     <h3>Employee Details</h3>
@@ -1101,7 +1101,7 @@
         </div>
         
         <!-- Change Password Modal -->
-        <div id="changePasswordModal" class="modal">
+        <div id="changePasswordModal" class="modal" style="display: none;">
             <div class="modal-content modal-sm">
                 <div class="modal-header">
                     <h3>Change Password</h3>
@@ -1127,13 +1127,13 @@
         </div>
 
         <!-- Self Signup Modal -->
-        <div id="selfSignupModal" class="modal">
+        <div id="selfSignupModal" class="modal" style="display: none;">
             <div class="modal-content">
                 <div class="modal-header">
                     <h3>Employee Self Signup</h3>
-                    <span class="close" onclick="closeModal('selfSignupModal')">&times;</span>
+                    <span class="close" onclick="closeSelfSignupModal()">&times;</span>
                 </div>
-                <form id="selfSignupForm" onsubmit="handleSelfSignup(event)">
+                <form id="selfSignupForm">
                     <div class="form-group">
                         <label>Full Name</label>
                         <input type="text" id="signupFullName" class="form-control" required>
