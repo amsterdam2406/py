@@ -13,6 +13,8 @@ class UserManager(BaseUserManager):
         if not email:
             raise ValueError(_('The Email must be set'))
         email = self.normalize_email(email)
+        if 'full_name' not in extra_fields or not extra_fields['full_name']:
+            extra_fields['full_name'] = extra_fields.get('username', email.split('@')[0])
         user = self.model(email=email, **extra_fields)
         user.set_password(password)
         user.save(using=self._db)
