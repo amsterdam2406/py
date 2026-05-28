@@ -1592,16 +1592,11 @@ async function handleCreateEmployee(e) {
     email: document.getElementById("newEmployeeEmail")?.value.trim(),
     phone: document.getElementById("newEmployeePhone")?.value.trim(),
     bank_name: document.getElementById("newEmployeeBankName")?.value.trim(),
-    bank_code:
-      document.getElementById("newEmployeeBankName")?.selectedOptions?.[0]
-        ?.dataset?.code || "",
-    account_number: document
-      .getElementById("newEmployeeAccountNumber")
-      ?.value.trim(),
-    account_holder: document
-      .getElementById("newEmployeeAccountHolder")
-      ?.value.trim(),
-  };
+    bank_code: document.getElementById("newEmployeeBankName")?.selectedOptions?.[0]?.dataset?.code || "",
+    account_number: document.getElementById("newEmployeeAccountNumber")?.value.trim(),
+    account_holder: document.getElementById("newEmployeeAccountHolder")?.value.trim(),
+    employee_id: document.getElementById("newEmployeeId")?.value?.trim() || "",
+};
 
   // Hybrid validation
   const missingFields = [];
@@ -1755,12 +1750,11 @@ async function handleRegistration(e, isSelfSignup = false) {
     phone: document.getElementById("accountPhone")?.value.trim(),
     email: document.getElementById("accountEmail")?.value.trim(),
     bank_name: document.getElementById("accountBankName")?.value,
-    bank_code:
-      document.getElementById("accountBankName")?.selectedOptions?.[0]?.dataset
-        ?.code || "",
+    bank_code: document.getElementById("accountBankName")?.selectedOptions?.[0]?.dataset?.code || "",
     account_number: document.getElementById("accountNumber")?.value.trim(),
     account_holder: document.getElementById("accountHolderName")?.value.trim(),
-  };
+    employee_id: document.getElementById("generatedEmployeeIdInput")?.value || document.getElementById("generatedEmployeeId")?.textContent.trim() || "",
+};
 
   // Password Strength Check
   const strength = checkPasswordStrength(payload.password || "");
@@ -4301,13 +4295,14 @@ function setupEmployeeIdGeneration() {
     // Update hidden input
     let hiddenInput = document.getElementById("generatedEmployeeIdInput");
     if (!hiddenInput) {
-      hiddenInput = document.createElement("input");
-      hiddenInput.type = "hidden";
-      hiddenInput.id = "generatedEmployeeIdInput";
-      hiddenInput.name = "employee_id";
-      document.getElementById("createAccountForm")?.appendChild(hiddenInput);
+        hiddenInput = document.createElement("input");
+        hiddenInput.type = "hidden";
+        hiddenInput.id = "generatedEmployeeIdInput";
+        hiddenInput.name = "employee_id";
+        const form = document.getElementById("createAccountForm");
+        if (form) form.appendChild(hiddenInput);
     }
-    hiddenInput.value = nextId || "";
+    if (hiddenInput) hiddenInput.value = nextId || "";
   };
 
   if (typeSelect) typeSelect.addEventListener("change", generateId);

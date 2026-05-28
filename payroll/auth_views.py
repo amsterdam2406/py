@@ -23,7 +23,6 @@ from django.utils.html import strip_tags
 from django.urls import reverse
 from django.conf import settings
 from django.db.models import Q
-
 from rest_framework_simplejwt.views import TokenRefreshView
 from rest_framework_simplejwt.serializers import TokenRefreshSerializer
 from rest_framework_simplejwt.exceptions import InvalidToken
@@ -476,6 +475,8 @@ def get_next_employee_id(request):
         'sequence': next_sequence,
         'note': 'This is a preview. Actual ID assigned on creation.'
     }, status=status.HTTP_200_OK)
+
+
 
 @api_view(['POST'])
 @permission_classes([AllowAny])
