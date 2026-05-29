@@ -53,7 +53,9 @@ class PaystackService:
             if not result or not result.get('status'):
                 raise Exception(f"Failed to create recipient: {result.get('message') if result else 'Unknown error'}")
             
-            recipient_code = result.get('data', {}).get('recipient_code')
+            recipient_code = result.get('data', {}).get('recipient_code') or result.get('recipient_code')
+            if not recipient_code:
+                raise Exception("Failed to create recipient: missing recipient code")
             employee.paystack_recipient_code = recipient_code
             employee.save(update_fields=['paystack_recipient_code'])
         return recipient_code
@@ -136,6 +138,7 @@ class PaystackService:
                     net_amount=net_amount,
                     transaction_reference=str(uuid.uuid4()),
                     payment_date=timezone.now().date(),
+                    payment_month=current_month,
                     processed_by=processed_by,
                     status='processing',
                     payment_method='bank_transfer'
@@ -173,7 +176,8 @@ class PaystackService:
         if verification.get('status') is True:
             if paystack_status == 'success':
                 if payment.change_status('completed'):
-                    payment.paystack_reference = str(data.get('id', '') or data.get('reference', ''))
+                    payment.paystack_reference = str(data.get('id') or data.get('transfer_code') or data.get('reference') or '')
+                    payment.paystack_transfer_code = str(data.get('transfer_code') or payment.paystack_transfer_code or '')
                     payment.save()
                     Notification.objects.create(
                         user=payment.employee.user,

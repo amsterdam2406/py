@@ -521,6 +521,7 @@ async function apiRequest(url, options = {}) {
         success: false,
         status: response.status,
         message: `Too many requests. Please wait ${waitTime} seconds.`,
+        data: errorData,
       };
     }
 

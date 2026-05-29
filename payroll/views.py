@@ -26,6 +26,7 @@ from django.core.cache import cache
 from django.http import HttpResponse, JsonResponse
 from django.shortcuts import render
 from django.template.loader import render_to_string
+from django.utils.html import escape
 from django.utils import timezone
 from django.views.decorators.csrf import csrf_exempt
 import requests
@@ -77,6 +78,60 @@ from .utils import log_audit, get_client_ip
 
 User = get_user_model()
 logger = logging.getLogger(__name__)
+
+
+def _paystack_reference_from_data(data):
+    if not isinstance(data, dict):
+        return ''
+    return str(data.get('id') or data.get('transfer_code') or data.get('reference') or '')
+
+
+def _paystack_transfer_code_from_data(data):
+    if not isinstance(data, dict):
+        return ''
+    return str(data.get('transfer_code') or '')
+
+
+def _apply_paystack_transfer_result(payment, transfer_data, save=True):
+    transfer_data = transfer_data if isinstance(transfer_data, dict) else {}
+    transfer_status = transfer_data.get('status')
+    paystack_ref = _paystack_reference_from_data(transfer_data)
+    transfer_code = _paystack_transfer_code_from_data(transfer_data)
+
+    if paystack_ref:
+        payment.paystack_reference = paystack_ref
+    if transfer_code:
+        payment.paystack_transfer_code = transfer_code
+
+    if transfer_status == 'success':
+        payment.status = 'completed'
+    elif transfer_status == 'otp':
+        payment.status = 'pending_paystack_otp'
+    elif transfer_status in ['failed', 'reversed']:
+        payment.status = 'failed'
+    elif transfer_status in ['pending', 'processing', 'queued', 'received']:
+        payment.status = 'processing'
+    elif not transfer_status and payment.status in ['pending', 'pending_hr']:
+        payment.status = 'processing'
+
+    if save:
+        payment.save(update_fields=['status', 'paystack_reference', 'paystack_transfer_code', 'updated_at'])
+    return payment
+
+
+def _sync_payment_with_paystack(payment):
+    if payment.payment_method != 'bank_transfer':
+        return payment
+    if payment.status not in ['processing', 'pending', 'pending_hr', 'pending_paystack_otp']:
+        return payment
+
+    result = PaystackAPI().verify_transfer(payment.transaction_reference)
+    transfer_data = result.get('data') if isinstance(result.get('data'), dict) else {}
+    if result.get('status') is True:
+        with transaction.atomic():
+            locked = Payment.objects.select_for_update().get(pk=payment.pk)
+            return _apply_paystack_transfer_result(locked, transfer_data)
+    return payment
 
 
 class DownloadLogSerializer(serializers.ModelSerializer):
@@ -140,7 +195,10 @@ def paystack_verify_account(request):
         message = result.get('message', 'Account verification temporarily rate limited.')
         if retry_after:
             message = f"{message} Retry after {retry_after} seconds."
-        return Response({'detail': message}, status=status.HTTP_429_TOO_MANY_REQUESTS)
+        return Response(
+            {'detail': message, 'retry_after': retry_after},
+            status=status.HTTP_429_TOO_MANY_REQUESTS
+        )
 
     return Response(result)
 
@@ -334,10 +392,12 @@ def _handle_transfer_success(data):
             payment = Payment.objects.select_for_update().get(transaction_reference=reference)
             logger.info(f"Handling transfer.success for payment {payment.id}, current status: {payment.status}")
 
-            payment.paystack_reference = str(data.get('id', ''))
-            # change_status handles the save operation, now including the reference
-            if not payment.change_status('completed'):
+            payment.paystack_reference = _paystack_reference_from_data(data)
+            payment.paystack_transfer_code = _paystack_transfer_code_from_data(data) or payment.paystack_transfer_code
+            if payment.status == 'completed':
                 return
+            payment.status = 'completed'
+            payment.save(update_fields=['status', 'paystack_reference', 'paystack_transfer_code', 'updated_at'])
             
             # Automate Receipt Email
             send_payment_receipt_email(payment)
@@ -368,9 +428,12 @@ def _handle_transfer_failed(data):
             payment = Payment.objects.select_for_update().get(transaction_reference=reference)
             logger.info(f"Handling transfer.failed for payment {payment.id}, current status: {payment.status}")
             
-            # change_status handles the save operation
-            if not payment.change_status('failed'):
+            if payment.status == 'failed':
                 return
+            payment.paystack_reference = _paystack_reference_from_data(data) or payment.paystack_reference
+            payment.paystack_transfer_code = _paystack_transfer_code_from_data(data) or payment.paystack_transfer_code
+            payment.status = 'failed'
+            payment.save(update_fields=['status', 'paystack_reference', 'paystack_transfer_code', 'updated_at'])
             
             # Keep deductions as 'pending' unless they are cancelled manually by deduction admin.
 
@@ -399,9 +462,12 @@ def _handle_transfer_reversed(data):
             payment = Payment.objects.select_for_update().get(transaction_reference=reference)
             logger.info(f"Handling transfer.reversed for payment {payment.id}, current status: {payment.status}")
 
-            # change_status handles the save operation
-            if not payment.change_status('failed'):
+            if payment.status == 'failed':
                 return
+            payment.paystack_reference = _paystack_reference_from_data(data) or payment.paystack_reference
+            payment.paystack_transfer_code = _paystack_transfer_code_from_data(data) or payment.paystack_transfer_code
+            payment.status = 'failed'
+            payment.save(update_fields=['status', 'paystack_reference', 'paystack_transfer_code', 'updated_at'])
 
             Notification.objects.create(
                 user=payment.employee.user,
@@ -482,12 +548,9 @@ def verify_payment_status(request, reference):
                 with transaction.atomic():
                     payment = Payment.objects.select_for_update().get(pk=payment.pk)
                     if payment.status == 'processing':
-                        payment.status = 'completed'
-                        payment.paystack_reference = str(transfer_data.get('id', '') or transfer_data.get('reference', ''))
-                        payment.save(update_fields=['status', 'paystack_reference', 'updated_at'])
+                        _apply_paystack_transfer_result(payment, transfer_data)
             elif verification.get('status') is True and transfer_status in ['failed', 'reversed']:
-                payment.status = 'failed'
-                payment.save(update_fields=['status', 'updated_at'])
+                _apply_paystack_transfer_result(payment, transfer_data)
         except Exception as exc:
             logger.error(f"Payment status polling failed for {reference}: {exc}")
 
@@ -1261,13 +1324,13 @@ class PaymentViewSet(viewsets.ModelViewSet):
                     data = res.get('data', {})
                     if data.get('status') == 'success':
                         with transaction.atomic():
-                            payment.change_status('completed')
-                            payment.paystack_reference = str(data.get('id', ''))
-                            payment.save()
+                            payment = Payment.objects.select_for_update().get(pk=payment.pk)
+                            _apply_paystack_transfer_result(payment, data)
                         updated_count += 1
                     elif data.get('status') in ['failed', 'reversed']:
-                        payment.change_status('failed')
-                        payment.save()
+                        with transaction.atomic():
+                            payment = Payment.objects.select_for_update().get(pk=payment.pk)
+                            _apply_paystack_transfer_result(payment, data)
                         updated_count += 1
             except Exception as e:
                 logger.error(f"Sync error for {payment.transaction_reference}: {e}")
@@ -1372,14 +1435,18 @@ class PaymentViewSet(viewsets.ModelViewSet):
                     return Response({'error': 'Invalid custom amount'}, status=status.HTTP_400_BAD_REQUEST)
             else:
                 payment_month = timezone.now().strftime('%Y-%m')
-                existing = Payment.objects.filter(
+                existing_payment = Payment.objects.filter(
                     employee=employee,
                     payment_month=payment_month,
-                ).exclude(status='failed').exists()
+                ).first()
 
-                if existing:
+                if existing_payment:
                     return Response(
-                        {'error': f'Full salary already initiated for {payment_month}'},
+                        {
+                            'error': f'Full salary already initiated for {payment_month}',
+                            'status': existing_payment.status,
+                            'reference': existing_payment.transaction_reference,
+                        },
                         status=status.HTTP_400_BAD_REQUEST
                     )
 
@@ -1394,22 +1461,26 @@ class PaymentViewSet(viewsets.ModelViewSet):
                     status=status.HTTP_400_BAD_REQUEST
                 )
 
-            payment = Payment.objects.create(
-                employee=employee,
-                base_salary=employee.salary,
-                total_deductions=total_deductions,
-                net_amount=net_salary,
-                transaction_reference=str(uuid.uuid4()),
-                payment_date=timezone.now().date(),
-                payment_month=payment_month,
-                processed_by=request.user,
-                status=initial_status,
-                is_partial=is_partial, # Initial status is 'pending' before internal OTP verification
-                payment_method='bank_transfer'
-            )
+            try:
+                payment = Payment.objects.create(
+                    employee=employee,
+                    base_salary=employee.salary,
+                    total_deductions=total_deductions,
+                    net_amount=net_salary,
+                    transaction_reference=str(uuid.uuid4()),
+                    payment_date=timezone.now().date(),
+                    payment_month=payment_month,
+                    processed_by=request.user,
+                    status=initial_status,
+                    is_partial=is_partial,
+                    payment_method='bank_transfer'
+                )
+            except ValidationError as exc:
+                return Response({'error': exc.message_dict if hasattr(exc, 'message_dict') else exc.messages}, status=status.HTTP_400_BAD_REQUEST)
 
-            # Since Internal OTP flow is removed, trigger Paystack immediately if no HR approval is required
-            if initial_status in ['pending', 'pending_hr']:
+            # Since Internal OTP flow is removed, trigger Paystack immediately only
+            # when this payment does not need HR approval.
+            if initial_status == 'pending':
                 paystack = PaystackAPI()
                 
                 # 1. Ensure Paystack Recipient exists for this employee
@@ -1425,7 +1496,11 @@ class PaymentViewSet(viewsets.ModelViewSet):
                         payment.save()
                         return Response({'error': f"Paystack recipient creation failed: {recipient_result.get('message')}"}, status=status.HTTP_400_BAD_REQUEST)
                     
-                    recipient_code = recipient_result.get('data', {}).get('recipient_code')
+                    recipient_code = recipient_result.get('data', {}).get('recipient_code') or recipient_result.get('recipient_code')
+                    if not recipient_code:
+                        payment.status = 'failed'
+                        payment.save(update_fields=['status', 'updated_at'])
+                        return Response({'error': 'Paystack recipient creation failed: missing recipient code'}, status=status.HTTP_400_BAD_REQUEST)
                     employee.paystack_recipient_code = recipient_code
                     employee.save(update_fields=['paystack_recipient_code'])
 
@@ -1439,27 +1514,21 @@ class PaymentViewSet(viewsets.ModelViewSet):
 
                 if transfer_result.get('status'):
                     data = transfer_result.get('data', {})
-                    transfer_status = data.get('status')
-                    
-                    payment.paystack_transfer_code = data.get('transfer_code')
-                    # If Paystack requires an OTP (configured on their dashboard), move to that state
-                    if transfer_status == 'otp':
-                        payment.status = 'pending_paystack_otp'
-                    else:
-                        payment.status = 'processing'
-                    payment.save()
+                    _apply_paystack_transfer_result(payment, data)
 
                     return Response({
-                        'message': 'Payment initiated on Paystack.',
+                        'message': 'Payment confirmed by Paystack.' if payment.status == 'completed' else 'Payment initiated on Paystack.',
                         'reference': payment.transaction_reference,
+                        'paystack_reference': payment.paystack_reference,
+                        'paystack_transfer_code': payment.paystack_transfer_code,
                         'amount': float(net_salary),
                         'status': payment.status,
-                        'paystack_otp_required': transfer_status == 'otp',
+                        'paystack_otp_required': payment.status == 'pending_paystack_otp',
                         'employee': employee.name
                     })
                 else:
                     payment.status = 'failed'
-                    payment.save()
+                    payment.save(update_fields=['status', 'updated_at'])
                     return Response({'error': f"Paystack API error: {transfer_result.get('message')}"}, status=status.HTTP_400_BAD_REQUEST)
 
             return Response({
@@ -1499,13 +1568,13 @@ class PaymentViewSet(viewsets.ModelViewSet):
                 employee = Employee.objects.get(id=emp_id, status='active')
 
                 # Prevent double payment in bulk
-                existing = Payment.objects.filter(
+                existing_payment = Payment.objects.filter(
                     employee=employee, 
                     payment_month=current_month
-                ).exclude(status='failed').exists()
+                ).first()
                 
-                if existing:
-                    errors.append(f"{employee.name}: Already paid or processing for {current_month}")
+                if existing_payment:
+                    errors.append(f"{employee.name}: payment already exists for {current_month} ({existing_payment.status})")
                     continue
 
                 bank_code = get_employee_bank_code(employee)
@@ -1527,6 +1596,7 @@ class PaymentViewSet(viewsets.ModelViewSet):
                     net_amount=net_amount,
                     transaction_reference=str(uuid.uuid4()),
                     payment_date=timezone.now().date(),
+                    payment_month=current_month,
                     processed_by=request.user,
                     status='processing',
                     payment_method='bank_transfer'
@@ -1665,12 +1735,10 @@ class PaymentViewSet(viewsets.ModelViewSet):
             )
 
             if transfer_result.get('status'):
-                paystack_transfer_status = transfer_result.get('data', {}).get('status')
-                paystack_transfer_code = transfer_result.get('data', {}).get('transfer_code')
-
-                payment.paystack_transfer_code = paystack_transfer_code # Store Paystack's transfer code
-                payment.status = 'pending_paystack_otp' if paystack_transfer_status == 'otp' else 'processing'
-                payment.save()
+                transfer_data = transfer_result.get('data', {})
+                paystack_transfer_status = transfer_data.get('status')
+                paystack_transfer_code = transfer_data.get('transfer_code')
+                _apply_paystack_transfer_result(payment, transfer_data)
                 
                 # Check status and return correct frontend instruction
                 if paystack_transfer_status == 'otp':
@@ -1683,9 +1751,8 @@ class PaymentViewSet(viewsets.ModelViewSet):
 
                 elif paystack_transfer_status == 'success':
                     with transaction.atomic():
-                        payment.status = 'completed'
-                        payment.paystack_reference = str(transfer_result.get('data', {}).get('id', '') or '')
-                        payment.save()
+                        payment = Payment.objects.select_for_update().get(pk=payment.pk)
+                        _apply_paystack_transfer_result(payment, transfer_data)
                         Notification.objects.create(
                             user=payment.employee.user,
                             message=f"Salary payment of ₦{payment.net_amount:,.2f} confirmed.",
@@ -1695,14 +1762,13 @@ class PaymentViewSet(viewsets.ModelViewSet):
                     return Response({'message': 'Payment initiated and completed successfully', 'payment_completed': True}, status=status.HTTP_200_OK)
 
                 elif paystack_transfer_status in ['failed', 'reversed']:
-                    payment.status = 'failed'
-                    payment.save()
+                    _apply_paystack_transfer_result(payment, transfer_data)
                     logger.error(f"Paystack transfer failed for {payment.employee.name} (Ref: {reference})")
                     return Response({'error': 'Paystack transfer failed', 'payment_failed': True}, status=status.HTTP_400_BAD_REQUEST) # Frontend will show error
 
                 else: # 'processing' or 'pending'
                     payment.status = 'processing'
-                    payment.save()
+                    payment.save(update_fields=['status', 'updated_at'])
                     logger.info(f"Paystack transfer initiated, status: {paystack_transfer_status} (Ref: {reference})")
                     # Frontend will poll verify_payment_status
                     return Response({'message': 'Payment initiated, awaiting Paystack confirmation', 'payment_processing': True})
@@ -1840,12 +1906,14 @@ class PaymentViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST
             )
 
-        # Find the payment record to get Paystack refs
+        # Find the payment record to get Paystack refs. Prefer the latest record,
+        # then sync in-flight transfers before generating the document.
         payment_record = Payment.objects.filter(
             employee=employee, 
-            payment_month=month, 
-            status='completed'
-        ).first()
+            payment_month=month,
+        ).order_by('-created_at').first()
+        if payment_record:
+            payment_record = _sync_payment_with_paystack(payment_record)
 
         month_deductions = Deduction.objects.filter(
             employee=employee, date__range=[start_date, end_date], status='applied'
@@ -1853,8 +1921,14 @@ class PaymentViewSet(viewsets.ModelViewSet):
         total_deductions = month_deductions.aggregate(Sum('amount'))['amount__sum'] or 0
         net_salary = employee.salary - total_deductions
 
-        trans_ref = payment_record.transaction_reference if payment_record else "PENDING"
-        paystack_ref = payment_record.paystack_reference if payment_record else "N/A"
+        trans_ref = payment_record.transaction_reference if payment_record else "Not generated"
+        paystack_ref = (
+            payment_record.paystack_reference
+            or payment_record.paystack_transfer_code
+            or "Awaiting Paystack confirmation"
+        ) if payment_record else "Not generated"
+        payment_status = payment_record.status.replace('_', ' ').title() if payment_record else 'Not Paid'
+        logo_url = request.build_absolute_uri(settings.STATIC_URL + 'no_bggg.png')
 
         month_payments = Payment.objects.filter(
             employee=employee,
@@ -1891,29 +1965,31 @@ class PaymentViewSet(viewsets.ModelViewSet):
             'transaction_reference': trans_ref,
             'paystack_reference': paystack_ref,
             'net_salary': float(net_salary),
-            'payment_status': 'Paid' if month_payments.exists() else 'Pending',
+            'payment_status': payment_status,
             'generated_at': timezone.now().isoformat()
         }
 
         payslip_html = f"""
-        <div class="payslip-container" style="font-family: Arial, sans-serif; max-width: 800px; margin: 0 auto; padding: 20px; border: 2px solid #333;">
+        <div class="payslip-container" style="font-family: Arial, sans-serif; max-width: 800px; margin: 0 auto; padding: 20px; border: 2px solid #333; position: relative; overflow: hidden; background: #fff;">
+            <img src="{escape(logo_url)}" alt="" style="position: absolute; top: 50%; left: 50%; width: 360px; max-width: 70%; transform: translate(-50%, -50%); opacity: 0.06; z-index: 0; pointer-events: none;">
+            <div style="position: relative; z-index: 1;">
             <div class="header" style="text-align: center; border-bottom: 2px solid #117e62; padding-bottom: 20px; margin-bottom: 30px;">
                 <h1 style="color: #117e62; margin: 0;">FOTASCO SECURITY SERVICES</h1>
                 <h2 style="margin: 10px 0;">PAYSLIP</h2>
                 <p style="margin: 5px 0;">Month: {month}</p>
                 <div style="font-size: 0.8em; color: #666; margin-top: 5px;">
-                    Ref: {trans_ref} | Paystack: {paystack_ref}
+                    Ref: {escape(trans_ref)} | Paystack: {escape(paystack_ref)} | Status: {escape(payment_status)}
                 </div>
             </div>
             <div class="employee-info" style="margin-bottom: 30px;">
                 <h3 style="color: #117e62; border-bottom: 1px solid #ccc;">Employee Information</h3>
                 <table style="width: 100%;">
-                    <tr><td><strong>Name:</strong></td><td>{employee.name}</td></tr>
-                    <tr><td><strong>Employee ID:</strong></td><td>{employee.employee_id}</td></tr>
-                    <tr><td><strong>Type:</strong></td><td>{employee.type.title()}</td></tr>
-                    <tr><td><strong>Location:</strong></td><td>{employee.location}</td></tr>
-                    <tr><td><strong>Bank:</strong></td><td>{employee.bank_name}</td></tr>
-                    <tr><td><strong>Account:</strong></td><td>{employee.account_number}</td></tr>
+                    <tr><td><strong>Name:</strong></td><td>{escape(employee.name)}</td></tr>
+                    <tr><td><strong>Employee ID:</strong></td><td>{escape(employee.employee_id)}</td></tr>
+                    <tr><td><strong>Type:</strong></td><td>{escape(employee.type.title())}</td></tr>
+                    <tr><td><strong>Location:</strong></td><td>{escape(employee.location)}</td></tr>
+                    <tr><td><strong>Bank:</strong></td><td>{escape(employee.bank_name)}</td></tr>
+                    <tr><td><strong>Account:</strong></td><td>{escape(employee.account_number)}</td></tr>
                 </table>
             </div>
             <div class="earnings" style="margin-bottom: 30px;">
@@ -1933,6 +2009,7 @@ class PaymentViewSet(viewsets.ModelViewSet):
             <div class="footer" style="margin-top: 50px; text-align: center; font-size: 0.9em; color: #666;">
                 <p>Generated on {timezone.now().strftime('%Y-%m-%d %H:%M')}</p>
                 <p>This is a computer-generated document and does not require signature.</p>
+            </div>
             </div>
         </div>
         """
@@ -1989,7 +2066,9 @@ class PaymentViewSet(viewsets.ModelViewSet):
             month = export_token.filters.get('month')
             employee = Employee.objects.get(id=employee_id)
             
-            payment_record = Payment.objects.filter(employee=employee, payment_month=month, status='completed').first()
+            payment_record = Payment.objects.filter(employee=employee, payment_month=month).order_by('-created_at').first()
+            if payment_record:
+                payment_record = _sync_payment_with_paystack(payment_record)
 
             # Calculate financial data again on the backend for security
             year, month_num = map(int, month.split('-'))
@@ -2010,8 +2089,14 @@ class PaymentViewSet(viewsets.ModelViewSet):
             elements.append(Paragraph("FOTASCO SECURITY SERVICES", styles['Title']))
             elements.append(Paragraph(f"PAYSLIP - {month}", styles['Heading2']))
             if payment_record:
+                paystack_ref = (
+                    payment_record.paystack_reference
+                    or payment_record.paystack_transfer_code
+                    or 'Awaiting Paystack confirmation'
+                )
                 elements.append(Paragraph(f"Trans ID: {payment_record.transaction_reference}", styles['Normal']))
-                elements.append(Paragraph(f"Paystack Ref: {payment_record.paystack_reference}", styles['Normal']))
+                elements.append(Paragraph(f"Paystack Ref: {paystack_ref}", styles['Normal']))
+                elements.append(Paragraph(f"Payment Status: {payment_record.status.replace('_', ' ').title()}", styles['Normal']))
             elements.append(Spacer(1, 12))
 
             # Employee Info Table

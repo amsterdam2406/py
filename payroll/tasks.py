@@ -44,8 +44,14 @@ def verify_processing_payments():
                     payment = Payment.objects.select_for_update().get(pk=payment.pk)
                     if payment.status == 'processing':
                         payment.status = 'completed'
-                        payment.paystack_reference = str(transfer_data.get('id', ''))
-                        payment.save(update_fields=['status', 'paystack_reference', 'updated_at'])
+                        payment.paystack_reference = str(
+                            transfer_data.get('id') or
+                            transfer_data.get('transfer_code') or
+                            transfer_data.get('reference') or
+                            ''
+                        )
+                        payment.paystack_transfer_code = str(transfer_data.get('transfer_code') or payment.paystack_transfer_code or '')
+                        payment.save(update_fields=['status', 'paystack_reference', 'paystack_transfer_code', 'updated_at'])
                         count += 1
                         
             elif transfer_status in ['failed', 'reversed']:
@@ -53,7 +59,15 @@ def verify_processing_payments():
                     payment = Payment.objects.select_for_update().get(pk=payment.pk)
                     if payment.status == 'processing':
                         payment.status = 'failed'
-                        payment.save(update_fields=['status', 'updated_at'])
+                        payment.paystack_reference = str(
+                            transfer_data.get('id') or
+                            transfer_data.get('transfer_code') or
+                            transfer_data.get('reference') or
+                            payment.paystack_reference or
+                            ''
+                        )
+                        payment.paystack_transfer_code = str(transfer_data.get('transfer_code') or payment.paystack_transfer_code or '')
+                        payment.save(update_fields=['status', 'paystack_reference', 'paystack_transfer_code', 'updated_at'])
                         count += 1
 
         except Exception as e:

@@ -5,6 +5,26 @@ from django.core.cache import cache
 
 logger = logging.getLogger(__name__)
 
+def _paystack_error_response(exc, fallback_status='failed'):
+    error_payload = None
+    response = getattr(exc, 'response', None)
+    if response is not None:
+        try:
+            error_payload = response.json()
+        except ValueError:
+            error_payload = {'raw': response.text}
+
+    message = (
+        error_payload.get('message')
+        if isinstance(error_payload, dict) and error_payload.get('message')
+        else str(exc)
+    )
+    return {
+        'status': False,
+        'message': message,
+        'data': error_payload if error_payload is not None else {'status': fallback_status},
+    }
+
 class PaystackAPI:
     """Paystack Payment Gateway Integration"""
     
@@ -95,10 +115,12 @@ class PaystackAPI:
             response.raise_for_status()
             data = response.json()
             if data.get("status"):
-                return {"status": True, "recipient_code": data["data"]["recipient_code"]}
+                recipient_code = data.get("data", {}).get("recipient_code")
+                return {"status": True, "recipient_code": recipient_code, "data": data.get("data", {})}
             return {"status": False, "message": data.get("message")}
         except requests.exceptions.RequestException as e:
-            return {"status": False, "message": str(e)}
+            logger.error(f"Paystack create recipient error: {e}")
+            return _paystack_error_response(e)
         except Exception as e:
             logger.error(f"Paystack create recipient error: {e}")
             return {"status": False, "message": str(e)}
@@ -141,8 +163,8 @@ class PaystackAPI:
                 if e.response is not None:
                     retry_after = e.response.headers.get('Retry-After')
                 logger.warning(
-                    "Paystack verify account rate limited for bank_code=%s account_number=%s retry_after=%s",
-                    bank_code, account_number, retry_after
+                    "Paystack verify account rate limited for bank_code=%s account_last4=%s retry_after=%s",
+                    bank_code, str(account_number)[-4:], retry_after
                 )
                 return {
                     'status': False,
@@ -198,8 +220,9 @@ class PaystackAPI:
             response.raise_for_status()
             return response.json()
         except requests.exceptions.RequestException as e:
-            logger.error(f"Paystack initiate transfer error: {e}")
-            return {'status': False, 'message': str(e), 'data': None}
+            result = _paystack_error_response(e)
+            logger.error(f"Paystack initiate transfer error: {result.get('message')} data={result.get('data')}")
+            return result
         except Exception as e:
             logger.error(f"Paystack initiate transfer unexpected error: {e}")
             return {'status': False, 'message': str(e), 'data': None}
@@ -213,19 +236,9 @@ class PaystackAPI:
             response.raise_for_status()
             return response.json()
         except requests.exceptions.RequestException as e:
-            error_payload = None
-            if getattr(e, 'response', None) is not None:
-                try:
-                    error_payload = e.response.json()
-                except ValueError:
-                    error_payload = {'raw': e.response.text}
-            message = (
-                error_payload.get('message')
-                if isinstance(error_payload, dict) and error_payload.get('message')
-                else str(e)
-            )
-            logger.error(f"Paystack bulk transfer error: {message} payload={error_payload}")
-            return {'status': False, 'message': message, 'data': error_payload}
+            result = _paystack_error_response(e)
+            logger.error(f"Paystack bulk transfer error: {result.get('message')} payload={result.get('data')}")
+            return result
         except Exception as e:
             logger.error(f"Paystack bulk transfer unexpected error: {e}")
             return {'status': False, 'message': str(e), 'data': None}
@@ -238,8 +251,9 @@ class PaystackAPI:
             response.raise_for_status()
             return response.json()
         except requests.exceptions.RequestException as e:
-            logger.error(f"Paystack verify transfer error: {e}")
-            return {'status': False, 'message': str(e), 'data': {'status': 'failed'}}
+            result = _paystack_error_response(e)
+            logger.error(f"Paystack verify transfer error: {result.get('message')} data={result.get('data')}")
+            return result
         except Exception as e:
             logger.error(f"Paystack verify transfer unexpected error: {e}")
             return {'status': False, 'message': str(e), 'data': {'status': 'failed'}}

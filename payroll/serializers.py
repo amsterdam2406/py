@@ -140,12 +140,15 @@ class EmployeeSerializer(serializers.ModelSerializer):
         if value < 0:
             raise serializers.ValidationError("Salary cannot be negative")
         return value
-    
+
+    def validate_account_number(self, value):
+        if not value:
+            return value
         if not value.isdigit():
             raise serializers.ValidationError("Account number must contain only digits")
         
         # Check for duplicates excluding current instance (for updates)
-        queryset = Employee.objects.filter(account_number=value, status__in=['active', 'terminated'])
+        queryset = Employee.objects.filter(account_number=value, status__in=['active', 'pending'])
         if self.instance:
             queryset = queryset.exclude(pk=self.instance.pk)
         if queryset.exists():
@@ -167,16 +170,20 @@ class EmployeeSerializer(serializers.ModelSerializer):
     def validate(self, attrs):
         bank_fields = ['bank_name', 'bank_code', 'account_number', 'account_holder']
         if any(attrs.get(field) for field in bank_fields):
-            missing = [field for field in bank_fields if not attrs.get(field)]
+            bank_values = {
+                field: attrs.get(field) or (getattr(self.instance, field, None) if self.instance else None)
+                for field in bank_fields
+            }
+            missing = [field for field in bank_fields if not bank_values.get(field)]
             if missing:
                 raise serializers.ValidationError({
                     field: 'This field is required for bank verification.' for field in missing
                 })
             attrs['account_holder'] = _verify_employee_bank_account(
                 attrs.get('name') or (self.instance.name if self.instance else ''),
-                attrs.get('account_number'),
-                attrs.get('bank_code'),
-                attrs.get('account_holder')
+                bank_values.get('account_number'),
+                bank_values.get('bank_code'),
+                bank_values.get('account_holder')
             )
         return attrs
 

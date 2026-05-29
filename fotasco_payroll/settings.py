@@ -401,7 +401,7 @@ LOGGING = {
         'payroll': {
             'handlers': ['console', 'file'],
             'level': 'INFO',
-            'propagate': True,
+            'propagate': False,
         },
         'payroll.webhook': {
             'handlers': ['console', 'file'],
