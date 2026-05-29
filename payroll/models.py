@@ -452,20 +452,11 @@ class Employee(TimeStampedModel, SoftDeleteModel):
     def clean(self):
         """Validate employee data before saving."""
         super().clean()
-        if self.type == EmployeeType.EMPLOYEE and not self.employee_id:
-            raise ValidationError(
-                {"employee_id": _("Employee ID is required for type 'employee'.")}
-            )
-        if not self.pk and self.type in [EmployeeType.STAFF, EmployeeType.GUARD] and self.employee_id:
-            raise ValidationError(
-                {"employee_id": _("Employee ID is auto-generated for staff and guard.")}
-            )
 
     def generate_employee_id(self):
         """Generate unique employee ID using locked sequence counter.
         
-        Staff & Guard: Auto-generated with format FSS-001-STAFF, FSS-001-GRD
-        Employee: Must be manually input (no auto-generation)
+        Staff, guard, and employee IDs are auto-generated with type suffixes.
         """
         with transaction.atomic():
             seq, _ = EmployeeSequence.objects.select_for_update().get_or_create(
@@ -483,9 +474,6 @@ class Employee(TimeStampedModel, SoftDeleteModel):
 
             employee_id = f"FSS-{str(seq.last_value).zfill(3)}-{suffix}"
 
-            # Final collision check (should never happen with sequences)
-            if self.type == EmployeeType.EMPLOYEE:
-                raise ValueError(_("Employee type should not auto-generate employee_id."))
             if Employee.all_objects.filter(employee_id=employee_id).exists():
                 raise IntegrityError(
                     f"Employee ID collision: {employee_id}. Sequence may be corrupted."
@@ -495,9 +483,9 @@ class Employee(TimeStampedModel, SoftDeleteModel):
             return employee_id
 
     def save(self, *args, **kwargs):
-        self.full_clean()
-        if not self.employee_id and self.type in (EmployeeType.STAFF, EmployeeType.GUARD):
+        if not self.employee_id and self.type in (EmployeeType.STAFF, EmployeeType.GUARD, EmployeeType.EMPLOYEE):
             self.employee_id = self.generate_employee_id()
+        self.full_clean()
         super().save(*args, **kwargs)
 
 

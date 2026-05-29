@@ -124,6 +124,15 @@ function formatCurrency(amount, currency = "₦") {
   return `${currency}${num.toLocaleString("en-NG")}`;
 }
 
+function formatEmployeeType(type) {
+  const labels = {
+    staff: "Staff",
+    guard: "Guard",
+    employee: "Employee",
+  };
+  return labels[type] || "Employee";
+}
+
 function formatDate(dateString) {
   if (!dateString) return "-";
   try {
@@ -694,7 +703,6 @@ async function verifyBankAccountFields({
   const selectedOption = bankSelect?.options[bankSelect.selectedIndex];
   const bankCode = selectedOption?.dataset?.code;
   const verificationKey = `${bankCode || ""}:${accountNumber || ""}`;
-  const MAX_RETRIES = 3;
 
   if (!accountNumber || !/^\d{10}$/.test(accountNumber)) {
     if (manual) showToast("Enter valid 10-digit account number", "error");
@@ -725,8 +733,7 @@ async function verifyBankAccountFields({
   }
 
   AppState.pendingAccountVerificationKey = verificationKey;
-  holderInput.value =
-    attempt > 1 ? `Retrying (${attempt}/${MAX_RETRIES})...` : "Verifying...";
+  holderInput.value = "Verifying...";
   holderInput.disabled = true;
   holderInput.readOnly = true;
   holderInput.style.background = "#f8f9fa";
@@ -743,39 +750,19 @@ async function verifyBankAccountFields({
       body: { account_number: accountNumber, bank_code: bankCode },
     });
 
-    // Handle Rate Limiting (429) with Server-Aware Exponential Backoff
-    if (res.status === 429 && attempt < MAX_RETRIES) {
-      // Use server provided retry_after or default to 5 seconds if missing
-      const serverRetryAfter = (parseInt(res.data?.retry_after) || 5) * 1000;
-
-      // Exponential Backoff: 2s, 4s, 8s... plus a small random jitter
-      // Client Backoff: 2s, 4s, 8s... plus a small random jitter
-      const clientBackoff = Math.pow(2, attempt) * 1000 + Math.random() * 500;
-
-      // Respect the server's cooling period, but don't wait less than our backoff
-      const backoffDelay = Math.max(serverRetryAfter, clientBackoff);
-      const seconds = (backoffDelay / 1000).toFixed(1);
-
+    if (res.status === 429) {
+      const retryAfter = parseInt(res.data?.retry_after, 10) || 300;
+      const minutes = Math.max(1, Math.ceil(retryAfter / 60));
+      holderInput.value = "";
+      holderInput.style.background = "#f8d7da";
+      AppState.lastVerifiedAccountKey = null;
       setAccountVerificationStatus(
         statusEl,
-        `Rate limited. Retrying in ${seconds}s...`,
+        `Paystack is rate limited. Try again in about ${minutes} minute${minutes === 1 ? "" : "s"}.`,
         "text-warning",
       );
-
-      return new Promise((resolve) => {
-        setTimeout(() => {
-          resolve(
-            verifyBankAccountFields({
-              accountInput,
-              bankSelect,
-              holderInput,
-              statusEl,
-              manual,
-              attempt: attempt + 1,
-            }),
-          );
-        }, backoffDelay);
-      });
+      if (manual) showToast("Paystack verification is cooling down. Try again later.", "warning");
+      return false;
     }
 
     if (
@@ -3354,7 +3341,7 @@ function updateRecentActivity(recentEmployees = [], recentPayments = []) {
 
   recentEmployees.forEach((e) => {
     activities.push({
-      text: `${e.type === "staff" ? "Staff" : "Guard"} added: ${e.name}`,
+      text: `${formatEmployeeType(e.type)} added: ${e.name}`,
       date: formatDate(e.created_at),
       type: "success",
     });

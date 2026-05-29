@@ -207,10 +207,11 @@ class EmployeeSerializer(serializers.ModelSerializer):
             username = f"{username_base}{counter}"
 
         with transaction.atomic():
+            employee_type = validated_data.get('type') or 'staff'
             user = User(
                 username=username,
                 email=validated_data.get('email') or '',
-                role=validated_data.get('type') or 'staff',
+                role=employee_type if employee_type in ['staff', 'guard'] else 'staff',
                 phone=validated_data.get('phone') or '',
             )
             user.set_unusable_password()

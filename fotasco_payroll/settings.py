@@ -246,7 +246,7 @@ REST_FRAMEWORK = {
         'verify_password': '5/min',
         'otp': '10/hour',
         'export': '10/hour',
-        'bank_verify': '60/min',
+        'bank_verify': '6/min',
     },
     'DEFAULT_PAGINATION_CLASS': 'rest_framework.pagination.PageNumberPagination',
     'PAGE_SIZE': 20,
@@ -381,7 +381,7 @@ LOGGING = {
         'django': {
             'handlers': ['console', 'file'],
             'level': 'INFO',
-            'propagate': True,
+            'propagate': False,
         },
         'django.utils.autoreload': {
             'handlers': ['console'],

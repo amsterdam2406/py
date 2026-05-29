@@ -146,6 +146,11 @@ class PaystackAPI:
         """Verify bank account number"""
         url = f"{self.BASE_URL}/bank/resolve?account_number={account_number}&bank_code={bank_code}"
         cache_key = f"paystack:resolve:{bank_code}:{account_number}"
+        rate_limit_key = f"paystack:resolve:rate_limited:{bank_code}:{account_number}"
+        global_rate_limit_key = "paystack:resolve:rate_limited:global"
+        cached_rate_limit = cache.get(rate_limit_key) or cache.get(global_rate_limit_key)
+        if cached_rate_limit:
+            return cached_rate_limit
         cached = cache.get(cache_key)
         if cached:
             return cached
@@ -166,13 +171,20 @@ class PaystackAPI:
                     "Paystack verify account rate limited for bank_code=%s account_last4=%s retry_after=%s",
                     bank_code, str(account_number)[-4:], retry_after
                 )
-                return {
+                rate_limited_result = {
                     'status': False,
                     'message': 'Account verification temporarily rate limited. Please wait and try again.',
                     'error_code': 'rate_limited',
-                    'retry_after': retry_after,
+                    'retry_after': retry_after or 300,
                     'data': None,
                 }
+                try:
+                    cooldown = int(retry_after or 300)
+                except (TypeError, ValueError):
+                    cooldown = 300
+                cache.set(rate_limit_key, rate_limited_result, cooldown)
+                cache.set(global_rate_limit_key, rate_limited_result, min(cooldown, 60))
+                return rate_limited_result
             # Handle other HTTP errors (400, 422, etc.)
             return {
                 'status': False,

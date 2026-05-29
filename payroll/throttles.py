@@ -13,7 +13,7 @@ class LoginThrottle(AnonRateThrottle):
 class BankVerifyThrottle(UserRateThrottle):
     """Throttle bank account verification lookups."""
     scope = 'bank_verify'
-    rate = '30/min'
+    rate = '6/min'
 
 
 # ---------------------------------------------------------------------------

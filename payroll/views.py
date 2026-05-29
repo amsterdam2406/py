@@ -660,7 +660,7 @@ class EmployeeViewSet(viewsets.ModelViewSet):
         return Employee.objects.filter(user=user).order_by('-created_at')
 
     def create(self, request, *args, **kwargs):
-        print("Employee create payload:", request.data)
+        logger.info("Employee create requested by user_id=%s", getattr(request.user, "id", None))
         return super().create(request, *args, **kwargs)
 
     def get_throttles(self):
