@@ -45,7 +45,68 @@
   window.showSelfSignupModal = showSelfSignupModal;
   window.closeSelfSignupModal = closeSelfSignupModal;
 
+  async function submitSelfSignup() {
+    const form = document.getElementById('selfSignupForm');
+    if (!form) return;
+
+    form.addEventListener('submit', async (e) => {
+      e.preventDefault();
+
+      const getVal = (id) => (document.getElementById(id)?.value || '').trim();
+
+      const payload = {
+        username: getVal('signupUsername'),
+        password: getVal('signupPassword'),
+        full_name: getVal('signupFullName'),
+        role: getVal('signupRole'),
+        email: getVal('signupEmail'),
+        location: getVal('signupLocation'),
+        salary: Number(getVal('signupSalary') || '0'),
+        phone: getVal('signupPhone'),
+
+        bank_name: getVal('signupBankName'),
+        bank_code: getVal('signupBankCode'),
+        account_number: getVal('signupAccountNumber'),
+        account_holder: getVal('signupAccountHolder')
+      };
+
+      // Basic client-side validation for missing fields
+      const requiredBank = ['bank_name', 'bank_code', 'account_number', 'account_holder'];
+      const missingBank = requiredBank.filter((k) => !payload[k]);
+      if (missingBank.length) {
+        alert(`Missing required bank/account fields: ${missingBank.join(', ')}`);
+        return;
+      }
+
+      try {
+        const res = await fetch('/self-register/', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify(payload)
+        });
+
+        const data = await res.json().catch(() => ({}));
+
+        if (!res.ok) {
+          alert(data?.error || 'Self-registration failed. Please try again.');
+          return;
+        }
+
+        alert(data?.message || 'Account created! Your registration is pending admin approval.');
+        closeSelfSignupModal();
+        // Reset form to avoid resubmission with old bank values
+        form.reset();
+      } catch (err) {
+        console.error(err);
+        alert('Self-registration failed due to a network/server error.');
+      }
+    });
+  }
+
   document.addEventListener('DOMContentLoaded', () => {
     initSelfSignupModal();
+    submitSelfSignup();
   });
 })();

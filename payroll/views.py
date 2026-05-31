@@ -156,51 +156,65 @@ def paystack_banks(request):
     return Response(result)
 
 
-@api_view(['POST'])
-@permission_classes([AllowAny])
-@throttle_classes([BankVerifyThrottle])
-def paystack_verify_account(request):
-    """Verify bank account number"""
-    account_number = request.data.get('account_number')
-    bank_code = request.data.get('bank_code')
+class PaystackVerifyAccountView(APIView):
+    permission_classes = [AllowAny]
+    # Throttle this endpoint to avoid bursts hammering Paystack (429s).
+    throttle_classes = [BankVerifyThrottle]
 
-    if not account_number or not bank_code:
-        return Response(
-            {'error': 'account_number and bank_code required'},
-            status=status.HTTP_400_BAD_REQUEST
-        )
 
-    # Check for existing active employees to avePaystack API calls and prevent duplicates
-    duplicate = Employee.objects.filter(
-        account_number=account_number,
-        status__in=['active', 'pending']
-    ).first()
 
-    if duplicate:
-        return Response({
-            'status': True,
-            'message': 'Account already verified and registered in system',
-            'data': {
-                'account_name': duplicate.account_holder,
-                'account_number': duplicate.account_number,
-                'bank_name': duplicate.bank_name
-            }
-        }, status=status.HTTP_200_OK)
+    def post(self, request):
+        """Verify bank account number"""
+        account_number = request.data.get('account_number')
+        bank_code = request.data.get('bank_code')
 
-    paystack = PaystackAPI()
-    result = paystack.verify_account(account_number, bank_code)
+        if not account_number or not bank_code:
+            return Response(
+                {'error': 'account_number and bank_code required'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
 
-    if result.get('error_code') == 'rate_limited':
-        retry_after = result.get('retry_after')
-        message = result.get('message', 'Account verification temporarily rate limited.')
-        if retry_after:
-            message = f"{message} Retry after {retry_after} seconds."
-        return Response(
-            {'detail': message, 'retry_after': retry_after},
-            status=status.HTTP_429_TOO_MANY_REQUESTS
-        )
+        # Check for existing active employees to avePaystack API calls and prevent duplicates
+        duplicate = Employee.objects.filter(
+            account_number=account_number,
+            status__in=['active', 'pending']
+        ).first()
 
-    return Response(result)
+        if duplicate:
+            return Response({
+                'status': True,
+                'message': 'Account already verified and registered in system',
+                'data': {
+                    'account_name': duplicate.account_holder,
+                    'account_number': duplicate.account_number,
+                    'bank_name': duplicate.bank_name
+                }
+            }, status=status.HTTP_200_OK)
+
+        paystack = PaystackAPI()
+        result = paystack.verify_account(account_number, bank_code)
+
+        if result.get('error_code') == 'rate_limited':
+            retry_after = result.get('retry_after')
+            message = "Verification service is temporarily unavailable. Please try again in 5 minutes."
+            if retry_after:
+                message = f"{message} Retry after {retry_after} seconds."
+            # Keep backward compatibility: include `detail` and `retry_after` keys
+            # but also add stable `message` key for frontend usage.
+            return Response(
+                {
+                    'success': False,
+                    'message': message,
+                    'detail': message,
+                    'retry_after': retry_after,
+                },
+                status=status.HTTP_429_TOO_MANY_REQUESTS
+            )
+
+
+
+        return Response(result)
+
 
 
 @api_view(['POST'])

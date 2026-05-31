@@ -11,9 +11,14 @@ class LoginThrottle(AnonRateThrottle):
     rate = '5/min'
 
 class BankVerifyThrottle(UserRateThrottle):
-    """Throttle bank account verification lookups."""
+    """Throttle bank account verification lookups.
+
+    NOTE: This rate must remain permissive enough for normal UX retries,
+    otherwise users hit Paystack (and backend) rate limits quickly.
+    """
     scope = 'bank_verify'
-    rate = '6/min'
+    # Increased to reduce “slow down” experiences during normal usage.
+    rate = '60/min'
 
 
 # ---------------------------------------------------------------------------

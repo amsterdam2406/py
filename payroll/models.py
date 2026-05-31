@@ -342,9 +342,33 @@ class User(AbstractUser):
 # ==================== EMPLOYEE SEQUENCE COUNTER ====================
 
 class EmployeeSequence(models.Model):
-    """Thread-safe sequence counter for employee ID generation."""
+    """Thread-safe sequence counter for employee ID generation.
+
+    Backward-compatible behavior:
+    - If legacy DB data exists using type='global', we continue to use it.
+    - Otherwise we create/maintain independent counters per employee type.
+
+    This prevents numbering overlaps between STAFF/GRD/EMP.
+    """
     type = models.CharField(max_length=10, choices=EmployeeType.choices)
+
     last_value = models.PositiveIntegerField(default=0)
+
+    @classmethod
+    def global_sequence_key(cls):
+        # Legacy key used by prior implementation.
+        return 'global'
+
+    @classmethod
+    def sequence_key_for_type(cls, employee_type: str) -> str:
+        # Map employee type values to sequence keys.
+        if employee_type == EmployeeType.STAFF:
+            return EmployeeType.STAFF
+        if employee_type == EmployeeType.GUARD:
+            return EmployeeType.GUARD
+        if employee_type == EmployeeType.EMPLOYEE:
+            return EmployeeType.EMPLOYEE
+        return EmployeeType.EMPLOYEE
 
     class Meta:
         db_table = 'employee_sequences'
@@ -454,33 +478,104 @@ class Employee(TimeStampedModel, SoftDeleteModel):
         super().clean()
 
     def generate_employee_id(self):
-        """Generate unique employee ID using locked sequence counter.
-        
-        Staff, guard, and employee IDs are auto-generated with type suffixes.
+        """Generate unique employee ID.
+
+        Uses a locked per-type sequence counter. If a collision is detected, the
+        sequence is considered out-of-sync and is *self-healed* by syncing to the
+        current max value already stored in the DB for this employee type.
         """
+        suffix = {
+            EmployeeType.STAFF: 'STAFF',
+            EmployeeType.GUARD: 'GRD',
+            EmployeeType.EMPLOYEE: 'EMP'
+        }.get(self.type, 'EMP')
+
+        def _extract_last_value(emp_id: str):
+            # Expected format: FSS-###-SUFFIX
+            try:
+                parts = (emp_id or '').split('-')
+                if len(parts) != 3:
+                    return None
+                if parts[0] != 'FSS':
+                    return None
+                return int(parts[1])
+            except (TypeError, ValueError):
+                return None
+
+        # Use independent per-employee-type counters.
+        # STAFF: staff
+        # GRD: guard
+        # EMPLOYEE: employee
+        #
+        # Backward compatibility:
+        # - If legacy data exists using type='global', we self-heal per-type sequences
+        #   by syncing them to the max numeric portion already present for that suffix.
+
+        sequence_type_key = {
+            EmployeeType.STAFF: EmployeeType.STAFF,
+            EmployeeType.GUARD: EmployeeType.GUARD,
+            EmployeeType.EMPLOYEE: EmployeeType.EMPLOYEE,
+        }.get(self.type, EmployeeType.EMPLOYEE)
+
+        legacy_global_key = EmployeeSequence.global_sequence_key()
+
         with transaction.atomic():
-            seq, _ = EmployeeSequence.objects.select_for_update().get_or_create(
-                type=self.type,
-                defaults={'last_value': 0}
-            )
-            seq.last_value += 1
-            seq.save(update_fields=['last_value'])
-
-            suffix = {
-                EmployeeType.STAFF: 'STAFF',
-                EmployeeType.GUARD: 'GRD',
-                EmployeeType.EMPLOYEE: 'EMP'
-            }.get(self.type, 'EMP')
-
-            employee_id = f"FSS-{str(seq.last_value).zfill(3)}-{suffix}"
-
-            if Employee.all_objects.filter(employee_id=employee_id).exists():
-                raise IntegrityError(
-                    f"Employee ID collision: {employee_id}. Sequence may be corrupted."
+            # Bounded retry to avoid infinite loops.
+            for _attempt in range(2):
+                # Create the per-type sequence row if missing.
+                seq, _ = EmployeeSequence.objects.select_for_update().get_or_create(
+                    type=sequence_type_key,
+                    defaults={'last_value': 0}
                 )
 
-            self.id_sequence = seq.last_value
-            return employee_id
+                # Self-heal: sync this *type* sequence to the max numeric portion
+                # for IDs that already exist for the same suffix.
+                existing_ids = Employee.all_objects.values_list('employee_id', flat=True)
+                max_existing_for_suffix = None
+                for eid in existing_ids:
+                    if not eid:
+                        continue
+                    if not eid.endswith(f"-{suffix}"):
+                        continue
+                    lv = _extract_last_value(eid)
+                    if lv is None:
+                        continue
+                    max_existing_for_suffix = (
+                        lv if max_existing_for_suffix is None else max(max_existing_for_suffix, lv)
+                    )
+
+                if max_existing_for_suffix is not None and seq.last_value < max_existing_for_suffix:
+                    seq.last_value = max_existing_for_suffix
+                    seq.save(update_fields=['last_value'])
+                else:
+                    # Additional backward-compatibility: if no per-type max exists yet but
+                    # the legacy global counter is ahead, move this type forward.
+                    try:
+                        legacy_seq = EmployeeSequence.objects.select_for_update().get(type=legacy_global_key)
+                    except EmployeeSequence.DoesNotExist:
+                        legacy_seq = None
+
+                    if legacy_seq is not None and seq.last_value < legacy_seq.last_value:
+                        seq.last_value = legacy_seq.last_value
+                        seq.save(update_fields=['last_value'])
+
+                seq.last_value += 1
+                seq.save(update_fields=['last_value'])
+
+                employee_id = f"FSS-{str(seq.last_value).zfill(3)}-{suffix}"
+
+                if not Employee.all_objects.filter(employee_id=employee_id).exists():
+                    self.id_sequence = seq.last_value
+                    return employee_id
+
+                # Collision still occurred: resync from DB max for this suffix and retry.
+                continue
+
+            raise IntegrityError(
+                f"Employee ID collision could not be resolved after retries for suffix={suffix}."
+            )
+
+
 
     def save(self, *args, **kwargs):
         if not self.employee_id and self.type in (EmployeeType.STAFF, EmployeeType.GUARD, EmployeeType.EMPLOYEE):
@@ -849,11 +944,13 @@ class Payment(TimeStampedModel):
     def clean(self):
         """Validate payment data."""
         super().clean()
-                # Validate net_amount is set and non-negative
+
+        # Validate net_amount is set and non-negative
         if self.net_amount is None:
             raise ValidationError({"net_amount": _("Net amount is required.")})
-        if self.net_amount is not None and self.net_amount< 0:
+        if self.net_amount is not None and self.net_amount < 0:
             raise ValidationError({"net_amount": _("Net amount cannot be negative.")})
+
 
     def save(self, *args, **kwargs):
         # Auto-calculate net_amount only on initial creation if not provided
@@ -1135,6 +1232,125 @@ class Notification(TimeStampedModel):
 
 
 # ==================== EMPLOYEE REQUEST ====================
+
+class EmployeeRegistrationRequest(TimeStampedModel):
+    """HR-reviewed self-registration request for creating/activating employees."""
+
+    STATUS_PENDING = ApprovalStatus.PENDING
+    STATUS_APPROVED = ApprovalStatus.APPROVED
+    STATUS_DECLINED = ApprovalStatus.DECLINED
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+
+    # Link to the created but inactive user (self signup creates user immediately)
+    user = models.OneToOneField(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name='registration_request'
+    )
+
+    # Snapshot of employee data (self signup creates Employee row as well)
+    employee = models.OneToOneField(
+        'Employee',
+        on_delete=models.CASCADE,
+        related_name='registration_request'
+    )
+
+    employee_name = models.CharField(max_length=200)
+    employee_type = models.CharField(max_length=10, choices=EmployeeType.choices)
+    location = models.CharField(max_length=200)
+
+    salary = models.DecimalField(max_digits=10, decimal_places=2, validators=[MinValueValidator(0)])
+    phone = models.CharField(max_length=15, blank=True, default='')
+    email = models.EmailField(blank=True, null=True)
+
+    bank_name = models.CharField(max_length=100)
+    bank_code = models.CharField(max_length=20, blank=True, null=True)
+    account_number = models.CharField(max_length=10)
+    account_holder = models.CharField(max_length=200)
+
+    is_self_registered = models.BooleanField(default=True)
+
+    status = models.CharField(
+        max_length=10,
+        choices=ApprovalStatus.choices,
+        default=ApprovalStatus.PENDING,
+        db_index=True
+    )
+    decline_reason = models.TextField(blank=True, null=True)
+    action_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='handled_registration_requests'
+    )
+
+    history = HistoricalRecords(excluded_fields=['updated_at'])
+
+    objects = models.Manager()
+
+    class Meta:
+        db_table = 'employee_registration_requests'
+        ordering = ['-created_at']
+        verbose_name = _('Employee Registration Request')
+        verbose_name_plural = _('Employee Registration Requests')
+
+        indexes = [
+            models.Index(fields=['status'], name='regreq_status_idx'),
+            models.Index(fields=['account_number', 'bank_code'], name='regreq_account_idx'),
+        ]
+
+    def __str__(self):
+        return f"{self.employee_name} ({self.status})"
+
+    @transaction.atomic
+    def approve(self, approved_by):
+        if self.status != ApprovalStatus.PENDING:
+            raise ValueError(_(f"Cannot approve request with status: {self.status}"))
+
+        # Activate user + employee
+        self.user.is_active = True
+        self.user.save(update_fields=['is_active'])
+
+        self.employee.status = EmployeeStatus.ACTIVE
+        self.employee.is_self_registered = True
+        self.employee.save(update_fields=['status', 'is_self_registered'])
+
+        self.status = ApprovalStatus.APPROVED
+        self.action_by = approved_by
+        self.decline_reason = None
+        self.save(update_fields=['status', 'action_by', 'decline_reason', 'updated_at'])
+
+        Notification.objects.create(
+            user=self.user,
+            message=f"Welcome! Your registration has been approved (ID: {self.employee.employee_id}).",
+            type='success'
+        )
+
+    @transaction.atomic
+    def decline(self, declined_by, reason=''):
+        if self.status != ApprovalStatus.PENDING:
+            raise ValueError(_(f"Cannot decline request with status: {self.status}"))
+
+        self.user.is_active = False
+        self.user.save(update_fields=['is_active'])
+
+        # Mark employee as inactive/terminated for consistency
+        self.employee.status = EmployeeStatus.INACTIVE
+        self.employee.save(update_fields=['status'])
+
+        self.status = ApprovalStatus.DECLINED
+        self.action_by = declined_by
+        self.decline_reason = reason or ''
+        self.save(update_fields=['status', 'action_by', 'decline_reason', 'updated_at'])
+
+        Notification.objects.create(
+            user=self.user,
+            message=f"Your registration was declined. {('Reason: ' + self.decline_reason) if self.decline_reason else ''}",
+            type='error'
+        )
+
 
 class EmployeeRequest(TimeStampedModel):
     """Model for employee requests - loans, advances, expenses."""

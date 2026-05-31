@@ -1137,10 +1137,14 @@
         <div id="selfSignupModal" class="modal" style="display: none;">
             <div class="modal-content">
                 <div class="modal-header">
-                    <h3>Employee Self Signup</h3>
+                <h3>Employee Self Signup</h3>
                     <span class="close" onclick="closeSelfSignupModal()">&times;</span>
                 </div>
                 <form id="selfSignupForm">
+                    <div class="form-group">
+                        <label>Phone (Optional)</label>
+                        <input type="text" id="signupPhone" class="form-control" placeholder="e.g., +2348012345678">
+                    </div>
                     <div class="form-group">
                         <label>Full Name</label>
                         <input type="text" id="signupFullName" class="form-control" required>
@@ -1168,6 +1172,26 @@
                         <label>Preferred Location</label>
                         <input type="text" id="signupLocation" class="form-control" required>
                     </div>
+
+                    <h4>Bank Account Details</h4>
+                    <div class="form-group">
+                        <label>Bank Name</label>
+                        <input type="text" id="signupBankName" class="form-control" required>
+                    </div>
+                    <div class="form-group">
+                        <label>Bank Code</label>
+                        <input type="text" id="signupBankCode" class="form-control" required>
+                    </div>
+                    <div class="form-group">
+                        <label>Account Number</label>
+                        <input type="text" id="signupAccountNumber" class="form-control" maxlength="10" required placeholder="10 digits">
+                    </div>
+                    <div class="form-group">
+                        <label>Account Holder Name</label>
+                        <input type="text" id="signupAccountHolder" class="form-control" required placeholder="Must match account holder">
+                    </div>
+
+
                     <input type="hidden" id="signupSalary" value="0">
                     <button type="submit" class="btn btn-primary btn-block">Sign Up</button>
                 </form>

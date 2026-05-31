@@ -697,12 +697,22 @@ async function verifyBankAccountFields({
   holderInput,
   statusEl,
   manual = false,
-  attempt = 1,
+  attempt = 2,
 }) {
-  const accountNumber = accountInput?.value.trim();
+  const accountNumber = accountInput?.value?.trim();
   const selectedOption = bankSelect?.options[bankSelect.selectedIndex];
   const bankCode = selectedOption?.dataset?.code;
-  const verificationKey = `${bankCode || ""}:${accountNumber || ""}`;
+  
+  if (!accountNumber || !bankCode) return false;
+  
+  const verificationKey = `${bankCode}:${accountNumber}`;
+
+  // Defensive: never allow writing into status element by mistake
+  const safeHolderInput =
+    holderInput && holderInput !== statusEl ? holderInput : null;
+
+  // Check if we are already verified or verifying this specific key
+  if (AppState.lastVerifiedAccountKey === verificationKey && safeHolderInput?.value) return true;
 
   if (!accountNumber || !/^\d{10}$/.test(accountNumber)) {
     if (manual) showToast("Enter valid 10-digit account number", "error");
@@ -721,22 +731,29 @@ async function verifyBankAccountFields({
   }
   if (
     AppState.lastVerifiedAccountKey === verificationKey &&
-    holderInput?.value.trim() &&
+    safeHolderInput?.value.trim() &&
     attempt === 1
   ) {
     setAccountVerificationStatus(
       statusEl,
-      `Verified: ${holderInput.value.trim()}`,
+      `Verified: ${safeHolderInput.value.trim()}`,
       "text-success",
     );
     return true;
   }
 
+  // Coalesce: invalidate any previous in-flight verification by key
   AppState.pendingAccountVerificationKey = verificationKey;
-  holderInput.value = "Verifying...";
-  holderInput.disabled = true;
-  holderInput.readOnly = true;
-  holderInput.style.background = "#f8f9fa";
+  AppState.pendingAccountVerificationRunId =
+    (AppState.pendingAccountVerificationRunId || 0) + 1;
+  const runId = AppState.pendingAccountVerificationRunId;
+
+  if (safeHolderInput) {
+    safeHolderInput.value = "Verifying...";
+    safeHolderInput.disabled = true;
+    safeHolderInput.readOnly = true;
+    safeHolderInput.style.background = "#f8f9fa";
+  }
   setAccountVerificationStatus(
     statusEl,
     "Verifying with Paystack...",
@@ -750,18 +767,43 @@ async function verifyBankAccountFields({
       body: { account_number: accountNumber, bank_code: bankCode },
     });
 
+    // Ignore stale responses (race protection)
+    if (
+      AppState.pendingAccountVerificationRunId !== runId ||
+      AppState.pendingAccountVerificationKey !== verificationKey
+    ) {
+      return false;
+    }
+
     if (res.status === 429) {
-      const retryAfter = parseInt(res.data?.retry_after, 10) || 300;
-      const minutes = Math.max(1, Math.ceil(retryAfter / 60));
-      holderInput.value = "";
-      holderInput.style.background = "#f8d7da";
-      AppState.lastVerifiedAccountKey = null;
-      setAccountVerificationStatus(
-        statusEl,
-        `Paystack is rate limited. Try again in about ${minutes} minute${minutes === 1 ? "" : "s"}.`,
-        "text-warning",
-      );
-      if (manual) showToast("Paystack verification is cooling down. Try again later.", "warning");
+      // User-facing requirement (exact message):
+      // "Verification service is temporarily unavailable. Please try again in 5 minutes."
+      // Backend may also provide retry_after.
+      const retryAfter = parseInt(res.data?.retry_after, 10);
+
+      let displayMsg =
+        res.message || res.data?.message || "Verification service is temporarily unavailable. Please try again in 5 minutes.";
+
+      if (!isNaN(retryAfter) && retryAfter > 0) {
+        const minutes = Math.max(1, Math.round(retryAfter / 60));
+        displayMsg =
+          minutes <= 1
+            ? "Verification service is temporarily unavailable. Please try again in 1 minute."
+            : `Verification service is temporarily unavailable. Please try again in ${minutes} minutes.`;
+      }
+
+      // IMPORTANT: Never write rate-limit/error text into the Account Holder Name field.
+      // Keep the field blank.
+      if (safeHolderInput) {
+        safeHolderInput.value = "";
+        safeHolderInput.style.background = "#f8f9fa";
+      }
+
+      // Mark this key as already “handled” so auto-verify won't immediately re-trigger.
+      AppState.lastVerifiedAccountKey = verificationKey;
+
+      setAccountVerificationStatus(statusEl, displayMsg, "text-warning");
+      if (manual) showToast(displayMsg, "warning");
       return false;
     }
 
@@ -770,8 +812,10 @@ async function verifyBankAccountFields({
       res.data?.status === true &&
       res.data?.data?.account_name
     ) {
-      holderInput.value = res.data.data.account_name;
-      holderInput.style.background = "#d4edda";
+      if (safeHolderInput) {
+        safeHolderInput.value = res.data.data.account_name;
+        safeHolderInput.style.background = "#d4edda";
+      }
       AppState.lastVerifiedAccountKey = verificationKey;
       setAccountVerificationStatus(
         statusEl,
@@ -782,25 +826,24 @@ async function verifyBankAccountFields({
       return true;
     }
 
-    holderInput.value = "";
-    holderInput.style.background = "#f8d7da";
+    if (safeHolderInput) {
+      safeHolderInput.value = "";
+      safeHolderInput.style.background = "#f8d7da";
+    }
     AppState.lastVerifiedAccountKey = null;
 
     const errorMsg =
-      res.status === 429
-        ? "Too many requests. Please try again in a minute."
-        : res.message || res.data?.message || "Account could not be verified.";
+      res.message || res.data?.message || "Account could not be verified.";
 
     setAccountVerificationStatus(statusEl, errorMsg, "text-danger");
     if (manual)
-      showToast(
-        res.message || res.data?.message || "Verification failed",
-        "error",
-      );
+      showToast(errorMsg, "error");
     return false;
   } catch (err) {
-    holderInput.value = "";
-    holderInput.style.background = "#f8d7da";
+    if (safeHolderInput) {
+      safeHolderInput.value = "";
+      safeHolderInput.style.background = "#f8d7da";
+    }
     AppState.lastVerifiedAccountKey = null;
     setAccountVerificationStatus(
       statusEl,
@@ -810,12 +853,22 @@ async function verifyBankAccountFields({
     if (manual) showToast("Verification service unavailable", "error");
     return false;
   } finally {
-    AppState.pendingAccountVerificationKey = null;
-    holderInput.disabled = false;
-    holderInput.readOnly = true;
-    holderInput.placeholder = "Auto-filled after verification";
+    // Only clear pending if this run is the latest one
+    if (
+      AppState.pendingAccountVerificationRunId === runId &&
+      AppState.pendingAccountVerificationKey === verificationKey
+    ) {
+      AppState.pendingAccountVerificationKey = null;
+    }
+
+    if (safeHolderInput) {
+      safeHolderInput.disabled = false;
+      safeHolderInput.readOnly = true;
+      safeHolderInput.placeholder = "Auto-filled after verification";
+    }
   }
 }
+
 
 function setupAccountVerification({
   accountInputId,
@@ -845,12 +898,34 @@ function setupAccountVerification({
     1200,
   );
 
+  // Reduced auto-verify triggers to prevent excessive Paystack calls.
+  // Auto verify only when account input becomes stable (10 digits) OR when user changes bank.
+  let lastAutoVerifiedAccountKey = null;
+
   accountInput.addEventListener("input", () => {
-    holderInput.value = "";
-    holderInput.style.background = "#f8f9fa";
-    AppState.lastVerifiedAccountKey = null;
-    if (accountInput.value.trim().length === 10) {
-      verifyCurrentAccount();
+    // Only clear the displayed name if the current key is changing.
+    // This prevents flicker/races from clearing a recently verified name.
+    const v = accountInput.value.trim();
+    const selectedOption = bankSelect?.options[bankSelect.selectedIndex];
+    const bankCode = selectedOption?.dataset?.code;
+    const key = `${bankCode || ""}:${v}`;
+
+    // If we started typing a different key, clear prior UI.
+    if (key !== AppState.lastVerifiedAccountKey) {
+      holderInput.value = "";
+      holderInput.style.background = "#f8f9fa";
+    }
+
+    if (v.length === 10 && /^\d{10}$/.test(v)) {
+      const currentKey = `${bankCode || ""}:${v}`;
+      if (
+        currentKey &&
+        currentKey !== lastAutoVerifiedAccountKey &&
+        currentKey !== AppState.pendingAccountVerificationKey
+      ) {
+        lastAutoVerifiedAccountKey = currentKey; // lock auto-trigger for this key
+        verifyCurrentAccount();
+      }
     } else {
       setAccountVerificationStatus(
         statusEl,
@@ -863,13 +938,26 @@ function setupAccountVerification({
   bankSelect.addEventListener("change", () => {
     holderInput.value = "";
     holderInput.style.background = "#f8f9fa";
-    AppState.lastVerifiedAccountKey = null;
     setAccountVerificationStatus(
       statusEl,
       "Enter 10-digit account number to auto-verify",
       "text-muted",
     );
-    if (accountInput.value.trim().length === 10) verifyCurrentAccount();
+
+    const v = accountInput.value.trim();
+    if (v.length === 10 && /^\d{10}$/.test(v)) {
+      const selectedOption = bankSelect?.options[bankSelect.selectedIndex];
+      const bankCode = selectedOption?.dataset?.code;
+      const key = `${bankCode || ""}:${v}`;
+      if (
+        key &&
+        key !== lastAutoVerifiedAccountKey &&
+        key !== AppState.pendingAccountVerificationKey
+      ) {
+        lastAutoVerifiedAccountKey = key; // lock auto-trigger for this key
+        verifyCurrentAccount();
+      }
+    }
   });
 
   return { accountInput, bankSelect, holderInput, statusEl };
@@ -3217,10 +3305,6 @@ async function updateDashboardStats() {
   // Update Chart
   if (stats.salary_summary) renderSalaryChart(stats.salary_summary);
 
-  // NEW: Update health check
-  const healthRes = await apiRequest("/health-check/");
-  if (healthRes.success) updateHealthStatusUI(healthRes.data);
-
   const elements = {
     totalStaff: document.getElementById("totalStaff"),
     totalGuards: document.getElementById("totalGuards"),
@@ -3815,45 +3899,41 @@ async function generatePayslip() {
 }
 
 async function downloadPayslip(html, employeeId, month) {
-  const element = document.createElement("div");
-  element.innerHTML = html;
-  element.style.padding = "20px";
-  element.style.position = "absolute";
-  element.style.left = "-9999px"; // Hide off-screen but keep in DOM
-  element.style.top = "0";
-  document.body.appendChild(element);
-
-  const opt = {
-    margin: [0.5, 0.5, 0.5, 0.5], // [top, left, bottom, right] in inches
-    filename: `payslip_${employeeId}_${month}.pdf`,
-    image: { type: "jpeg", quality: 0.98 },
-    html2canvas: { 
-      scale: 2,
-      useCORS: true,
-      logging: false,
-      scrollX: 0,
-      scrollY: 0,
-      windowWidth: element.scrollWidth,
-      windowHeight: element.scrollHeight
-    },
-    jsPDF: { unit: "in", format: "letter", orientation: "portrait" },
-    pagebreak: { mode: ['avoid-all', 'css', 'legacy'] } // Prevent awkward breaks
-  };
-
+  // Server-side PDF generation (ReportLab) to avoid blank/white PDF issues
+  // caused by client-side html2pdf/html2canvas rendering.
   try {
-    if (typeof html2pdf === "undefined") {
-      throw new Error("PDF generator not loaded");
-    }
-    
-    // FIXED: Wait for PDF generation to complete before removing element
-    await html2pdf().set(opt).from(element).save();
+    // Re-use existing export password modal if present.
+    // If password is missing, backend will reject with 401.
+    const exportPassword = document.getElementById("exportPassword")?.value || "";
+
+    const tokenRes = await apiRequest(
+      "/api/payments/request_payslip_export/",
+      {
+        method: "POST",
+        body: {
+          password: exportPassword,
+          employee_id: employeeId,
+          month: month,
+        },
+      },
+    );
+
+    if (!tokenRes.success) throw new Error(tokenRes.message);
+
+    const downloadToken = tokenRes.data?.token;
+    if (!downloadToken) throw new Error("Missing export token");
+
+    await triggerSecureDownload(
+      "/api/payments/download_payslip_pdf/",
+      downloadToken,
+      `payslip_${employeeId}_${month}.pdf`,
+      { method: "GET" },
+    );
+
     showToast("Payslip downloaded successfully", "success");
   } catch (err) {
-    console.error("PDF generation error:", err);
-    showToast("Failed to generate PDF: " + err.message, "error");
-  } finally {
-    // Now safe to remove
-    element.remove();
+    console.error("Payslip download error:", err);
+    showToast("Failed to download payslip PDF: " + (err.message || err), "error");
   }
 }
 
@@ -3947,24 +4027,42 @@ function exportPaymentHistory() {
 }
 
 // REPLACE the existing triggerSecureDownload function
-async function triggerSecureDownload(url, token, filename) {
+async function triggerSecureDownload(url, token, filename, { method = null } = {}) {
   try {
     showLoading(null, AppState.elements.globalSpinner);
-    const accessToken = AppState.accessToken || localStorage.getItem("accessToken");
-    
-    // FIXED: Use POST with token in body, not GET with query param
-    const response = await fetch(`${window.location.origin}${url}`, {
-      method: "POST",
+    const accessToken =
+      AppState.accessToken || localStorage.getItem("accessToken");
+
+    // Employees + payments CSV endpoints expect `token` as a query param (GET action).
+    // Payslip/receipt PDF endpoints also expect `token` as a query param.
+    const finalMethod = method || "GET";
+
+    let fullUrl = `${window.location.origin}${url}`;
+    if (finalMethod.toUpperCase() === "GET") {
+      fullUrl = `${fullUrl}${fullUrl.includes("?") ? "&" : "?"}token=${encodeURIComponent(token)}`;
+    }
+
+    const response = await fetch(fullUrl, {
+      method: finalMethod,
       headers: {
         "Authorization": `Bearer ${accessToken}`,
-        "Content-Type": "application/json"
+        "Content-Type": "application/json",
       },
-      body: JSON.stringify({ token: token })
+      ...(finalMethod.toUpperCase() === "POST"
+        ? { body: JSON.stringify({ token: token }) }
+        : {}),
     });
 
     if (!response.ok) {
-      const errorData = await response.json().catch(() => ({}));
-      throw new Error(errorData.detail || errorData.error || `Export failed (${response.status})`);
+      const errorData = await response
+        .json()
+        .catch(() => ({}));
+      throw new Error(
+        errorData.detail ||
+          errorData.error ||
+          errorData.message ||
+          `Export failed (${response.status})`,
+      );
     }
 
     const blob = await response.blob();
@@ -4876,6 +4974,7 @@ document.addEventListener("DOMContentLoaded", async () => {
       console.log("Token valid, loading dashboard");
       AppState.currentUser = res.data;
       await loadDashboard();
+      initHealthPoller();
     } else {
       console.log("Token invalid, attempting refresh once...");
       const refreshed = await refreshAccessToken();

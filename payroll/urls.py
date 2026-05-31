@@ -26,12 +26,15 @@ urlpatterns = [
     path('current-user/', auth_views.CurrentUserView.as_view(), name='current_user'),
     path('register/', auth_views.register_view, name='register'),
     path('self-register/', auth_views.self_register_employee, name='self_register'),
+
+
+
     path('request-reset/', auth_views.request_password_reset, name='request_reset'),
     path('reset-password/confirm/<uidb64>/<token>/', auth_views.reset_password_confirm, name='password_reset_confirm'),
     
     # Paystack
     path('paystack/banks/', views.paystack_banks, name='paystack_banks'),
-    path('paystack/verify-account/', views.paystack_verify_account, name='paystack_verify_account'),
+    path('paystack/verify-account/', views.PaystackVerifyAccountView.as_view(), name='paystack_verify_account'),
     path('paystack/clear-cache/', views.clear_paystack_cache, name='clear_paystack_cache'),
     
     # WEBHOOK: Only ONE endpoint. Paystack should point here:

@@ -57,8 +57,15 @@ def _validate_bank_account_name(full_name, account_number, bank_code, submitted_
 
     result = PaystackAPI().verify_account(account_number, bank_code)
     verified_name = (result.get('data') or {}).get('account_name') if isinstance(result.get('data'), dict) else None
+
+    # PRODUCTION: if Paystack is rate-limiting, don't block employee creation.
+    # We'll update account_holder asynchronously.
+    if result.get('error_code') == 'rate_limited':
+        return None, None
+
     if not result.get('status') or not verified_name:
         return None, result.get('message') or 'Bank account could not be verified with Paystack.'
+
 
     employee_tokens = _name_tokens(full_name)
     account_tokens = _name_tokens(verified_name)
@@ -310,13 +317,27 @@ def register_view(request):
             data.get('bank_code'),
             data.get('account_holder')
         )
-        if verification_error:
-            return Response(
-                {'error': verification_error, 'field': 'account_holder'},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-        mutable_data = data.copy()
-        mutable_data['account_holder'] = verified_holder
+    if verification_error:
+        return Response(
+            {'error': verification_error, 'field': 'account_holder'},
+            status=status.HTTP_400_BAD_REQUEST
+        )
+
+    # If Paystack was rate-limited/unavailable, verified_holder is None.
+    # Never persist an unverified/None account_holder value.
+    if role in ['staff', 'guard'] and (verified_holder is None or not str(verified_holder).strip()):
+        return Response(
+            {
+                'error': 'Account verification is temporarily unavailable due to rate limiting. Please try again in a few minutes.',
+                'field': 'account_holder',
+            },
+            status=status.HTTP_429_TOO_MANY_REQUESTS,
+        )
+
+
+    mutable_data = data.copy()
+    mutable_data['account_holder'] = verified_holder
+
     
     try:
         with transaction.atomic():
@@ -455,10 +476,15 @@ def get_next_employee_id(request):
     """Get next auto-generated employee ID for preview (does NOT reserve it)"""
     employee_type = request.query_params.get('type', 'staff')
     
-    # Get the last sequence used globally
-    last_employee = Employee.objects.order_by('-id_sequence').first()
-    next_sequence = (last_employee.id_sequence + 1) if last_employee and last_employee.id_sequence else 1
-    
+    # Get the next global sequence value for preview (does NOT reserve it).
+    # Must match Employee.generate_employee_id() global behavior.
+    from .models import EmployeeSequence
+
+    global_key = 'global'
+    seq = EmployeeSequence.objects.filter(type=global_key).first()
+    current = seq.last_value if seq and seq.last_value is not None else 0
+    next_sequence = current + 1
+
     # Format preview ID
     if employee_type == 'staff':
         suffix = 'STAFF'
@@ -466,7 +492,7 @@ def get_next_employee_id(request):
         suffix = 'GRD'
     else:
         suffix = 'EMP'
-    
+
     next_id = f"FSS-{str(next_sequence).zfill(3)}-{suffix}"
     
     return Response({
@@ -515,12 +541,21 @@ def self_register_employee(request):
             status=status.HTTP_400_BAD_REQUEST
         )
 
+    # Self signup must include bank/account fields (required for Paystack verification + employee account creation)
+    required_bank = ['account_number', 'bank_code', 'bank_name', 'account_holder']
+    missing_bank = [f for f in required_bank if f not in data or not data.get(f)]
+    if missing_bank:
+        return Response(
+            {'error': f'Missing required bank/account fields: {", ".join(missing_bank)}'},
+            status=status.HTTP_400_BAD_REQUEST
+        )
+
     try:
         with transaction.atomic():
             name_parts = data['full_name'].split(None, 1)
             first_name = name_parts[0]
             last_name = name_parts[1] if len(name_parts) > 1 else ''
-            
+
             user = User.objects.create_user(
                 username=data['username'],
                 password=data['password'],
@@ -529,9 +564,10 @@ def self_register_employee(request):
                 first_name=first_name,
                 last_name=last_name,
             )
-            user.is_active = False # Requires admin approval
+            user.is_active = False  # Requires admin approval
             user.save()
 
+            # EmployeeStatus values are stored as strings in the DB in this project
             employee = Employee.objects.create(
                 user=user,
                 name=data['full_name'],
@@ -549,7 +585,26 @@ def self_register_employee(request):
                 join_date=timezone.now().date()
             )
             employee.refresh_from_db()
-            
+
+            # Ensure HR can review/approve/reject via dedicated request model.
+            from .models import EmployeeRegistrationRequest
+            EmployeeRegistrationRequest.objects.create(
+                user=user,
+                employee=employee,
+                employee_name=data['full_name'],
+                employee_type=role_type,
+                location=data['location'],
+                salary=employee.salary,
+                phone=data.get('phone', ''),
+                email=user.email,
+                bank_name=data.get('bank_name', ''),
+                bank_code=data.get('bank_code', ''),
+                account_number=data.get('account_number', ''),
+                account_holder=verified_holder,
+                status='pending',
+                is_self_registered=True
+            )
+
         send_registration_notifications(employee, request)
 
         logger.info(f"Self-signup {role_type} successful: {user.username} (ID: {employee.employee_id})")
@@ -558,6 +613,7 @@ def self_register_employee(request):
             'employee_id': employee.employee_id,
             'username': user.username
         }, status=status.HTTP_201_CREATED)
+
 
     except IntegrityError as e: # Add specific handling here
         logger.error(f"Integrity error during self-registration: {e}")
