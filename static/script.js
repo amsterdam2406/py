@@ -731,6 +731,16 @@ async function verifyBankAccountFields({
   }
 
   if (AppState.lastVerifiedAccountKey === verificationKey && safeHolderInput?.value) return true;
+  // If already verified, ensure UI reflects it and return
+  if (AppState.lastVerifiedAccountKey === verificationKey && safeHolderInput && safeHolderInput.value && safeHolderInput.value !== "Verifying...") {
+    setAccountVerificationStatus(
+      statusEl,
+      `Verified: ${safeHolderInput.value}`,
+      "text-success",
+    );
+    safeHolderInput.style.background = "#d4edda";
+    return true;
+  }
 
   if (!accountNumber || !/^\d{10}$/.test(accountNumber)) {
     if (manual) showToast("Enter valid 10-digit account number", "error");
@@ -804,6 +814,7 @@ async function verifyBankAccountFields({
 
       let displayMsg =
         res.message ||
+        res.message && res.message.includes("5 minutes") ? res.message :
         res.data?.message ||
         res.data?.detail ||
         "Verification service is temporarily unavailable. Please try again in 5 minutes.";
@@ -817,8 +828,11 @@ async function verifyBankAccountFields({
       }
 
       if (safeHolderInput) {
-        safeHolderInput.value = "";
-        safeHolderInput.style.background = "#f8f9fa";
+        // IMPORTANT: If rate limited, let the user type manually as a fallback
+        safeHolderInput.disabled = false;
+        safeHolderInput.readOnly = false;
+        safeHolderInput.placeholder = "Enter name manually (Service busy)";
+        safeHolderInput.style.background = "#fff3cd"; // Warning yellow
       }
 
       AppState.lastVerifiedAccountKey = null;
@@ -844,6 +858,7 @@ async function verifyBankAccountFields({
         const nameToSet = accountName.trim();
         safeHolderInput.disabled = false;
         safeHolderInput.readOnly = true;
+        safeHolderInput.value = nameToSet;          // set value AFTER disabled=false
         safeHolderInput.style.background = "#d4edda";
         safeHolderInput.value = nameToSet;          // set value AFTER disabled=false
       }
@@ -892,7 +907,7 @@ async function verifyBankAccountFields({
 
     if (safeHolderInput) {
       safeHolderInput.disabled = false;
-      if (safeHolderInput.value === "Verifying..." || !AppState.lastVerifiedAccountKey) {
+      if (safeHolderInput.value === "Verifying..." && !AppState.lastVerifiedAccountKey) {
          safeHolderInput.value = "";
       }
     }
@@ -925,27 +940,32 @@ function setupAccountVerification({
         statusEl,
       }),
     1200,
+    800,
   );
 
   const mapKey = accountInputId;
 
   accountInput.addEventListener("input", () => {
+    // Clear cached verification if user changes digits to allow re-triggering
+    _autoVerifiedKeys.delete(mapKey);
+    
     const v = accountInput.value.trim();
     const selectedOption = bankSelect?.options[bankSelect.selectedIndex];
     const bankCode = selectedOption?.dataset?.code;
     const key = `${bankCode || "none"}:${v}`;
 
     // Only clear if the user actually changed the digits/bank to something unverified
-    if (key !== AppState.lastVerifiedAccountKey && !AppState.pendingAccountVerificationKey) {
+    // Only clear if the user actually changed the key to something different than verified
+    if (AppState.lastVerifiedAccountKey && key !== AppState.lastVerifiedAccountKey && !AppState.pendingAccountVerificationKey) {
       holderInput.value = "";
       holderInput.style.background = "#f8f9fa";
+      AppState.lastVerifiedAccountKey = null;
     }
 
     if (v.length === 10 && /^\d{10}$/.test(v)) {
       const currentKey = `${bankCode || "none"}:${v}`;
       if (
         currentKey &&
-        currentKey !== _autoVerifiedKeys.get(mapKey) &&
         currentKey !== AppState.pendingAccountVerificationKey
       ) {
         _autoVerifiedKeys.set(mapKey, currentKey);
@@ -961,10 +981,6 @@ function setupAccountVerification({
   });
 
   bankSelect.addEventListener("change", () => {
-    if (!AppState.lastVerifiedAccountKey) {
-        holderInput.value = "";
-        holderInput.style.background = "#f8f9fa";
-    }
     setAccountVerificationStatus(
       statusEl,
       "Enter 10-digit account number to auto-verify",
@@ -972,6 +988,16 @@ function setupAccountVerification({
     );
 
     const v = accountInput.value.trim();
+    const selectedOption = bankSelect?.options[bankSelect.selectedIndex];
+    const bankCode = selectedOption?.dataset?.code;
+    const key = `${bankCode || "none"}:${v}`;
+
+    if (AppState.lastVerifiedAccountKey && key !== AppState.lastVerifiedAccountKey) {
+      holderInput.value = "";
+      holderInput.style.background = "#f8f9fa";
+      AppState.lastVerifiedAccountKey = null;
+    }
+
     if (v.length === 10 && /^\d{10}$/.test(v)) {
       const selectedOption = bankSelect?.options[bankSelect.selectedIndex];
       const bankCode = selectedOption?.dataset?.code;
@@ -982,7 +1008,9 @@ function setupAccountVerification({
         key !== AppState.pendingAccountVerificationKey
       ) {
         _autoVerifiedKeys.set(mapKey, key);
-        verifyCurrentAccount();
+        if (key !== AppState.pendingAccountVerificationKey && key !== AppState.lastVerifiedAccountKey) {
+          verifyCurrentAccount();
+        }
       }
     }
   });

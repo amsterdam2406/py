@@ -162,8 +162,6 @@ class PaystackVerifyAccountView(APIView):
     throttle_classes = [BankVerifyThrottle]
 
     def post(self, request):
-
-
         """Verify bank account number"""
         account_number = request.data.get('account_number')
         bank_code = request.data.get('bank_code')
@@ -177,6 +175,7 @@ class PaystackVerifyAccountView(APIView):
         # Check for existing active employees to avePaystack API calls and prevent duplicates
         duplicate = Employee.objects.filter(
             account_number=account_number,
+            bank_code=bank_code,
             status__in=['active', 'pending']
         ).first()
 
@@ -200,7 +199,7 @@ class PaystackVerifyAccountView(APIView):
             or result.get('status') is False and str(result.get('message', '')).lower().find('rate limit') >= 0
         ):
             retry_after = result.get('retry_after')
-            message = "Verification service is temporarily unavailable. Please try again shortly."
+            message = "Verification service is temporarily unavailable. Please try again in 5 minutes."
             if retry_after:
                 message = f"Rate limited. Try again in {retry_after}s."
 
@@ -212,7 +211,7 @@ class PaystackVerifyAccountView(APIView):
                     'retry_after': retry_after,
                     'error_code': 'rate_limited'
                 },
-                status=status.HTTP_200_OK
+                status=status.HTTP_429_TOO_MANY_REQUESTS
             )
 
 
@@ -238,6 +237,7 @@ def paystack_resolve_account(request):
     # If already resolved/registered, avoid external calls
     duplicate = Employee.objects.filter(
         account_number=account_number,
+        bank_code=bank_code,
         status__in=['active', 'pending']
     ).first()
     if duplicate:
@@ -272,7 +272,7 @@ def paystack_resolve_account(request):
                 'retry_after': retry_after,
                 'error_code': 'rate_limited'
             },
-            status=status.HTTP_200_OK
+            status=status.HTTP_429_TOO_MANY_REQUESTS
         )
 
     # Expect verify_account payload to contain account_name/account_number/bank_name
