@@ -152,6 +152,12 @@ body {
 
 .nav-user span {
     font-weight: 500;
+    color: #28a745 !important;
+}
+
+/* Enforce success color for the welcome message and user display */
+#welcomeUserName, #currentUserName {
+    color: #28a745 !important;
 }
 
 /* Sidebar */

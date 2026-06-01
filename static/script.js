@@ -1387,21 +1387,6 @@ async function loadCurrentUser() {
     if (!res.success) throw new Error(res.message);
 
     AppState.currentUser = res.data;
-
-    // FIXED: Use correct element ID that exists in HTML
-    const el = document.getElementById("currentUserName");
-    if (el) {
-      const displayName = AppState.currentUser.name || AppState.currentUser.username || "User";
-      el.textContent = escapeHtml(displayName);
-    }
-
-    // Also update any other places that might show the user name
-    const welcomeEl = document.getElementById("welcomeUserName");
-    if (welcomeEl) {
-      const displayName = AppState.currentUser.name || AppState.currentUser.username || "User";
-      welcomeEl.textContent = `Welcome, ${escapeHtml(displayName)}`;
-    }
-
     applyRolePermissions(AppState.currentUser);
     return true;
   } catch (err) {
@@ -1417,6 +1402,21 @@ async function loadCurrentUser() {
 
 function applyRolePermissions(user) {
   if (!user) return;
+
+  // Prefer first_name, fallback to username
+  const firstName = user.first_name || user.username || "User";
+
+  const nameEl = document.getElementById("currentUserName");
+  if (nameEl) {
+    // Display Welcome + First Name behind the dropdown
+    nameEl.textContent = "Welcome, " + firstName;
+  }
+
+  const welcomeEl = document.getElementById("welcomeUserName");
+  if (welcomeEl) {
+    // Display Welcome + First Name
+    welcomeEl.textContent = "Welcome, " + firstName;
+  }
 
   // Mapping backend flags to UI visibility
   const permissions = [

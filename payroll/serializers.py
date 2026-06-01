@@ -69,11 +69,12 @@ def _verify_employee_bank_account(full_name, account_number, bank_code, submitte
 
 class UserSerializer(serializers.ModelSerializer):
     employee_id = serializers.SerializerMethodField(read_only=True)
+    name = serializers.SerializerMethodField(read_only=True)
 
     class Meta:
         model = User
         fields = [
-            'id', 'username', 'email', 'role', 'phone', 'employee_id',
+            'id', 'username', 'email', 'role', 'phone', 'employee_id', 'name',
             'is_company_admin', 'is_notification_admin', 'is_payment_admin',
             'is_deduction_admin', 'is_employee_admin', 'is_request_admin', 'is_hr_admin',
             'first_name', 'last_name',
@@ -86,6 +87,12 @@ class UserSerializer(serializers.ModelSerializer):
         if hasattr(obj, 'employee_profile'):
             return obj.employee_profile.employee_id
         return None
+
+    def get_name(self, obj):
+        if hasattr(obj, 'employee_profile') and obj.employee_profile.name:
+            return obj.employee_profile.name
+        full_name = f"{obj.first_name} {obj.last_name}".strip()
+        return full_name or obj.username
 
     def validate_email(self, value):
         if not value or not value.strip():
