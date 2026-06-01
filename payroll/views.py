@@ -161,9 +161,9 @@ class PaystackVerifyAccountView(APIView):
     # Throttle this endpoint to avoid bursts hammering Paystack (429s).
     throttle_classes = [BankVerifyThrottle]
 
-
-
     def post(self, request):
+
+
         """Verify bank account number"""
         account_number = request.data.get('account_number')
         bank_code = request.data.get('bank_code')
@@ -194,21 +194,25 @@ class PaystackVerifyAccountView(APIView):
         paystack = PaystackAPI()
         result = paystack.verify_account(account_number, bank_code)
 
-        if result.get('error_code') == 'rate_limited':
+        # Normalize Paystack 429/rate-limited payloads so frontend doesn't hammer the endpoint.
+        if (
+            result.get('error_code') == 'rate_limited'
+            or result.get('status') is False and str(result.get('message', '')).lower().find('rate limit') >= 0
+        ):
             retry_after = result.get('retry_after')
-            message = "Verification service is temporarily unavailable. Please try again in 5 minutes."
+            message = "Verification service is temporarily unavailable. Please try again shortly."
             if retry_after:
-                message = f"{message} Retry after {retry_after} seconds."
-            # Keep backward compatibility: include `detail` and `retry_after` keys
-            # but also add stable `message` key for frontend usage.
+                message = f"Rate limited. Try again in {retry_after}s."
+
             return Response(
                 {
                     'success': False,
                     'message': message,
                     'detail': message,
                     'retry_after': retry_after,
+                    'error_code': 'rate_limited'
                 },
-                status=status.HTTP_429_TOO_MANY_REQUESTS
+                status=status.HTTP_200_OK
             )
 
 
@@ -217,9 +221,68 @@ class PaystackVerifyAccountView(APIView):
 
 
 
+@api_view(['GET'])
+@permission_classes([AllowAny])
+@throttle_classes([BankVerifyThrottle])
+def paystack_resolve_account(request):
+    """Resolve Paystack account name (GET /paystack/resolve-account/)."""
+    account_number = request.GET.get('account_number')
+    bank_code = request.GET.get('bank_code')
+
+    if not account_number or not bank_code:
+        return Response(
+            {'success': False, 'message': 'account_number and bank_code are required'},
+            status=status.HTTP_400_BAD_REQUEST
+        )
+
+    # If already resolved/registered, avoid external calls
+    duplicate = Employee.objects.filter(
+        account_number=account_number,
+        status__in=['active', 'pending']
+    ).first()
+    if duplicate:
+        return Response({
+            'success': True,
+            'message': 'Account already verified and registered in system',
+            'data': {
+                'account_name': duplicate.account_holder,
+                'account_number': duplicate.account_number,
+                'bank_name': duplicate.bank_name,
+            }
+        }, status=status.HTTP_200_OK)
+
+    paystack = PaystackAPI()
+    # Reuse existing caching & normalization by calling verify_account
+    result = paystack.verify_account(account_number, bank_code)
+
+    if (
+        result.get('error_code') == 'rate_limited'
+        or result.get('status') is False and str(result.get('message', '')).lower().find('rate limit') >= 0
+    ):
+        retry_after = result.get('retry_after')
+        message = "Verification service is temporarily unavailable. Please try again in 5 minutes."
+        if retry_after:
+            message = f"Rate limited. Try again in {retry_after}s."
+
+        return Response(
+            {
+                'success': False,
+                'message': message,
+                'detail': message,
+                'retry_after': retry_after,
+                'error_code': 'rate_limited'
+            },
+            status=status.HTTP_200_OK
+        )
+
+    # Expect verify_account payload to contain account_name/account_number/bank_name
+    return Response(result)
+
+
 @api_view(['POST'])
 @permission_classes([IsAdmin])
 def clear_paystack_cache(request):
+
     """
     Clear all cached Paystack bank account resolutions.
     Requires django-redis for delete_pattern support.

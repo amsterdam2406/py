@@ -42,6 +42,7 @@ const AppState = {
   loginLockedUntil: null,
   selectedEmployeesForBulk: new Set(),
   bankList: [],
+  rateLimitedKeys: new Map(),
   lastVerifiedAccountKey: null,
   globalLoadingCount: 0, // ADDED: Counter for global loading operations
   pendingAccountVerificationKey: null,
@@ -62,6 +63,8 @@ const AppState = {
     globalSpinner: null,
   },
 };
+
+const _autoVerifiedKeys = new Map();
 
 // ==========================================
 // UTILITY FUNCTIONS
@@ -473,7 +476,14 @@ async function apiRequest(url, options = {}) {
     ? url
     : `${baseUrl}${url.startsWith("/") ? "" : "/"}${url}`;
 
-  const token = AppState.accessToken || localStorage.getItem("accessToken");
+  let token = AppState.accessToken || localStorage.getItem("accessToken");
+
+  // NEW: Proactively refresh token if expired to avoid unnecessary 401 logs and extra roundtrips
+  if (token && isJwtExpired(token) && !url.includes("/token/refresh/") && !url.includes("/login/")) {
+    const refreshed = await refreshAccessToken();
+    if (refreshed) token = AppState.accessToken;
+  }
+
   const csrfToken = getCookie("csrftoken");
 
   const headers = {
@@ -529,7 +539,7 @@ async function apiRequest(url, options = {}) {
       return {
         success: false,
         status: response.status,
-        message: `Too many requests. Please wait ${waitTime} seconds.`,
+        message: "Verification service is temporarily unavailable. Please try again in 5 minutes.",
         data: errorData,
       };
     }
@@ -657,6 +667,7 @@ function populateBankSelects() {
   const bankSelects = [
     document.getElementById("accountBankName"),
     document.getElementById("newEmployeeBankName"),
+    document.getElementById("signupBankName"),
   ];
 
   bankSelects.forEach((select) => {
@@ -702,16 +713,23 @@ async function verifyBankAccountFields({
   const accountNumber = accountInput?.value?.trim();
   const selectedOption = bankSelect?.options[bankSelect.selectedIndex];
   const bankCode = selectedOption?.dataset?.code;
-  
-  if (!accountNumber || !bankCode) return false;
-  
-  const verificationKey = `${bankCode}:${accountNumber}`;
 
-  // Defensive: never allow writing into status element by mistake
+  if (!accountNumber || !bankCode) return false;
+
+  const verificationKey = `${bankCode || "none"}:${accountNumber}`;
+
   const safeHolderInput =
     holderInput && holderInput !== statusEl ? holderInput : null;
 
-  // Check if we are already verified or verifying this specific key
+  // Check for local rate limit cooldown
+  const cooldownUntil = AppState.rateLimitedKeys.get(verificationKey);
+  if (cooldownUntil && Date.now() < cooldownUntil) {
+    if (!manual) return false; // Don't annoy with toasts on auto-verify
+    const remainingSecs = Math.ceil((cooldownUntil - Date.now()) / 1000);
+    setAccountVerificationStatus(statusEl, `Rate limited. Please wait ${remainingSecs}s.`, "text-warning");
+    return false;
+  }
+
   if (AppState.lastVerifiedAccountKey === verificationKey && safeHolderInput?.value) return true;
 
   if (!accountNumber || !/^\d{10}$/.test(accountNumber)) {
@@ -722,18 +740,15 @@ async function verifyBankAccountFields({
     if (manual) showToast("Select a valid bank first", "error");
     return false;
   }
-  if (
-    AppState.pendingAccountVerificationKey === verificationKey &&
-    attempt === 1
-  ) {
-    if (manual) showToast("Verification already in progress", "info");
+  if (AppState.pendingAccountVerificationKey === verificationKey) {
     return false;
   }
   if (
     AppState.lastVerifiedAccountKey === verificationKey &&
-    safeHolderInput?.value.trim() &&
-    attempt === 1
+    safeHolderInput?.value.trim()
   ) {
+    // If we already verified this key earlier and the UI still has a holder name,
+    // reuse it to avoid re-calling Paystack (prevents 429 bursts).
     setAccountVerificationStatus(
       statusEl,
       `Verified: ${safeHolderInput.value.trim()}`,
@@ -742,7 +757,7 @@ async function verifyBankAccountFields({
     return true;
   }
 
-  // Coalesce: invalidate any previous in-flight verification by key
+
   AppState.pendingAccountVerificationKey = verificationKey;
   AppState.pendingAccountVerificationRunId =
     (AppState.pendingAccountVerificationRunId || 0) + 1;
@@ -761,13 +776,12 @@ async function verifyBankAccountFields({
   );
 
   try {
-    const res = await apiRequest("/paystack/verify-account/", {
-      // This function doesn't manage its own spinner
-      method: "POST",
-      body: { account_number: accountNumber, bank_code: bankCode },
-    });
+    // Use GET endpoint with query parameters for account resolution
+    const res = await apiRequest(buildUrl("/paystack/resolve-account/", {
+      account_number: accountNumber,
+      bank_code: bankCode
+    }));
 
-    // Ignore stale responses (race protection)
     if (
       AppState.pendingAccountVerificationRunId !== runId ||
       AppState.pendingAccountVerificationKey !== verificationKey
@@ -775,16 +789,26 @@ async function verifyBankAccountFields({
       return false;
     }
 
-    if (res.status === 429) {
-      // User-facing requirement (exact message):
-      // "Verification service is temporarily unavailable. Please try again in 5 minutes."
-      // Backend may also provide retry_after.
-      const retryAfter = parseInt(res.data?.retry_after, 10);
+    if (res.status === 429 || res.data?.error_code === 'rate_limited') {
+      let retryAfter = parseInt(res.data?.retry_after, 10);
+      
+      // If DRF throttle hit, parse seconds from the "detail" string
+      if (isNaN(retryAfter) && res.data?.detail) {
+        const match = res.data.detail.match(/\d+/);
+        if (match) retryAfter = parseInt(match[0], 10);
+      }
+
+    // Reduce local cooldown to 30s to allow faster recovery
+    const cooldownMs = (retryAfter || 30) * 1000;
+      AppState.rateLimitedKeys.set(verificationKey, Date.now() + cooldownMs);
 
       let displayMsg =
-        res.message || res.data?.message || "Verification service is temporarily unavailable. Please try again in 5 minutes.";
+        res.message ||
+        res.data?.message ||
+        res.data?.detail ||
+        "Verification service is temporarily unavailable. Please try again in 5 minutes.";
 
-      if (!isNaN(retryAfter) && retryAfter > 0) {
+      if (!isNaN(retryAfter) && retryAfter > 0 && !displayMsg.includes("5 minutes")) {
         const minutes = Math.max(1, Math.round(retryAfter / 60));
         displayMsg =
           minutes <= 1
@@ -792,34 +816,41 @@ async function verifyBankAccountFields({
             : `Verification service is temporarily unavailable. Please try again in ${minutes} minutes.`;
       }
 
-      // IMPORTANT: Never write rate-limit/error text into the Account Holder Name field.
-      // Keep the field blank.
       if (safeHolderInput) {
         safeHolderInput.value = "";
         safeHolderInput.style.background = "#f8f9fa";
       }
 
-      // Mark this key as already “handled” so auto-verify won't immediately re-trigger.
-      AppState.lastVerifiedAccountKey = verificationKey;
+      AppState.lastVerifiedAccountKey = null;
 
       setAccountVerificationStatus(statusEl, displayMsg, "text-warning");
       if (manual) showToast(displayMsg, "warning");
       return false;
     }
 
-    if (
-      res.success &&
-      res.data?.status === true &&
-      res.data?.data?.account_name
-    ) {
+    const accountName =
+      res.data?.data?.account_name ||   
+      res.data?.account_name ||          
+      res.data?.data?.account_holder ||  
+      res.data?.account_holder ||
+      null;
+    const isVerifiedOk =
+      res.success && accountName && accountName.trim().length > 0;
+    // ──────────────────────────────────────────────────────────────────────
+
+    if (isVerifiedOk) {
       if (safeHolderInput) {
-        safeHolderInput.value = res.data.data.account_name;
+        // Capture the name first, then apply all DOM changes together
+        const nameToSet = accountName.trim();
+        safeHolderInput.disabled = false;
+        safeHolderInput.readOnly = true;
         safeHolderInput.style.background = "#d4edda";
+        safeHolderInput.value = nameToSet;          // set value AFTER disabled=false
       }
       AppState.lastVerifiedAccountKey = verificationKey;
       setAccountVerificationStatus(
         statusEl,
-        `Verified: ${res.data.data.account_name}`,
+        `Verified: ${accountName.trim()}`,
         "text-success",
       );
       if (manual) showToast("Account verified successfully", "success");
@@ -836,8 +867,7 @@ async function verifyBankAccountFields({
       res.message || res.data?.message || "Account could not be verified.";
 
     setAccountVerificationStatus(statusEl, errorMsg, "text-danger");
-    if (manual)
-      showToast(errorMsg, "error");
+    if (manual) showToast(errorMsg, "error");
     return false;
   } catch (err) {
     if (safeHolderInput) {
@@ -853,7 +883,6 @@ async function verifyBankAccountFields({
     if (manual) showToast("Verification service unavailable", "error");
     return false;
   } finally {
-    // Only clear pending if this run is the latest one
     if (
       AppState.pendingAccountVerificationRunId === runId &&
       AppState.pendingAccountVerificationKey === verificationKey
@@ -863,8 +892,9 @@ async function verifyBankAccountFields({
 
     if (safeHolderInput) {
       safeHolderInput.disabled = false;
-      safeHolderInput.readOnly = true;
-      safeHolderInput.placeholder = "Auto-filled after verification";
+      if (safeHolderInput.value === "Verifying..." || !AppState.lastVerifiedAccountKey) {
+         safeHolderInput.value = "";
+      }
     }
   }
 }
@@ -883,7 +913,6 @@ function setupAccountVerification({
 
   if (!accountInput || !bankSelect || !holderInput) return null;
 
-  // Strictly prevent manual input for account holder names
   holderInput.readOnly = true;
   holderInput.style.background = "#f8f9fa";
 
@@ -898,32 +927,28 @@ function setupAccountVerification({
     1200,
   );
 
-  // Reduced auto-verify triggers to prevent excessive Paystack calls.
-  // Auto verify only when account input becomes stable (10 digits) OR when user changes bank.
-  let lastAutoVerifiedAccountKey = null;
+  const mapKey = accountInputId;
 
   accountInput.addEventListener("input", () => {
-    // Only clear the displayed name if the current key is changing.
-    // This prevents flicker/races from clearing a recently verified name.
     const v = accountInput.value.trim();
     const selectedOption = bankSelect?.options[bankSelect.selectedIndex];
     const bankCode = selectedOption?.dataset?.code;
-    const key = `${bankCode || ""}:${v}`;
+    const key = `${bankCode || "none"}:${v}`;
 
-    // If we started typing a different key, clear prior UI.
-    if (key !== AppState.lastVerifiedAccountKey) {
+    // Only clear if the user actually changed the digits/bank to something unverified
+    if (key !== AppState.lastVerifiedAccountKey && !AppState.pendingAccountVerificationKey) {
       holderInput.value = "";
       holderInput.style.background = "#f8f9fa";
     }
 
     if (v.length === 10 && /^\d{10}$/.test(v)) {
-      const currentKey = `${bankCode || ""}:${v}`;
+      const currentKey = `${bankCode || "none"}:${v}`;
       if (
         currentKey &&
-        currentKey !== lastAutoVerifiedAccountKey &&
+        currentKey !== _autoVerifiedKeys.get(mapKey) &&
         currentKey !== AppState.pendingAccountVerificationKey
       ) {
-        lastAutoVerifiedAccountKey = currentKey; // lock auto-trigger for this key
+        _autoVerifiedKeys.set(mapKey, currentKey);
         verifyCurrentAccount();
       }
     } else {
@@ -936,8 +961,10 @@ function setupAccountVerification({
   });
 
   bankSelect.addEventListener("change", () => {
-    holderInput.value = "";
-    holderInput.style.background = "#f8f9fa";
+    if (!AppState.lastVerifiedAccountKey) {
+        holderInput.value = "";
+        holderInput.style.background = "#f8f9fa";
+    }
     setAccountVerificationStatus(
       statusEl,
       "Enter 10-digit account number to auto-verify",
@@ -948,13 +975,13 @@ function setupAccountVerification({
     if (v.length === 10 && /^\d{10}$/.test(v)) {
       const selectedOption = bankSelect?.options[bankSelect.selectedIndex];
       const bankCode = selectedOption?.dataset?.code;
-      const key = `${bankCode || ""}:${v}`;
+      const key = `${bankCode || "none"}:${v}`;
       if (
         key &&
-        key !== lastAutoVerifiedAccountKey &&
+        key !== _autoVerifiedKeys.get(mapKey) &&
         key !== AppState.pendingAccountVerificationKey
       ) {
-        lastAutoVerifiedAccountKey = key; // lock auto-trigger for this key
+        _autoVerifiedKeys.set(mapKey, key);
         verifyCurrentAccount();
       }
     }
@@ -970,6 +997,26 @@ async function verifyBankAccountManual() {
   const statusEl = document.getElementById("verificationStatus");
   const btn = document.getElementById("verifyAccountBtn");
   showLoading(btn); // Button spinner
+  try {
+    return await verifyBankAccountFields({
+      accountInput,
+      bankSelect,
+      holderInput,
+      statusEl,
+      manual: true,
+    });
+  } finally {
+    hideLoading(btn);
+  }
+}
+
+async function verifyNewEmployeeBankManual() {
+  const accountInput = document.getElementById("newEmployeeAccountNumber");
+  const bankSelect = document.getElementById("newEmployeeBankName");
+  const holderInput = document.getElementById("newEmployeeAccountHolder");
+  const statusEl = document.getElementById("newEmployeeVerificationStatus");
+  const btn = document.getElementById("verifyNewEmployeeBtn"); // Assuming this ID for the new button
+  showLoading(btn);
   try {
     return await verifyBankAccountFields({
       accountInput,
@@ -1020,6 +1067,12 @@ function setupBankVerification() {
     bankSelectId: "newEmployeeBankName",
     holderInputId: "newEmployeeAccountHolder",
     statusId: "newEmployeeVerificationStatus",
+  });
+  setupAccountVerification({
+    accountInputId: "signupAccountNumber",
+    bankSelectId: "signupBankName",
+    holderInputId: "signupAccountHolder",
+    statusId: "signupVerificationStatus",
   });
 }
 
@@ -1329,31 +1382,6 @@ async function loadCurrentUser() {
   }
 }
 
-// async function loadCurrentUser() {
-//   try {
-//     const res = await apiRequest("/current-user/");
-//     if (!res.success) throw new Error(res.message);
-
-//     AppState.currentUser = res.data;
-
-//     const el = document.getElementById("currentUserName"); 
-//     if (el) {
-//       el.textContent = `Welcome, ${escapeHtml(AppState.currentUser.name || AppState.currentUser.username)}`;
-//     }
-
-//     // Clear the inside of the dropdown text if it exists
-//     const dropdownName = document.querySelector(
-//       ".dropbtn-custom span.user-label",
-//     );
-//     if (dropdownName) dropdownName.style.display = "none";
-
-//     applyRolePermissions(AppState.currentUser);
-//     return true;
-//   } catch (err) {
-//     console.error("Failed to load user:", err); // No hideLoading here, as it's part of bootstrap
-//     return false;
-//   }
-// }
 
 // ==========================================
 // AUTHORIZATION
@@ -5109,6 +5137,7 @@ const EXPOSED_FUNCTIONS = {
 
   // Bank verification
   verifyBankAccountManual,
+  verifyNewEmployeeBankManual,
   setupBankVerification,
   clearBankCache,
   setupBankCodeTracking,

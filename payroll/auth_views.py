@@ -59,9 +59,9 @@ def _validate_bank_account_name(full_name, account_number, bank_code, submitted_
     verified_name = (result.get('data') or {}).get('account_name') if isinstance(result.get('data'), dict) else None
 
     # PRODUCTION: if Paystack is rate-limiting, don't block employee creation.
-    # We'll update account_holder asynchronously.
+    # Fallback to the submitted holder name so registration can proceed.
     if result.get('error_code') == 'rate_limited':
-        return None, None
+        return submitted_holder, None
 
     if not result.get('status') or not verified_name:
         return None, result.get('message') or 'Bank account could not be verified with Paystack.'

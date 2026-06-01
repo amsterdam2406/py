@@ -169,147 +169,117 @@ class PaystackAPI:
         lock_key = f"paystack:resolve:lock:{bank_code}:{account_number}"
         lock_ttl_seconds = 8  # short lock window; should exceed typical network RTT
 
-        # Small in-process retry to handle transient 429 bursts (do not loop forever)
-        max_attempts = 2  # first try + one fast retry
-        backoff_seconds = 0.75
-        last_rate_limited_result = None
+        try:
+            # Acquire lock if possible
+            acquired = cache.add(lock_key, True, lock_ttl_seconds)
+            if not acquired:
+                # Someone else is resolving; re-check caches before hitting Paystack.
+                cached_now = cache.get(cache_key)
+                if cached_now:
+                    return cached_now
+                cached_rate_limit_now = cache.get(rate_limit_key)
+                if cached_rate_limit_now:
+                    return cached_rate_limit_now
 
-        for attempt in range(max_attempts):
+                # Wait a moment for the in-flight request to populate cache.
+                try:
+                    import time
+                    time.sleep(0.4)
+                except Exception:
+                    pass
+
+                # Still re-check again; if still missing, fall through to attempt resolution.
+                cached_now = cache.get(cache_key)
+                if cached_now:
+                    return cached_now
+                cached_rate_limit_now = cache.get(rate_limit_key)
+                if cached_rate_limit_now:
+                    return cached_rate_limit_now
+
+            response = requests.get(url, headers=self.headers, timeout=10)
+            response.raise_for_status()
+            result = response.json()
+
+            # Cache successful resolutions (prefer when account_name exists)
+            if result.get('status'):
+                ttl = 60 * 60 * 24  # 24h
+                if result.get('data', {}).get('account_name'):
+                    cache.set(cache_key, result, ttl)
+                else:
+                    # Still cache for a short time to avoid repeating lookups
+                    cache.set(cache_key, result, 60 * 30)  # 30 minutes
+
+            # Success: clear lock early so future calls can proceed immediately.
             try:
-                # Acquire lock if possible
-                acquired = cache.add(lock_key, True, lock_ttl_seconds)
-                if not acquired:
-                    # Someone else is resolving; re-check caches before hitting Paystack.
-                    cached_now = cache.get(cache_key)
-                    if cached_now:
-                        return cached_now
-                    cached_rate_limit_now = cache.get(rate_limit_key)
-                    if cached_rate_limit_now:
-                        return cached_rate_limit_now
+                cache.delete(lock_key)
+            except Exception:
+                pass
 
-                    # Wait a moment for the in-flight request to populate cache.
-                    try:
-                        import time
-                        time.sleep(0.4)
-                    except Exception:
-                        pass
+            return result
 
-                    # Still re-check again; if still missing, fall through to attempt resolution.
-                    cached_now = cache.get(cache_key)
-                    if cached_now:
-                        return cached_now
-                    cached_rate_limit_now = cache.get(rate_limit_key)
-                    if cached_rate_limit_now:
-                        return cached_rate_limit_now
+        except requests.exceptions.HTTPError as e:
+            try:
+                # Release lock early on HTTP errors.
+                cache.delete(lock_key)
+            except Exception:
+                pass
+            status_code = getattr(e.response, 'status_code', None)
+            if status_code == 429:
+                retry_after = e.response.headers.get('Retry-After') if e.response is not None else None
 
-                response = requests.get(url, headers=self.headers, timeout=10)
-                response.raise_for_status()
-                result = response.json()
+                logger.warning(
+                    "Paystack verify account rate limited bank_code=%s account_last4=%s retry_after=%s",
+                    bank_code, str(account_number)[-4:], retry_after
+                )
 
-                # Cache successful resolutions (prefer when account_name exists)
-                if result.get('status'):
-                    ttl = 60 * 60 * 24  # 24h
-                    if result.get('data', {}).get('account_name'):
-                        cache.set(cache_key, result, ttl)
-                    else:
-                        # Still cache for a short time to avoid repeating lookups
-                        cache.set(cache_key, result, 60 * 30)  # 30 minutes
-
-                # Success: clear lock early so future calls can proceed immediately.
-                try:
-                    cache.delete(lock_key)
-                except Exception:
-                    pass
-
-                return result
-
-            except requests.exceptions.HTTPError as e:
-                try:
-                    # Release lock early on HTTP errors.
-                    cache.delete(lock_key)
-                except Exception:
-                    pass
-                status_code = getattr(e.response, 'status_code', None)
-                if status_code == 429:
-                    retry_after = None
-                    if e.response is not None:
-                        retry_after = e.response.headers.get('Retry-After')
-
-                    logger.warning(
-                        "Paystack verify account rate limited (attempt=%s/%s) bank_code=%s account_last4=%s retry_after=%s",
-                        attempt + 1, max_attempts, bank_code, str(account_number)[-4:], retry_after
-                    )
-
-                    # Build structured rate-limited payload
-                    rate_limited_result = {
-                        'status': False,
-                        'message': 'Account verification temporarily rate limited. Please wait and try again.',
-                        'error_code': 'rate_limited',
-                        'retry_after': retry_after or 300,
-                        'data': None,
-                    }
-                    last_rate_limited_result = rate_limited_result
-
-                    # Cache cooldown so subsequent calls immediately return without hitting Paystack
-                    try:
-                        cooldown = int(retry_after or 300)
-                    except (TypeError, ValueError):
-                        cooldown = 300
-
-                    # But keep it bounded: if Retry-After is huge, cap so UX still works.
-                    cooldown = min(cooldown, 900)  # max 15 minutes
-                    cache.set(rate_limit_key, rate_limited_result, cooldown)
-
-                    # Retry only if we still have attempts left
-                    if attempt < max_attempts - 1:
-                        # fast retry; prefer small sleep not full retry_after
-                        # (cached cooldown above prevents hammering on second call)
-                        try:
-                            import time
-                            time.sleep(backoff_seconds)
-                        except Exception:
-                            pass
-                        continue
-
-                    return rate_limited_result
-
-                # Other HTTP errors (400, 422, etc.)
-                return {
+                # Build structured rate-limited payload
+                rate_limited_result = {
                     'status': False,
-                    'message': f'Account verification failed: {str(e)}',
-                    'data': None
+                    'message': 'Account verification temporarily rate limited. Please wait and try again.',
+                    'error_code': 'rate_limited',
+                    'retry_after': retry_after or 30,
+                    'data': None,
                 }
 
-            except requests.exceptions.RequestException as e:
-                # network/timeout
+                # Cache cooldown so subsequent calls immediately return without hitting Paystack
                 try:
-                    cache.delete(lock_key)
-                except Exception:
-                    pass
+                    cooldown = int(retry_after or 30)
+                except (TypeError, ValueError):
+                    cooldown = 30
 
-                logger.error(f"Paystack verify account network error: {e}")
-                return {
-                    'status': False,
-                    'message': f'Network error during verification: {str(e)}',
-                    'data': None
-                }
+                # But keep it bounded: if Retry-After is huge, cap so UX still works.
+                cooldown = min(cooldown, 900)  # max 15 minutes
+                cache.set(rate_limit_key, rate_limited_result, cooldown)
+                return rate_limited_result
 
-            except Exception as e:
-                try:
-                    cache.delete(lock_key)
-                except Exception:
-                    pass
+            return {
+                'status': False,
+                'message': f'Account verification failed: {str(e)}',
+                'data': None
+            }
 
-                logger.error(f"Paystack verify account unexpected error: {e}")
-                return {'status': False, 'message': str(e), 'data': None}
+        except requests.exceptions.RequestException as e:
+            # network/timeout
+            try:
+                cache.delete(lock_key)
+            except Exception:
+                pass
 
-        return last_rate_limited_result or {
-            'status': False,
-            'message': 'Account verification failed after retries.',
-            'error_code': 'retry_failed',
-            'retry_after': 60,
-            'data': None,
-        }
+            logger.error(f"Paystack verify account network error: {e}")
+            return {
+                'status': False,
+                'message': f'Network error during verification: {str(e)}',
+                'data': None
+            }
+
+        except Exception as e:
+            try:
+                cache.delete(lock_key)
+            except Exception:
+                pass
+
+            logger.error(f"Paystack verify account unexpected error: {e}")
+            return {'status': False, 'message': str(e), 'data': None}
 
 
     def get_transfer_balance(self):

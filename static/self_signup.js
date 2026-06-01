@@ -53,6 +53,8 @@
       e.preventDefault();
 
       const getVal = (id) => (document.getElementById(id)?.value || '').trim();
+      const bankSelect = document.getElementById('signupBankName');
+      const bankCode = bankSelect?.options[bankSelect.selectedIndex]?.dataset?.code || '';
 
       const payload = {
         username: getVal('signupUsername'),
@@ -65,7 +67,7 @@
         phone: getVal('signupPhone'),
 
         bank_name: getVal('signupBankName'),
-        bank_code: getVal('signupBankCode'),
+        bank_code: bankCode,
         account_number: getVal('signupAccountNumber'),
         account_holder: getVal('signupAccountHolder')
       };
@@ -77,6 +79,13 @@
         alert(`Missing required bank/account fields: ${missingBank.join(', ')}`);
         return;
       }
+
+      // Block submission if account holder was not verified/finalized
+      if ((payload.account_holder || '').trim().length < 2) {
+        alert('Account holder name is required and must be verified. Please verify the account first.');
+        return;
+      }
+
 
       try {
         const res = await fetch('/self-register/', {

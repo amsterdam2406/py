@@ -36,19 +36,29 @@ def _verify_employee_bank_account(full_name, account_number, bank_code, submitte
 
     employee_tokens = _name_tokens(full_name)
     account_tokens = _name_tokens(verified_name)
+
     if len(employee_tokens) < 2:
         raise serializers.ValidationError({
             'name': 'Enter at least two names. One name cannot create an employee account.'
         })
+
+    # Employee name must match (at least) the verified holder.
     if len(employee_tokens.intersection(account_tokens)) < 2:
         raise serializers.ValidationError({
             'account_holder': f'Employee name must match verified account holder name: {verified_name}'
         })
-    if submitted_holder and _name_tokens(submitted_holder) != account_tokens:
-        raise serializers.ValidationError({
-            'account_holder': 'Account holder name must come from Paystack verification.'
-        })
+
+    # Always store the Paystack-verified account holder name.
+    # If the client submitted a holder name, we keep mismatch protection
+    # to prevent accidental bypasses, but we never trust it for storage.
+    if submitted_holder is not None and submitted_holder != '':
+        if _name_tokens(submitted_holder) != account_tokens:
+            raise serializers.ValidationError({
+                'account_holder': 'Account holder name must match Paystack verification.'
+            })
+
     return verified_name
+
 
 
 class UserSerializer(serializers.ModelSerializer):

@@ -35,7 +35,10 @@ urlpatterns = [
     # Paystack
     path('paystack/banks/', views.paystack_banks, name='paystack_banks'),
     path('paystack/verify-account/', views.PaystackVerifyAccountView.as_view(), name='paystack_verify_account'),
+    path('paystack/resolve-account/', views.paystack_resolve_account, name='paystack_resolve_account'),
+
     path('paystack/clear-cache/', views.clear_paystack_cache, name='clear_paystack_cache'),
+
     
     # WEBHOOK: Only ONE endpoint. Paystack should point here:
     path('paystack/webhook/', views.paystack_webhook, name='paystack_webhook'),
