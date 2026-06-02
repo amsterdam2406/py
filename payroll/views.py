@@ -2739,7 +2739,7 @@ class DownloadLogViewSet(viewsets.ReadOnlyModelViewSet):
     search_fields = ['employee__name', 'employee__employee_id', 'reference', 'user__username']
 
 @api_view(['GET'])
-@permission_classes([IsAdmin])
+@permission_classes([IsAuthenticated])
 def system_health_check(request):
     """
     Monitor Paystack connectivity and pending transfer counts.
@@ -2753,7 +2753,8 @@ def system_health_check(request):
     
     health_data = {
         'status': 'healthy',
-        'timestamp': timezone.now(),
+        'environment': 'Production' if not settings.DEBUG else 'Development',
+        'timestamp': timezone.now().isoformat(),
         'paystack_connection': 'unknown',
         'queue': {
             'pending_transfers': pending_count,

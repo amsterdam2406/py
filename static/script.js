@@ -2919,13 +2919,22 @@ async function initiateIndividualPayment(empId) {
     const reference = res.data.reference;
     AppState.currentPaymentReference = reference;
 
-    // INTERNAL OTP FLOW REMOVED -> just poll until webhook/verify marks completed/failed
     showToast(res.data.message || "Payment initiated", "success");
     await loadPaymentHistory();
     await updateDashboardStats();
     startPaymentStatusPolling(reference);
   } catch (err) {
-    showToast(err.message || "Failed to initiate payment", "error");
+    console.error("Payment Initiation Detailed Error:", err);
+    
+    let errorMsg = err.message || "Failed to initiate payment";
+    // Surface specific Paystack instructions if provided by backend
+    if (err.data && err.data.message) {
+        errorMsg = `Paystack Error: ${err.data.message}`;
+        if (err.data.meta && err.data.meta.nextStep) {
+            errorMsg += `. Suggestion: ${err.data.meta.nextStep}`;
+        }
+    }
+    showToast(errorMsg, "error", 8000);
   } finally {
     hideLoading(
       document.querySelector(

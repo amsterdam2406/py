@@ -110,6 +110,8 @@ class PaystackAPI:
             "bank_code": bank_code,
             "currency": "NGN"
         }
+        logger.info(f"[Paystack {self.env_label}] Creating recipient: {name}, Acc: {account_number}, Bank: {bank_code}")
+        
         try:
             response = requests.post(url, json=payload, headers=self.headers, timeout=20)
             response.raise_for_status()
@@ -312,8 +314,12 @@ class PaystackAPI:
             "reference": reference,
             "reason": reason,
         }
+        
+        logger.info(f"[Paystack {self.env_label}] Initiating transfer to {recipient_code}. Amount: {amount/100} NGN. Ref: {reference}")
+
         try:
             response = requests.post(url, json=payload, headers=self.headers, timeout=30)
+            logger.debug(f"[Paystack {self.env_label}] Raw Response: {response.text}")
             response.raise_for_status()
             return response.json()
         except requests.exceptions.RequestException as e:
