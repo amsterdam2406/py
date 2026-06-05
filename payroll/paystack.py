@@ -34,7 +34,10 @@ class PaystackAPI:
         self.secret_key = getattr(settings, 'PAYSTACK_SECRET_KEY', '')
         if not self.secret_key:
             logger.error("PAYSTACK_SECRET_KEY not configured in settings!")
-            # Don't raise here to avoid import crashes, but log clearly
+        
+        # ADD THIS LINE:
+        self.env_label = "LIVE" if self.secret_key.startswith('sk_live_') else "TEST"
+        
         self.headers = {
             'Authorization': f'Bearer {self.secret_key}',
             'Content-Type': 'application/json'

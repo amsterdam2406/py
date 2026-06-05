@@ -88,3 +88,28 @@ class CanViewAndEditCompany(BasePermission):
             user.role == 'admin' or
             getattr(user, 'is_company_admin', False)
         )
+        
+class IsHRAdmin(BasePermission):
+    """Only superuser / is_hr_admin can access HR functions."""
+    def has_permission(self, request, view):
+        user = request.user
+        if not user.is_authenticated:
+            return False
+        return (
+            user.is_superuser or
+            getattr(user, 'is_hr_admin', False)
+        )
+
+
+class IsRequestAdmin(BasePermission):
+    """Only superuser / is_request_admin can manage employee requests."""
+    def has_permission(self, request, view):
+        user = request.user
+        if not user.is_authenticated:
+            return False
+        return (
+            user.is_superuser or
+            getattr(user, 'is_request_admin', False)
+        )
+        
+        

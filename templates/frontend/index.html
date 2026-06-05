@@ -412,6 +412,35 @@
                         </div>
                     </section>
 
+                    <!-- Paystack OTP Modal -->
+                    <div id="paystackOtpModal" class="modal" style="display: none;">
+                        <div class="modal-content">
+                            <div class="modal-header">
+                                <h3>Paystack Transfer Authorization</h3>
+                                <button type="button" class="close-btn" onclick="closeModal('paystackOtpModal')">&times;</button>
+                            </div>
+                            <div class="modal-body">
+                                <p id="paystackOtpMessage">
+                                    Paystack has sent an OTP to your registered business phone/email. 
+                                    Please enter it below to complete the transfer.
+                                </p>
+                                <form id="paystackOtpForm">
+                                    <div class="form-group">
+                                        <label for="paystackOtpInput">Enter OTP:</label>
+                                        <input type="text" id="paystackOtpInput" maxlength="6" placeholder="123456" 
+                                            class="form-control" autocomplete="one-time-code" inputmode="numeric">
+                                    </div>
+                                    <div class="form-actions">
+                                        <button type="submit" class="btn btn-primary">Verify & Complete Transfer</button>
+                                        <button type="button" class="btn btn-secondary" onclick="closeModal('paystackOtpModal')">Cancel</button>
+                                    </div>
+                                </form>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- otp end -->
+
                     <!-- Payslips Section -->
                     <section class="content-section" id="payslips">
                         <div class="section-header">

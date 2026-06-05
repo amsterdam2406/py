@@ -9,7 +9,18 @@ from django.conf import settings
 from django.core.exceptions import ValidationError
 from django.utils.translation import gettext_lazy as _
 from .managers import UserManager
-from simple_history.models import HistoricalRecords
+import importlib
+
+if importlib.util.find_spec("simple_history.models") is not None:
+    HistoricalRecords = importlib.import_module("simple_history.models").HistoricalRecords
+else:
+    class HistoricalRecords:
+        """Fallback stub when django-simple-history is unavailable."""
+        def __init__(self, *args, **kwargs):
+            pass
+        def contribute_to_class(self, cls, name, **kwargs):
+            pass
+
 from datetime import timedelta
 from django.utils import timezone
 from django.contrib.auth.hashers import make_password, check_password

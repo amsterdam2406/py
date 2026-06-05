@@ -522,8 +522,23 @@ async function apiRequest(url, options = {}) {
           message: "Auth failed",
         };
       }
+      if (options._authRetried) {
+        const errorData = await response.json().catch(() => ({}));
+        logout();
+        return {
+          success: false,
+          status: response.status,
+          data: errorData,
+          message:
+            errorData.detail ||
+            errorData.error ||
+            errorData.message ||
+            "Session expired. Please login again.",
+        };
+      }
+
       const refreshed = await refreshAccessToken();
-      if (refreshed) return apiRequest(url, options);
+      if (refreshed) return apiRequest(url, { ...options, _authRetried: true });
       logout();
       showToast("Session expired. Please login again.", "error");
       return {
@@ -1423,33 +1438,41 @@ function applyRolePermissions(user) {
     {
       id: "admin-controls-employee",
       allowed:
-        user.is_superuser || user.role === "admin" || user.is_employee_admin,
+        user.is_superuser || user.is_employee_admin,
     },
     {
       id: "admin-controls-sacked",
       allowed:
-        user.is_superuser || user.role === "admin" || user.is_employee_admin,
+        user.is_superuser || user.is_employee_admin,
     },
     {
       id: "admin-controls-companies",
       allowed:
-        user.is_superuser || user.role === "admin" || user.is_company_admin,
+        user.is_superuser || user.is_company_admin,
     },
-    { id: "accounts", allowed: user.is_superuser || user.role === "admin" },
+    { id: "accounts", allowed: user.is_superuser },
     {
       id: "requests-admin-view",
       allowed:
-        user.is_superuser || user.role === "admin" || user.is_request_admin,
+        user.is_superuser || user.is_request_admin,
     },
     {
       id: "payments",
       allowed:
-        user.is_superuser || user.role === "admin" || user.is_payment_admin,
+        user.is_superuser || user.is_payment_admin,
     },
     {
       id: "deductions-section",
       allowed:
-        user.is_superuser || user.role === "admin" || user.is_deduction_admin,
+        user.is_superuser || user.is_deduction_admin,
+    },
+    {
+      id: "hr-admin-view",  // Add this ID to your HTML for HR-specific sections
+      allowed: user.is_superuser || user.is_hr_admin,
+    },
+    {
+      id: "payment-approval-buttons",  // For approve/reject payment buttons
+      allowed: user.is_superuser || user.is_hr_admin,
     },
   ];
 
@@ -2715,9 +2738,7 @@ async function loadPaymentHistory() {
   const tbody =
     AppState.elements.historyTbody ||
     document.getElementById("historyTableBody");
-  if (!tbody) {
-    return;
-  } // No spinner here, caller manages
+  if (!tbody) return;
 
   try {
     const res = await apiRequest("/api/payments/");
@@ -2725,6 +2746,16 @@ async function loadPaymentHistory() {
 
     const list = res.data?.results || res.data || [];
     AppState.payments = list;
+    
+    // AUTO-SHOW OTP MODAL if any payment needs Paystack OTP
+    const pendingOtpPayment = list.find(p => p.status === 'pending_paystack_otp');
+    if (pendingOtpPayment && !document.getElementById('paystackOtpModal')?.classList.contains('active')) {
+        showPaystackOtpModal(
+            pendingOtpPayment.transaction_reference, 
+            pendingOtpPayment.paystack_transfer_code || ''
+        );
+    }
+    
     tbody.innerHTML = "";
 
     if (!list.length) {
@@ -2901,47 +2932,148 @@ async function startBulkPaymentPolling(
 }
 
 async function initiateIndividualPayment(empId) {
-  try {
-    const btn = document.querySelector(
-      `button[onclick="initiateIndividualPayment('${empId}')"]`,
+    // PRE-CHECK: Prevent calling API if already paid this month
+    const currentMonth = new Date().toISOString().slice(0, 7);
+    const existingPayment = AppState.payments?.find(p => 
+        String(p.employee) === String(empId) && p.payment_month === currentMonth
     );
-    showLoading(btn);
-    const res = await apiRequest("/api/payments/initiate_payment/", {
-      method: "POST",
-      body: { employee_id: empId },
-    });
-
-    if (!res.success) {
-      throw new Error(res.message || "Failed to initiate payment");
-    }
-
-    // Store the reference for polling
-    const reference = res.data.reference;
-    AppState.currentPaymentReference = reference;
-
-    showToast(res.data.message || "Payment initiated", "success");
-    await loadPaymentHistory();
-    await updateDashboardStats();
-    startPaymentStatusPolling(reference);
-  } catch (err) {
-    console.error("Payment Initiation Detailed Error:", err);
     
-    let errorMsg = err.message || "Failed to initiate payment";
-    // Surface specific Paystack instructions if provided by backend
-    if (err.data && err.data.message) {
-        errorMsg = `Paystack Error: ${err.data.message}`;
-        if (err.data.meta && err.data.meta.nextStep) {
-            errorMsg += `. Suggestion: ${err.data.meta.nextStep}`;
+    if (existingPayment) {
+        const status = existingPayment.status;
+        if (status === 'completed') {
+            showToast("Salary already paid for this month", "info");
+            return;
+        }
+        if (status === 'processing' || status === 'pending' || status === 'pending_hr') {
+            showToast(`Payment already ${status}. Checking status...`, "info");
+            startPaymentStatusPolling(existingPayment.transaction_reference);
+            return;
+        }
+        // Only allow retry if failed
+        if (status !== 'failed') {
+            showToast(`Payment already initiated (${status}). Cannot re-initiate.`, "warning");
+            return;
         }
     }
-    showToast(errorMsg, "error", 8000);
-  } finally {
-    hideLoading(
-      document.querySelector(
-        `button[onclick="initiateIndividualPayment('${empId}')"]`,
-      ),
-    );
-  }
+    try {
+        const btn = document.querySelector(
+            `button[onclick="initiateIndividualPayment('${empId}')"]`,
+        );
+        showLoading(btn);
+        
+        const res = await apiRequest("/api/payments/initiate_payment/", {
+            method: "POST",
+            body: { employee_id: empId },
+        });
+
+        if (!res.success) {
+            throw new Error(res.message || "Failed to initiate payment");
+        }
+
+        const reference = res.data.reference;
+        AppState.currentPaymentReference = reference;
+
+        // Check if Paystack OTP is required immediately
+        if (res.data.paystack_otp_required) {
+            showPaystackOtpModal(reference, res.data.paystack_transfer_code);
+            hideLoading(btn);
+            return;
+        }
+
+        showToast(res.data.message || "Payment initiated", "success");
+        await loadPaymentHistory();
+        await updateDashboardStats();
+        startPaymentStatusPolling(reference);
+        
+    } catch (err) {
+        console.error("Payment Initiation Detailed Error:", err);
+        let errorMsg = err.message || "Failed to initiate payment";
+        if (err.data && err.data.message) {
+            errorMsg = `Paystack Error: ${err.data.message}`;
+        }
+        showToast(errorMsg, "error", 8000);
+    } finally {
+        hideLoading(
+            document.querySelector(
+                `button[onclick="initiateIndividualPayment('${empId}')"]`,
+            ),
+        );
+    }
+}
+
+// NEW: Show Paystack OTP modal
+function showPaystackOtpModal(reference, transferCode) {
+    // GUARD: Don't show modal without a valid reference
+    if (!reference) {
+        console.warn("showPaystackOtpModal called without reference");
+        return;
+    }
+    
+    const modal = document.getElementById("paystackOtpModal");
+    const input = document.getElementById("paystackOtpInput");
+    
+    if (modal) {
+        AppState.currentPaymentReference = reference;
+        AppState.currentPaystackTransferCode = transferCode;
+        if (input) input.value = "";
+        modal.style.display = "flex";
+        modal.classList.add("active");
+    }
+}
+
+// NEW: Handle Paystack OTP submission
+async function submitPaystackOtp(e) {
+    e.preventDefault();
+    
+    const otp = document.getElementById("paystackOtpInput")?.value.trim();
+    const reference = AppState.currentPaymentReference;
+    
+    if (!otp || !reference) {
+        showToast("Please enter the OTP", "warning");
+        return;
+    }
+    
+    const btn = e.target.querySelector('button[type="submit"]');
+    
+    try {
+        showLoading(btn);
+        
+        const res = await apiRequest("/api/payments/verify_payment/", {
+            method: "POST",
+            body: {
+                reference: reference,
+                paystack_otp: otp
+            }
+        });
+        
+        if (res.success) {
+            if (res.data?.payment_completed) {
+                showToast("Payment completed successfully!", "success");
+                closeModal("paystackOtpModal");
+                await loadPaymentHistory();
+                await updateDashboardStats();
+            } else if (res.data?.payment_processing) {
+                showToast("Payment is processing. You'll be notified when complete.", "info");
+                closeModal("paystackOtpModal");
+                startPaymentStatusPolling(reference);
+            }
+        } else {
+            // Check if we can retry OTP
+            if (res.data?.paystack_otp_required) {
+                showToast(res.message || "Invalid OTP. Please try again.", "error");
+                // Clear input for retry
+                document.getElementById("paystackOtpInput").value = "";
+                document.getElementById("paystackOtpInput").focus();
+            } else {
+                showToast(res.message || "OTP verification failed", "error");
+                closeModal("paystackOtpModal");
+            }
+        }
+    } catch (err) {
+        showToast(err.message || "Failed to verify OTP", "error");
+    } finally {
+        hideLoading(btn);
+    }
 }
 
 async function startPaymentStatusPolling(
@@ -3654,6 +3786,26 @@ function populateBulkTable() {
   updateBulkTotal();
 }
 
+async function cancelStuckPayment(paymentId) {
+    if (!confirm("Cancel this stuck payment? You can retry afterwards.")) return;
+    
+    try {
+        showLoading();
+        const res = await apiRequest(`/api/payments/${paymentId}/`, {
+            method: "DELETE"
+        });
+        if (res.success) {
+            showToast("Payment cancelled. You can now retry.", "success");
+            await loadPaymentHistory();
+            populatePaymentsTable();
+        }
+    } catch (err) {
+        showToast(err.message || "Failed to cancel payment", "error");
+    } finally {
+        hideLoading();
+    }
+}
+
 function populatePaymentsTable() {
   const tbody = document.getElementById("paymentsTableBody");
   if (!tbody) return;
@@ -3669,10 +3821,9 @@ function populatePaymentsTable() {
   const activeEmployees = AppState.employees.filter(
     (e) => e.status === "active" || !e.status,
   );
-  const currentMonth = new Date().toISOString().slice(0, 7); // YYYY-MM
+  const currentMonth = new Date().toISOString().slice(0, 7);
 
   activeEmployees.forEach((emp) => {
-    // Find if a payment exists for this employee in the current month
     const monthlyPayment = (AppState.payments || []).find(
       (p) => idsMatch(p.employee, emp.id) && p.payment_month === currentMonth,
     );
@@ -3691,21 +3842,32 @@ function populatePaymentsTable() {
     let actionBtn = `<button type="button" class="btn btn-sm btn-success" onclick="initiateIndividualPayment('${emp.id}')">Pay</button>`;
 
     if (monthlyPayment) {
-      const s = monthlyPayment.status;
-      const statusClass =
-        s === "completed"
-          ? "bg-success"
-          : s === "failed"
-            ? "bg-danger"
-            : "bg-warning";
-      statusBadge = `<span class="badge ${statusClass}">${s.toUpperCase()}</span>`;
+        const s = monthlyPayment.status;
+        const statusClass = 
+            s === "completed" ? "bg-success" : 
+            s === "failed" ? "bg-danger" : 
+            s === "pending_paystack_otp" ? "bg-warning" : "bg-warning";
+        statusBadge = `<span class="badge ${statusClass}">${s.replace(/_/g, ' ').toUpperCase()}</span>`;
 
-      if (s === "completed") {
-        actionBtn =
-          '<span class="text-success"><i class="fas fa-check-circle"></i> Paid</span>';
-      } else if (s === "processing" || s === "pending") {
-        actionBtn = `<button type="button" class="btn btn-sm btn-info" onclick="retryPayment('${monthlyPayment.transaction_reference}')">Checking...</button>`;
-      }
+        if (s === "completed") {
+            actionBtn = '<span class="text-success"><i class="fas fa-check-circle"></i> Paid</span>';
+        } else if (s === "pending_paystack_otp") {
+            // FIXED: Single block with BOTH Enter OTP and Cancel buttons
+            actionBtn = `
+                <button type="button" class="btn btn-sm btn-warning" onclick="showPaystackOtpModal('${monthlyPayment.transaction_reference}', '${monthlyPayment.paystack_transfer_code || ''}')">
+                    <i class="fas fa-key"></i> Enter OTP
+                </button>
+                <button type="button" class="btn btn-sm btn-danger" onclick="cancelStuckPayment('${monthlyPayment.id}')">
+                    <i class="fas fa-times"></i> Cancel
+                </button>
+            `;
+        } else if (s === "processing" || s === "pending" || s === "pending_hr") {
+            actionBtn = `<button type="button" class="btn btn-sm btn-info" onclick="retryPayment('${monthlyPayment.transaction_reference}')">Checking...</button>`;
+        } else if (s === "failed") {
+            actionBtn = `<button type="button" class="btn btn-sm btn-warning" onclick="initiateIndividualPayment('${emp.id}')">Retry</button>`;
+        } else {
+            actionBtn = `<button type="button" class="btn btn-sm btn-secondary" disabled title="Payment already initiated for this month">Pay</button>`;
+        }
     }
 
     const row = document.createElement("tr");
@@ -3963,43 +4125,28 @@ async function generatePayslip() {
   }
 }
 
-async function downloadPayslip(html, employeeId, month) {
-  // Server-side PDF generation (ReportLab) to avoid blank/white PDF issues
-  // caused by client-side html2pdf/html2canvas rendering.
-  try {
-    // Re-use existing export password modal if present.
-    // If password is missing, backend will reject with 401.
-    const exportPassword = document.getElementById("exportPassword")?.value || "";
-
-    const tokenRes = await apiRequest(
-      "/api/payments/request_payslip_export/",
-      {
-        method: "POST",
-        body: {
-          password: exportPassword,
-          employee_id: employeeId,
-          month: month,
-        },
-      },
-    );
-
-    if (!tokenRes.success) throw new Error(tokenRes.message);
-
-    const downloadToken = tokenRes.data?.token;
-    if (!downloadToken) throw new Error("Missing export token");
-
-    await triggerSecureDownload(
-      "/api/payments/download_payslip_pdf/",
-      downloadToken,
-      `payslip_${employeeId}_${month}.pdf`,
-      { method: "GET" },
-    );
-
-    showToast("Payslip downloaded successfully", "success");
-  } catch (err) {
-    console.error("Payslip download error:", err);
-    showToast("Failed to download payslip PDF: " + (err.message || err), "error");
+function downloadPayslip(html, employeeId, month) {
+  const modal = document.getElementById("exportPasswordModal");
+  if (!modal) {
+    showToast("Export password modal is missing", "error");
+    return;
   }
+
+  modal.dataset.exportType = "payslip";
+  modal.dataset.employeeId = employeeId;
+  modal.dataset.month = month;
+  delete modal.dataset.paymentId;
+
+  const usernameInput = document.getElementById("exportUsername");
+  if (usernameInput) usernameInput.value = AppState.currentUser?.username || "";
+
+  const passwordInput = document.getElementById("exportPassword");
+  if (passwordInput) passwordInput.value = "";
+
+  const prompt = document.getElementById("exportPasswordPrompt");
+  if (prompt) prompt.textContent = "Enter password to download payslip PDF";
+
+  openModal("exportPasswordModal");
 }
 
 // function downloadPayslip(html, employeeId, month) {
@@ -4071,10 +4218,17 @@ function exportAllEmployees() {
   const modal = document.getElementById("exportPasswordModal");
   if (modal) {
     modal.dataset.exportType = "employees";
+    delete modal.dataset.employeeId;
+    delete modal.dataset.month;
+    delete modal.dataset.paymentId;
     // Populate username for password manager autofill
     const usernameInput = document.getElementById("exportUsername");
     if (usernameInput)
       usernameInput.value = AppState.currentUser?.username || "";
+    const passwordInput = document.getElementById("exportPassword");
+    if (passwordInput) passwordInput.value = "";
+    const prompt = document.getElementById("exportPasswordPrompt");
+    if (prompt) prompt.textContent = "Enter password to export employee data";
   }
   openModal("exportPasswordModal");
 }
@@ -4083,10 +4237,17 @@ function exportPaymentHistory() {
   const modal = document.getElementById("exportPasswordModal");
   if (modal) {
     modal.dataset.exportType = "payments";
+    delete modal.dataset.employeeId;
+    delete modal.dataset.month;
+    delete modal.dataset.paymentId;
     // Populate username for password manager autofill
     const usernameInput = document.getElementById("exportUsername");
     if (usernameInput)
       usernameInput.value = AppState.currentUser?.username || "";
+    const passwordInput = document.getElementById("exportPassword");
+    if (passwordInput) passwordInput.value = "";
+    const prompt = document.getElementById("exportPasswordPrompt");
+    if (prompt) prompt.textContent = "Enter password to export payment history";
   }
   openModal("exportPasswordModal");
 }
@@ -4592,6 +4753,8 @@ function setupEventListeners() {
     { id: "requestForm", handler: handleCreateRequest },
     // FIX: Ensure export confirm submit actually triggers confirmExport()
     { id: "exportPasswordForm", handler: confirmExport },
+    // Add to the forms array in setupEventListeners
+    { id: "paystackOtpForm", handler: submitPaystackOtp },
   ];
   document.getElementById("selfSignupForm")?.addEventListener("submit", handleSelfSignup);
 
@@ -4960,8 +5123,26 @@ function showLoginPage() {
 }
 
 function showDashboardPage() {
-  document.getElementById("loginPage")?.classList.add("hidden");
-  document.getElementById("dashboardPage")?.classList.remove("hidden");
+    document.getElementById("loginPage")?.classList.add("hidden");
+    document.getElementById("dashboardPage")?.classList.remove("hidden");
+    
+    // CLEAR stale payment state to prevent any modal popups
+    AppState.currentPaymentReference = null;
+    AppState.currentPaystackTransferCode = null;
+    if (AppState.paymentPollInterval) {
+        clearInterval(AppState.paymentPollInterval);
+        AppState.paymentPollInterval = null;
+    }
+    if (AppState.bulkPollInterval) {
+        clearInterval(AppState.bulkPollInterval);
+        AppState.bulkPollInterval = null;
+    }
+    
+    // Force-close all modals
+    document.querySelectorAll('.modal').forEach(modal => {
+        modal.classList.remove("active");
+        modal.style.display = "none";
+    });
 }
 
 // ==========================================
@@ -5083,7 +5264,6 @@ const EXPOSED_FUNCTIONS = {
   submitForgotPassword,
   handleResetPassword,
   handleRegistration,
-
   handleChangePassword, // ADDED
   // Navigation
   showSection, // Fixed: Ensure showSection is exposed
@@ -5130,12 +5310,19 @@ const EXPOSED_FUNCTIONS = {
   // Payments
   loadPaymentHistory,
   initiateIndividualPayment,
+  // updateinitiateIndividualPayment,
+  updatePaymentPreview, // Fixed: Ensure updatePaymentPreview is exposed
+  // handleIndividualpayment,
   handleIndividualPaymentSubmit,
   processBulkPayment,
-  updatePaymentPreview,
   updateBulkTotal, // Fixed: Ensure updateBulkTotal is exposed
   toggleAllBulkPayments,
   populateBulkTable,
+  showPaystackOtpModal,
+  submitPaystackOtp,
+  retryPayment, // Fixed: Ensure retryPayment is exposed
+  cancelStuckPayment,
+
 
   // Payslips
   generatePayslip,
@@ -5256,36 +5443,55 @@ function exportReceipt(paymentId) {
   if (modal) {
     modal.dataset.exportType = "receipt";
     modal.dataset.paymentId = paymentId;
+    delete modal.dataset.employeeId;
+    delete modal.dataset.month;
     const usernameInput = document.getElementById("exportUsername");
     if (usernameInput)
       usernameInput.value = AppState.currentUser?.username || "";
+    const passwordInput = document.getElementById("exportPassword");
+    if (passwordInput) passwordInput.value = "";
+    const prompt = document.getElementById("exportPasswordPrompt");
+    if (prompt) prompt.textContent = "Enter password to download receipt PDF";
   }
   openModal("exportPasswordModal"); // Fixed: Open export password modal
 }
 
 async function retryPayment(transactionReferenceOrId) {
   try {
-    if (!transactionReferenceOrId) {
-      showToast("Missing payment reference for retry", "error");
-      return;
-    }
-    const res = await apiRequest(
-      `/payments/verify-payment/${transactionReferenceOrId}/`,
-    );
-    if (res.success && res.data?.payment_status) {
-      await loadPaymentHistory();
-      populatePaymentsTable();
-      updateDashboardStats();
-      showToast(
-        `Payment status: ${res.data.payment_status}`,
-        res.data.payment_status === "completed" ? "success" : "info",
-        4000,
-      );
-      return;
-    }
-    showToast("Retry not available yet. Please try again later.", "warning");
+      if (!transactionReferenceOrId) {
+          showToast("Missing payment reference for retry", "error");
+          return;
+      }
+      
+      // Use the GET polling endpoint (verify_payment_status)
+      const res = await apiRequest(`/payments/verify-payment/${transactionReferenceOrId}/`);
+      
+      if (res.success && res.data?.payment_status) {
+          const status = res.data.payment_status;
+          
+          // Check for pending_paystack_otp status
+          if (status === "pending_paystack_otp") {
+              // Need to get transfer_code - call the POST verify_payment to get full details
+              // OR use the payment data we already have in AppState.payments
+              const payment = AppState.payments.find(p => 
+                  p.transaction_reference === transactionReferenceOrId
+              );
+              const transferCode = payment?.paystack_transfer_code || '';
+              
+              showPaystackOtpModal(transactionReferenceOrId, transferCode);
+              showToast("Paystack OTP required. Please enter the OTP.", "warning");
+              return;
+          }
+          
+          await loadPaymentHistory();
+          populatePaymentsTable();
+          updateDashboardStats();
+          showToast(`Payment status: ${status}`, status === "completed" ? "success" : "info", 4000);
+          return;
+      }
+      showToast("Retry not available yet. Please try again later.", "warning");
   } catch (err) {
-    console.error("retryPayment error:", err);
-    showToast(err.message || "Retry failed", "error");
+      console.error("retryPayment error:", err);
+      showToast(err.message || "Retry failed", "error");
   }
 }
