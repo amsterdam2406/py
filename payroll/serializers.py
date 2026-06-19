@@ -1,10 +1,14 @@
 import logging
+from decimal import Decimal
 
 from rest_framework import serializers
 from .models import (
     Employee, Attendance, Deduction, Payment, Company, 
-    SackedEmployee, Notification, OTP, ExportToken, EmployeeRequest, EmployeeRequestAttachment
+    SackedEmployee, Notification, OTP, ExportToken, EmployeeRequest, EmployeeRequestAttachment,
+    EmployeeSalaryAdjustment, EmployeeBalanceLedger, ClientMonthlyPayment
 )
+from .services import compute_total_salary_payable
+
 from django.contrib.auth import get_user_model
 import base64
 from django.core.files.base import ContentFile
@@ -123,6 +127,7 @@ class UserSerializer(serializers.ModelSerializer):
 class EmployeeSerializer(serializers.ModelSerializer):
     applied_deductions = serializers.SerializerMethodField(read_only=True)
     net_salary = serializers.SerializerMethodField(read_only=True)
+    salary_breakdown = serializers.SerializerMethodField(read_only=True)
     user = serializers.PrimaryKeyRelatedField(
         queryset=User.objects.all(), required=False, allow_null=True, write_only=True
     )
@@ -135,7 +140,7 @@ class EmployeeSerializer(serializers.ModelSerializer):
             'id', 'user', 'employee_id', 'name', 'type', 'location',
             'salary', 'phone', 'email', 'bank_name', 'bank_code', 'account_number',
             'account_holder', 'status', 'join_date', 'id_sequence', 'applied_deductions',
-            'net_salary', 'created_at', 'updated_at'
+            'net_salary', 'salary_breakdown', 'created_at', 'updated_at'
         ]
         read_only_fields = ['employee_id', 'id_sequence', 'created_at', 'updated_at', 'id', 'join_date']
 
@@ -150,8 +155,15 @@ class EmployeeSerializer(serializers.ModelSerializer):
         return float(total)
 
     def get_net_salary(self, obj):
-        return float(obj.salary) - self.get_applied_deductions(obj)
-    
+        month_key = timezone.now().strftime('%Y-%m')
+        salary_data = compute_total_salary_payable(obj, month_key)
+        return float(salary_data['total_payable'])
+
+    def get_salary_breakdown(self, obj):
+        month_key = timezone.now().strftime('%Y-%m')
+        salary_data = compute_total_salary_payable(obj, month_key)
+        return {k: float(v) if isinstance(v, Decimal) else v for k, v in salary_data.items()}
+
     def validate_name(self, value):
         if not value or not value.strip():
             raise serializers.ValidationError("Employee name cannot be empty")
@@ -434,7 +446,14 @@ class PaymentSerializer(serializers.ModelSerializer):
             'payment_month',
             'base_salary',
             'total_deductions',
+            'iou_amount',
+            'bonus_amount',
             'net_amount',
+            'is_partial',
+            'amount_paid',
+            'remaining_balance',
+            'previous_balance',
+            'partial_reason',
             'payment_method',
             'transaction_reference',
             'paystack_reference',
@@ -588,3 +607,80 @@ class EmployeeRequestSerializer(serializers.ModelSerializer):
         model = EmployeeRequest
         fields = '__all__'
         read_only_fields = ['id', 'employee', 'status', 'decline_reason', 'action_by', 'created_at', 'updated_at', 'attachments']
+
+
+class EmployeeSalaryAdjustmentSerializer(serializers.ModelSerializer):
+    employee_name = serializers.CharField(source='employee.name', read_only=True)
+    employee_id = serializers.CharField(source='employee.employee_id', read_only=True)
+    added_by_name = serializers.CharField(source='added_by.username', read_only=True)
+    approved_by_name = serializers.CharField(source='approved_by.username', read_only=True)
+
+    class Meta:
+        model = EmployeeSalaryAdjustment
+        fields = [
+            'id',
+            'employee',
+            'employee_id',
+            'employee_name',
+            'type',
+            'amount',
+            'reason',
+            'date_added',
+            'status',
+            'declined_reason',
+            'approved_at',
+            'approved_by',
+            'approved_by_name',
+            'added_by',
+            'added_by_name',
+            'created_at',
+            'updated_at',
+        ]
+        read_only_fields = ['id', 'status', 'declined_reason', 'approved_at', 'approved_by', 'added_by', 'created_at', 'updated_at']
+
+    def validate_amount(self, value):
+        if value <= 0:
+            raise serializers.ValidationError('Amount must be greater than 0')
+        return value
+
+    def validate(self, attrs):
+        employee = attrs.get('employee')
+        if not employee:
+            raise serializers.ValidationError({'employee': 'Employee is required'})
+        return attrs
+
+
+class EmployeeBalanceLedgerSerializer(serializers.ModelSerializer):
+    employee_name = serializers.CharField(source='employee.name', read_only=True)
+    employee_id = serializers.CharField(source='employee.employee_id', read_only=True)
+
+    class Meta:
+        model = EmployeeBalanceLedger
+        fields = ['id', 'employee', 'employee_id', 'employee_name', 'month_key', 'outstanding_balance', 'created_at', 'updated_at']
+        read_only_fields = ['id', 'employee', 'outstanding_balance', 'created_at', 'updated_at']
+
+
+class ClientMonthlyPaymentSerializer(serializers.ModelSerializer):
+    client_name = serializers.CharField(source='client.name', read_only=True)
+    class Meta:
+        model = ClientMonthlyPayment
+        fields = [
+            'id',
+            'client',
+            'client_name',
+            'month_key',
+            'status',
+            'amount_paid',
+            'outstanding_balance',
+            'payment_date',
+            'notes',
+            'increment',
+            'created_at',
+            'updated_at',
+        ]
+        read_only_fields = ['id', 'outstanding_balance', 'created_at', 'updated_at']
+
+    def validate_amount_paid(self, value):
+        if value < 0:
+            raise serializers.ValidationError('Amount paid cannot be negative')
+        return value

@@ -11,6 +11,7 @@ from .models import (
     OTP, ExportToken, EmployeeRequest, EmployeeRequestAttachment,
     DownloadLog, AuditLog
 )
+from django.utils.html import format_html
 
 # ─────────────────────────────────────────────
 # USER ADMIN (SAFE DELETE)
@@ -22,21 +23,20 @@ class EmailAuthenticationForm(AuthenticationForm):
         label="Email / Username",
         widget=forms.TextInput(attrs={"autofocus": True})
     )
-    
+
     def clean(self):
         username = self.cleaned_data.get('username')
         password = self.cleaned_data.get('password')
-        
+
         if username and password:
-            # Try to find user by email first, then username
             try:
                 user = User.objects.get(email__iexact=username)
-                username = user.username  # Get the actual username for authenticate()
+                username = user.username
             except User.DoesNotExist:
-                pass  # Keep original username
-            
+                pass
+
             self.cleaned_data['username'] = username
-            
+
         return super().clean()
 
 class CustomAdminSite(admin.AdminSite):
@@ -44,10 +44,7 @@ class CustomAdminSite(admin.AdminSite):
     site_header = "Fotasco Payroll Administration"
     site_title = "Fotasco Admin"
 
-# Use custom admin site
 admin_site = CustomAdminSite(name='customadmin')
-
-# Or override the default admin login form
 admin.site.login_form = EmailAuthenticationForm
 admin.site.site_header = "Fotasco Payroll Administration"
 admin.site.site_title = "Fotasco Admin"
@@ -60,7 +57,7 @@ class UserAdmin(BaseUserAdmin):
     list_filter = ['role', 'is_superuser', 'is_active']
     search_fields = ['username', 'email', 'first_name', 'last_name']
     ordering = ['-date_joined']
-    
+
     fieldsets = BaseUserAdmin.fieldsets + (
         ('Role & Permissions', {
             'fields': (
@@ -73,13 +70,7 @@ class UserAdmin(BaseUserAdmin):
         }),
         ('Contact Info', {'fields': ('phone',)}),
     )
-    
-    #  ('Custom Fields', {'fields': ('role', 'phone', 'is_company_admin', 'is_notification_admin', 
-                                    #    'is_payment_admin', 'is_deduction_admin', 'is_employee_admin',
-                                    #    'is_request_admin', 'is_hr_admin')}),
-    # )
-    
-    # Prevent bulk delete — handle one at a time with proper error messaging
+
     actions = ['safe_delete_users']
 
     @admin.action(description='Safely delete selected users (handles related data)')
@@ -88,70 +79,66 @@ class UserAdmin(BaseUserAdmin):
         deleted = 0
         skipped = 0
         errors = []
-        
+
         for user in queryset:
             try:
                 employee = user.employee_profile
             except Employee.DoesNotExist:
                 employee = None
-                
+
             try:
+                related_issues = []  # FIX: Initialize the variable
+
                 if employee:
-                    related_issues = []
-                    
-                count = user.processed_payments.count()
-                if count:
-                    related_issues.append(f"{count}  processed payments")
-                
-                if user.hr_approved_payments.exists():
-                    related_issues.append(f"{user.hr_approved_payments.count()} HR-approved payments")
-                
-                if user.hr_approved_deductions.exists():
-                    related_issues.append(f"{user.hr_approved_deductions.count()} HR-approved deductions")
-                
-                if user.handled_requests.exists():
-                    related_issues.append(f"{user.handled_requests.count()} handled requests")
-                
-                if user.termination_records.exists():
-                    related_issues.append(f"{user.termination_records.count()} termination records")
-                
+                    count = user.processed_payments.count()
+                    if count:
+                        related_issues.append(f"{count} processed payments")
+
+                    if user.hr_approved_payments.exists():
+                        related_issues.append(f"{user.hr_approved_payments.count()} HR-approved payments")
+
+                    if user.hr_approved_deductions.exists():
+                        related_issues.append(f"{user.hr_approved_deductions.count()} HR-approved deductions")
+
+                    if user.handled_requests.exists():
+                        related_issues.append(f"{user.handled_requests.count()} handled requests")
+
+                    if user.termination_records.exists():
+                        related_issues.append(f"{user.termination_records.count()} termination records")
+
                 if user.notifications.exists():
                     related_issues.append(f"{user.notifications.count()} notifications")
-                
-                if user.auditlog_set.exists():
+
+                if hasattr(user, 'auditlog_set') and user.auditlog_set.exists():
                     related_issues.append(f"{user.auditlog_set.count()} audit logs")
-                
-                if user.download_logs.exists():
+
+                if hasattr(user, 'download_logs') and user.download_logs.exists():
                     related_issues.append(f"{user.download_logs.count()} download logs")
-                
-                if user.export_tokens.exists():
+
+                if hasattr(user, 'export_tokens') and user.export_tokens.exists():
                     related_issues.append(f"{user.export_tokens.count()} export tokens")
-                
+
                 if related_issues:
-                    # Option 1: Cascade delete everything (DANGEROUS — use with caution)
-                    # Option 2: Skip and warn (SAFER — default)
                     errors.append(f"Skipped {user.username}: linked to {', '.join(related_issues)}")
                     skipped += 1
                     continue
-                
-                # If no blocking relations, delete
+
                 user.delete()
                 deleted += 1
-                
+
             except (ProtectedError, RestrictedError) as e:
                 errors.append(f"Cannot delete {user.username}: protected by database constraint")
                 skipped += 1
             except Exception as e:
                 errors.append(f"Error deleting {user.username}: {str(e)}")
                 skipped += 1
-        
-        # Report results
+
         if deleted:
             self.message_user(request, f"Successfully deleted {deleted} user(s).", messages.SUCCESS)
         if skipped:
             self.message_user(request, f"Skipped {skipped} user(s) due to related data.", messages.WARNING)
         if errors:
-            for error in errors[:5]:  # Show first 5 errors
+            for error in errors[:5]:
                 self.message_user(request, error, messages.ERROR)
             if len(errors) > 5:
                 self.message_user(request, f"... and {len(errors) - 5} more issues.", messages.ERROR)
@@ -159,7 +146,6 @@ class UserAdmin(BaseUserAdmin):
     def delete_model(self, request, obj):
         """Override single delete to catch errors gracefully."""
         try:
-            # Check for Employee profile first — most common blocker
             if hasattr(obj, 'employee_profile'):
                 self.message_user(
                     request,
@@ -168,10 +154,10 @@ class UserAdmin(BaseUserAdmin):
                     messages.ERROR
                 )
                 return
-            
+
             obj.delete()
             self.message_user(request, f"User {obj.username} deleted successfully.", messages.SUCCESS)
-            
+
         except (ProtectedError, RestrictedError) as e:
             self.message_user(
                 request,
@@ -187,7 +173,6 @@ class UserAdmin(BaseUserAdmin):
             )
 
     def has_delete_permission(self, request, obj=None):
-        """Allow delete permission — we'll handle errors in delete_model."""
         return True
 
 
@@ -200,7 +185,7 @@ class EmployeeAdmin(admin.ModelAdmin):
     list_filter = ['type', 'status', 'location', 'join_date']
     search_fields = ['employee_id', 'name', 'email', 'phone']
     date_hierarchy = 'join_date'
-    readonly_fields = ['employee_id', 'id_sequence', 'created_at', 'updated_at', 'user']  # Employee ID should not be editable after creation
+    readonly_fields = ['employee_id', 'id_sequence', 'created_at', 'updated_at', 'user']
     actions = ['clear_verification_cache']
 
     @admin.action(description='Clear Paystack verification cache for selected employees')
@@ -219,11 +204,23 @@ class EmployeeAdmin(admin.ModelAdmin):
 # ─────────────────────────────────────────────
 @admin.register(Attendance)
 class AttendanceAdmin(admin.ModelAdmin):
-    list_display = ['employee', 'date', 'status', 'clock_in', 'clock_out', 'clock_method']
+    list_display = ['employee', 'date', 'status', 'clock_in', 'clock_out', 'clock_method', 'clock_in_photo_url', 'clock_out_photo_url']
     list_filter = ['status', 'clock_method', 'date']
     autocomplete_fields = ['employee']
     search_fields = ['employee__name', 'employee__employee_id']
     date_hierarchy = 'date'
+    
+    def clock_in_photo_url(self, obj):
+        if obj.clock_in_photo:
+            return format_html('<a href="{}" target="_blank">View</a>', obj.clock_in_photo.url)
+        return "-"
+    clock_in_photo_url.short_description = 'Clock In Photo'
+
+    def clock_out_photo_url(self, obj):
+        if obj.clock_out_photo:
+            return format_html('<a href="{}" target="_blank">View</a>', obj.clock_out_photo.url)
+        return "-"
+    clock_out_photo_url.short_description = 'Clock Out Photo'
 
 
 # ─────────────────────────────────────────────
@@ -245,9 +242,9 @@ class DeductionAdmin(admin.ModelAdmin):
 class PaymentAdmin(admin.ModelAdmin):
     list_display = [
         'employee', 'transaction_reference', 'net_amount', 'status', 'hr_approved',
-        'payment_month', 'payment_method', 'payment_date'
+        'payment_month', 'payment_method', 'payment_date', 'is_partial'
     ]
-    list_filter = ['status', 'hr_approved', 'payment_month', 'payment_method', 'payment_date']
+    list_filter = ['status', 'hr_approved', 'payment_month', 'payment_method', 'payment_date', 'is_partial']
     search_fields = ['employee__name', 'employee__employee_id', 'transaction_reference']
     list_select_related = ['employee']
     date_hierarchy = 'payment_date'
@@ -303,7 +300,7 @@ class OTPAdmin(admin.ModelAdmin):
     list_filter = ['is_used']
     search_fields = ['email', 'reference']
     date_hierarchy = 'created_at'
-    
+
     def masked_code(self, obj):
         return f"***{obj.code[-2:]}"
 
@@ -336,8 +333,14 @@ class EmployeeRequestAdmin(admin.ModelAdmin):
 # ─────────────────────────────────────────────
 @admin.register(EmployeeRequestAttachment)
 class EmployeeRequestAttachmentAdmin(admin.ModelAdmin):
-    list_display = ['request', 'file_type', 'file']
+    list_display = ['request', 'file_type', 'file', 'file_url', 'created_at']
     list_filter = ['file_type']
+    
+    def file_url(self, obj):
+        if obj.file:
+            return format_html('<a href="{}" target="_blank">Download</a>', obj.file.url)
+        return "-"
+    file_url.short_description = 'File'
 
 # ─────────────────────────────────────────────
 # DOWNLOAD LOG ADMIN
@@ -373,6 +376,3 @@ class AuditLogAdmin(admin.ModelAdmin):
 
     def has_delete_permission(self, request, obj=None):
         return False
-        
-        
-        

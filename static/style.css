@@ -398,6 +398,47 @@ body {
     flex-wrap: wrap;
 }
 
+/* Loading skeleton for async per-employee breakdowns */
+.skeleton {
+    position: relative;
+    overflow: hidden;
+    background: #e9ecef;
+    border-radius: 4px;
+}
+.skeleton::after {
+    content: "";
+    position: absolute;
+    top: 0;
+    left: -150px;
+    width: 150px;
+    height: 100%;
+    background: linear-gradient(90deg, rgba(255,255,255,0), rgba(255,255,255,0.6), rgba(255,255,255,0));
+    animation: shimmer 1.2s infinite;
+}
+@keyframes shimmer {
+    0% { left: -150px; }
+    100% { left: 100%; }
+}
+
+/* Details row styling inside bulk modal */
+.bulk-details-row td {
+    background: #fafafa;
+    padding: 12px;
+    border-top: 1px solid var(--border-color);
+}
+.bulk-details-table {
+    width: 100%;
+    border-collapse: collapse;
+}
+.bulk-details-table td {
+    padding: 6px 8px;
+    border-bottom: 1px dashed var(--border-color);
+}
+.bulk-details-header {
+    font-weight: 600;
+    margin-bottom: 8px;
+}
+
 /* Tables */
 .table-responsive {
     background: white;
@@ -494,6 +535,17 @@ body {
     background: rgba(0, 0, 0, 0.5);
     backdrop-filter: blur(5px);
     overflow-y: auto;
+}
+
+/* FIX: Paystack OTP modal must always be above any other modals/overlays */
+#paystackOtpModal.modal {
+    position: fixed;
+    z-index: 20000 !important;
+    background-color: rgba(0, 0, 0, 0.55);
+}
+
+#paystackOtpModal.modal.active {
+    display: flex !important;
 }
 
 .modal.active {

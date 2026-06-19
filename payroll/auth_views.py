@@ -1,5 +1,6 @@
 import logging
 from decimal import Decimal
+from django.http import JsonResponse
 from rest_framework import status
 from rest_framework.decorators import api_view, permission_classes, throttle_classes
 from rest_framework.permissions import IsAuthenticated, AllowAny
@@ -15,7 +16,7 @@ from django.utils.encoding import force_bytes, force_str
 from django.contrib.auth.tokens import default_token_generator
 from django.core.exceptions import ValidationError
 from .models import Employee, User, Notification
-from .utils import log_audit
+from .utils import get_client_ip, log_audit
 from django.contrib.auth.password_validation import validate_password
 from django.core.mail import send_mail
 from django.template.loader import render_to_string
@@ -31,6 +32,9 @@ from .serializers import UserSerializer
 from .throttles import LoginThrottle
 from .paystack import PaystackAPI
 import re
+from django.contrib.auth.hashers import check_password
+from .utils import log_audit
+
 
 
 logger = logging.getLogger(__name__)
@@ -166,6 +170,12 @@ def login_view(request):
                 status=status.HTTP_403_FORBIDDEN
             )
 
+        # In login failure block:
+        if not user or not check_password (password, user.password):
+            log_audit(None, f"Failed login attempt for username: {username}", request, 
+                    extra={'ip': get_client_ip(request), 'username': username})
+            return Response({'error': 'Invalid credentials'}, status=401)
+
         logger.info(f"Successful login for {username} from {request.META.get('REMOTE_ADDR')}")
             
         # This is where 500s often happen if SimpleJWT migrations aren't run
@@ -200,14 +210,22 @@ def login_view(request):
 
         # Also set refresh token in HttpOnly cookie as backup
         response.set_cookie(
+            'access_token', 
+            str(refresh.access_token),
+            httponly=True, 
+            secure=not settings.DEBUG, 
+            samesite='Lax',
+            max_age=900  # 15 min
+        )
+        response.set_cookie(
             key='refresh_token',
             value=str(refresh),
             httponly=True,
             secure=not settings.DEBUG,
             samesite='Lax',
-            path="/"
+            path="/",
+            max_age=604800
         )
-
         return response
 
     except Exception as e:
@@ -440,7 +458,7 @@ def register_view(request):
             status=status.HTTP_400_BAD_REQUEST
         )
 @api_view(['POST'])
-@permission_classes([IsAuthenticated])
+@permission_classes([AllowAny])
 def logout_view(request):
     try:
         refresh_token = request.COOKIES.get('refresh_token') or request.data.get('refresh')

@@ -1,15 +1,15 @@
-from django.db.models import Count
 from django.core.validators import FileExtensionValidator
-from django.core.validators import RegexValidator, MinValueValidator, MaxValueValidator
+from django.core.validators import RegexValidator, MinValueValidator
 from django.db import models, IntegrityError, transaction
 from django.contrib.auth.models import AbstractUser
-from django.utils.crypto import constant_time_compare
 import uuid
 from django.conf import settings
 from django.core.exceptions import ValidationError
 from django.utils.translation import gettext_lazy as _
 from .managers import UserManager
 import importlib
+from django.contrib.auth.hashers import make_password, check_password
+from simple_history.models import HistoricalRecords
 
 if importlib.util.find_spec("simple_history.models") is not None:
     HistoricalRecords = importlib.import_module("simple_history.models").HistoricalRecords
@@ -23,8 +23,6 @@ else:
 
 from datetime import timedelta
 from django.utils import timezone
-from django.contrib.auth.hashers import make_password, check_password
-
 
 # ==================== BASE / UTILITIES ====================
 
@@ -183,6 +181,22 @@ class FileAttachmentType(models.TextChoices):
     """File attachment type choices."""
     PROOF = 'proof', _('Proof')
     RECEIPT = 'receipt', _('Receipt')
+
+
+class AdjustmentType(models.TextChoices):
+    """Salary adjustment types."""
+    BONUS = 'bonus', _('Bonus')
+    EXTRA_PAYMENT = 'extra_payment', _('Extra Payment')
+    LOAN = 'loan', _('Loan')
+    SALARY_ADVANCE = 'salary_advance', _('Salary Advance')
+    IOU = 'iou', _('IOU')
+
+
+class ClientPaymentStatus(models.TextChoices):
+    """Company payment status choices."""
+    PAID = 'paid', _('Fully Paid')
+    PARTIAL = 'partial', _('Partially Paid')
+    UNPAID = 'unpaid', _('Pending')
 
 
 # ==================== QUERYSET MANAGERS ====================
@@ -694,6 +708,32 @@ class Attendance(TimeStampedModel):
         self.full_clean()
         super().save(*args, **kwargs)
 
+    @property
+    def calculated_profit(self):
+        """Calculate profit for the company without mutating fields."""
+        assigned_count = self.assigned_guards.count()
+        effective_count = max(assigned_count, self.guards_count)
+        total_payment = effective_count * self.payment_per_guard
+        return self.payment_to_us - total_payment
+
+    @transaction.atomic
+    def reactivate(self):
+        """Reactivate a terminated company."""
+        if self.status != CompanyStatus.TERMINATED:
+            raise ValueError(_(f"Cannot reactivate company with status: {self.status}"))
+        self.status = CompanyStatus.REACTIVATED
+        self.termination_reason = None
+        self.save(update_fields=['status', 'termination_reason', 'updated_at'])
+
+    @transaction.atomic
+    def terminate(self, reason=''):
+        """Terminate an active or reactivated company."""
+        if self.status not in [CompanyStatus.ACTIVE, CompanyStatus.REACTIVATED]:
+            raise ValueError(_(f"Cannot terminate company with status: {self.status}"))
+        self.status = CompanyStatus.TERMINATED
+        self.termination_reason = reason
+        self.save(update_fields=['status', 'termination_reason', 'updated_at'])
+
 
 # ==================== DEDUCTION ====================
 
@@ -867,7 +907,10 @@ class Payment(TimeStampedModel):
         blank=True,
         validators=[MinValueValidator(0)]
     )
+    bonus_amount = models.DecimalField(max_digits=10, decimal_places=2, default=0)
+    iou_amount = models.DecimalField(max_digits=10, decimal_places=2, default=0)
     is_partial = models.BooleanField(default=False)
+    partial_reason = models.TextField(blank=True, null=True)
     payment_method = models.CharField(max_length=20, choices=PaymentMethod.choices)
     transaction_reference = models.CharField(max_length=100, unique=True, db_index=True)
     paystack_reference = models.CharField(max_length=100, blank=True, null=True)
@@ -876,6 +919,16 @@ class Payment(TimeStampedModel):
         max_length=25,
         choices=PaymentStatus.choices,
         default=PaymentStatus.PENDING
+    )
+    remaining_balance = models.DecimalField(
+        max_digits=10, decimal_places=2, default=0,
+        validators=[MinValueValidator(0)],
+        help_text="Remaining balance for partial payments"
+    )
+    previous_balance = models.DecimalField(
+        max_digits=10, decimal_places=2, default=0,
+        validators=[MinValueValidator(0)],
+        help_text="Previous month's unpaid balance"
     )
     hr_approved = models.BooleanField(default=False, editable=False)
     hr_approved_by = models.ForeignKey(
@@ -905,16 +958,12 @@ class Payment(TimeStampedModel):
             ('approve_payment', _('Can approve payment')),
             ('process_salary', _('Can process salary')),
         ]
-        indexes = [
-            models.Index(fields=['employee', 'payment_month'], name='pay_emp_month_idx'),
-            models.Index(fields=['status', 'payment_date'], name='pay_status_date_idx'),
-            models.Index(fields=['transaction_reference'], name='pay_ref_idx'),
-        ]
+        # Removed unique_payment_per_employee_per_month constraint to allow multiple partial payments in a month.
+        # The logic for preventing duplicate *active* payments is now handled in the initiate_payment view.
+        # A new migration will be generated to remove this constraint from the database.
         constraints = [
-            models.UniqueConstraint(
-                fields=['employee', 'payment_month'],
-                name='unique_payment_per_employee_per_month'
-            ),
+            # models.UniqueConstraint(fields=('employee', 'payment_month'), name='unique_payment_per_employee_per_month'),
+            
             models.CheckConstraint(
                 check=models.Q(base_salary__gte=0),
                 name='payment_base_salary_positive'
@@ -961,6 +1010,16 @@ class Payment(TimeStampedModel):
             raise ValidationError({"net_amount": _("Net amount is required.")})
         if self.net_amount is not None and self.net_amount < 0:
             raise ValidationError({"net_amount": _("Net amount cannot be negative.")})
+    
+    @classmethod
+    def get_previous_balance(cls, employee_id, current_month):
+        try:
+            prev = cls.objects.filter(
+                employee_id=employee_id, payment_month__lt=current_month, is_partial=True
+            ).order_by('-payment_month').first()
+            return prev.remaining_balance if prev else 0
+        except:
+            return 0
 
 
     def save(self, *args, **kwargs):
@@ -968,6 +1027,8 @@ class Payment(TimeStampedModel):
         if not self.pk and self.net_amount is None:
             self.net_amount = self.base_salary - self.total_deductions
         self.full_clean()
+        if not self.is_partial and self.amount_paid is None:
+            self.remaining_balance = 0
         super().save(*args, **kwargs)
 
     @transaction.atomic
@@ -1130,7 +1191,42 @@ class Company(TimeStampedModel, SoftDeleteModel):
 
     def save(self, *args, **kwargs):
         self.full_clean()
+        # Profit = Amount Received From Client - Total Amount Paid To Guards/Employees/Staff
+        # We use the sum of actual base salaries of assigned guards if they exist, 
+        # otherwise fallback to guards_count * payment_per_guard
+        if self.pk and self.assigned_guards.exists():
+            self.total_payment_to_guards = self.assigned_guards.aggregate(total=models.Sum('salary'))['total'] or 0
+        else:
+            effective_count = max(self.assigned_guards.count() if self.pk else 0, self.guards_count)
+            self.total_payment_to_guards = effective_count * self.payment_per_guard
+        
+        self.profit = self.payment_to_us - (self.total_payment_to_guards or 0)
         super().save(*args, **kwargs)
+
+
+# ==================== COMPANY MONTHLY PAYMENTS ====================
+class CompanyMonthlyPayment(TimeStampedModel):
+    """Monthly payment record from a client/company."""
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    company = models.ForeignKey(Company, on_delete=models.CASCADE, related_name='company_monthly_payments')
+    payment_month = models.CharField(max_length=7, help_text='YYYY-MM')
+    amount_due = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+    amount_paid = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+    status = models.CharField(
+        max_length=20, 
+        choices=ClientPaymentStatus.choices, 
+        default=ClientPaymentStatus.UNPAID
+    )
+    payment_date = models.DateField(null=True, blank=True)
+    notes = models.TextField(blank=True, null=True)
+
+    class Meta:
+        db_table = 'company_monthly_payments'
+        ordering = ['-payment_month']
+
+    @property
+    def outstanding(self):
+        return max(0, self.amount_due - (self.amount_paid or 0))
 
     @property
     def calculated_profit(self):
@@ -1526,23 +1622,18 @@ class OTP(TimeStampedModel):
         self.attempt_count += 1
         self.save(update_fields=['attempt_count'])
         return self.attempt_count >= self.max_attempts
-
+    
+    def set_code(self, raw_code):
+        self.code = make_password(raw_code)
+    
     def verify(self, input_code):
-        """Verify OTP code with attempt tracking.
-        Uses constant-time comparison to prevent timing attacks.
-
-        Returns:
-            tuple: (bool success, str status)
-            Status values: 'success', 'expired', 'already_used',
-            'max_attempts_exceeded', 'invalid'
-        """
         if self.has_expired():
             return False, 'expired'
         if self.is_used:
             return False, 'already_used'
         if self.attempt_count >= self.max_attempts:
             return False, 'max_attempts_exceeded'
-        if not constant_time_compare(self.code, input_code):
+        if not check_password(input_code, self.code):  # <-- use check_password
             max_reached = self.increment_attempt()
             return False, 'max_attempts_exceeded' if max_reached else 'invalid'
         self.is_used = True
@@ -1673,3 +1764,161 @@ class AuditLog(TimeStampedModel):
             ip_address=ip_address,
             extra_data=extra_data or {}
         )
+
+
+# ==================== SALARY ADJUSTMENTS / IOUs / LEDGERS ====================
+
+class EmployeeSalaryAdjustment(TimeStampedModel):
+    """IOU / Salary adjustment / advance entry for an employee.
+
+    Multiple entries per employee are allowed (history is preserved).
+    Payroll Admin can approve and carry into ledger-based payroll calculations.
+    """
+
+    STATUS_PENDING = 'pending'
+    STATUS_APPROVED = 'approved'
+    STATUS_DECLINED = 'declined'
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    employee = models.ForeignKey(
+        Employee,
+        on_delete=models.PROTECT,
+        related_name='salary_adjustments'
+    )
+    amount = models.DecimalField(
+        max_digits=10,
+        decimal_places=2,
+        validators=[MinValueValidator(0)],
+    )
+    type = models.CharField(
+        max_length=20,
+        choices=AdjustmentType.choices,
+        default=AdjustmentType.IOU,
+        db_index=True
+    )
+    reason = models.TextField()
+    date_added = models.DateField()
+
+    status = models.CharField(max_length=20, default=STATUS_PENDING)
+    declined_reason = models.TextField(blank=True, null=True)
+
+    approved_at = models.DateTimeField(blank=True, null=True)
+    approved_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='approved_salary_adjustments'
+    )
+    added_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        related_name='added_salary_adjustments',
+        null=True
+    )
+
+    class Meta:
+        db_table = 'employee_salary_adjustments'
+        ordering = ['-date_added', '-created_at']
+        verbose_name = _('Employee Salary Adjustment')
+        verbose_name_plural = _('Employee Salary Adjustments')
+        constraints = [
+            models.UniqueConstraint(
+                fields=('employee', 'date_added', 'reason'),
+                name='unique_adjustment_identity'
+            )
+        ]
+
+    def __str__(self):
+        return f"{self.employee.employee_id} - ₦{self.amount:,.2f} ({self.status})"
+
+
+class EmployeeBalanceLedger(TimeStampedModel):
+    """Monthly ledger to carry forward employee outstanding balances."""
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    employee = models.ForeignKey(
+        Employee,
+        on_delete=models.PROTECT,
+        related_name='balance_ledger'
+    )
+    month_key = models.CharField(max_length=7)
+    outstanding_balance = models.DecimalField(
+        max_digits=10,
+        decimal_places=2,
+        default=0,
+        validators=[MinValueValidator(0)],
+    )
+
+    class Meta:
+        db_table = 'employee_balance_ledgers'
+        ordering = ['-month_key', '-created_at']
+        verbose_name = _('Employee Balance Ledger')
+        verbose_name_plural = _('Employee Balance Ledgers')
+        constraints = [
+            models.UniqueConstraint(
+                fields=('employee', 'month_key'),
+                name='unique_employee_ledger_per_month'
+            )
+        ]
+
+    def __str__(self):
+        return f"{self.employee.employee_id} - {self.month_key}: ₦{self.outstanding_balance:,.2f}"
+
+
+class ClientMonthlyPayment(TimeStampedModel):
+    """Track company/client monthly payment status and carry-forward balances."""
+
+    STATUS_PAID = 'paid'
+    STATUS_PARTIAL = 'partial'
+    STATUS_UNPAID = 'unpaid'
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    client = models.ForeignKey(
+        Company,
+        on_delete=models.PROTECT,
+        related_name='client_monthly_payments'
+    )
+    month_key = models.CharField(max_length=7)
+    status = models.CharField(
+        max_length=20,
+        choices=ClientPaymentStatus.choices,
+        default=ClientPaymentStatus.UNPAID
+    )
+
+    amount_paid = models.DecimalField(
+        max_digits=10,
+        decimal_places=2,
+        default=0,
+        validators=[MinValueValidator(0)],
+    )
+    outstanding_balance = models.DecimalField(
+        max_digits=10,
+        decimal_places=2,
+        default=0,
+        validators=[MinValueValidator(0)],
+    )
+
+    payment_date = models.DateField(blank=True, null=True)
+    notes = models.TextField(blank=True, null=True)
+    increment = models.DecimalField(
+        max_digits=10,
+        decimal_places=2,
+        default=0,
+        validators=[MinValueValidator(0)],
+    )
+
+    class Meta:
+        db_table = 'client_monthly_payments'
+        ordering = ['-month_key', '-created_at']
+        verbose_name = _('Client Monthly Payment')
+        verbose_name_plural = _('Client Monthly Payments')
+        constraints = [
+            models.UniqueConstraint(
+                fields=('client', 'month_key'),
+                name='unique_client_payment_per_month'
+            )
+        ]
+
+    def __str__(self):
+        return f"{self.client.name} - {self.month_key}: {self.status}"

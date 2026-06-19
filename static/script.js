@@ -46,6 +46,11 @@ const AppState = {
   lastVerifiedAccountKey: null,
   globalLoadingCount: 0, // ADDED: Counter for global loading operations
   pendingAccountVerificationKey: null,
+
+  // ADDED: single-flight de-duplication for resolve-account GET
+  // Key: `${bankCode}:${accountNumber}` -> Promise
+  inFlightAccountVerifications: new Map(),
+
   paymentPollInterval: null,
   bulkPollInterval: null,
   isPolling: false,
@@ -63,6 +68,7 @@ const AppState = {
     globalSpinner: null,
   },
 };
+
 
 const _autoVerifiedKeys = new Map();
 
@@ -87,6 +93,14 @@ function getCookie(name) {
   return null;
 }
 
+function debounce(func, wait) {
+    let timeout;
+    return function(...args) {
+        clearTimeout(timeout);
+        timeout = setTimeout(() => func.apply(this, args), wait);
+    };
+}
+
 function escapeHtml(text) {
   if (typeof text !== "string") return text;
   const div = document.createElement("div");
@@ -94,13 +108,77 @@ function escapeHtml(text) {
   return div.innerHTML;
 }
 
-function debounce(fn, delay = CONFIG.DEBOUNCE_DELAY) {
-  let timeout;
-  return (...args) => {
-    clearTimeout(timeout);
-    timeout = setTimeout(() => fn(...args), delay);
-  };
+async function searchEmployees(query) {
+    if (!query || query.length < 2) return;
+    const res = await apiCall(`/api/employees/?search=${encodeURIComponent(query)}`, 'GET');
+    if (res) renderEmployeeTable(res.results || res);
 }
+async function searchPayments(query) {
+    if (!query || query.length < 2) return;
+    const res = await apiCall(`/api/payments/?search=${encodeURIComponent(query)}`, 'GET');
+    if (res) renderPaymentTable(res.results || res);
+}
+async function searchDeductions(query) {
+    if (!query || query.length < 2) return;
+    const res = await apiCall(`/api/deductions/?search=${encodeURIComponent(query)}`, 'GET');
+    if (res) renderDeductionTable(res.results || res);
+}
+async function filterRequests(status) {
+    const res = await apiCall(`/api/requests/?status=${status}`, 'GET');
+    if (res) renderRequestTable(res.results || res);
+}
+async function searchCompanies(query) {
+    if (!query || query.length < 2) return;
+    const res = await apiCall(`/api/companies/?search=${encodeURIComponent(query)}`, 'GET');
+    if (res) renderCompanyTable(res.results || res);
+}
+function togglePartialPayment() {
+    const cb = document.getElementById('isPartialPayment');
+    const input = document.getElementById('customAmount');
+    input.style.display = cb.checked ? 'block' : 'none';
+    input.disabled = !cb.checked;
+}
+
+function togglePartialPaymentIndividual() {
+  const cb = document.getElementById('isPartialPaymentIndividual');
+  const container = document.getElementById('partialFieldsIndividual');
+  const preview = document.getElementById('paymentPreview');
+  if (!container || !cb || !preview) return;
+  
+  container.style.display = cb.checked ? 'block' : 'none';
+
+  const updatePartialCalc = () => {
+    const netPayable = parseFloat(preview.dataset.netSalary || 0);
+    const payNow = parseFloat(document.getElementById('partialAmountIndividual').value || 0);
+    const remaining = Math.max(0, netPayable - payNow);
+    const partialDisplay = document.getElementById('partialAmountDisplay');
+    const remainingDisplay = document.getElementById('remainingBalanceDisplay');
+    if (partialDisplay) partialDisplay.textContent = formatCurrency(payNow);
+    if (remainingDisplay) remainingDisplay.textContent = formatCurrency(remaining);
+  };
+  document.getElementById('partialAmountIndividual').oninput = updatePartialCalc;
+}
+
+function toggleBulkPartial() {
+  const cb = document.getElementById('bulkPartialToggle');
+  const controls = document.getElementById('bulkPartialControls');
+  if (!controls || !cb) return;
+
+  const enabled = cb.checked;
+  controls.style.display = enabled ? 'block' : 'none';
+
+  // Enable/disable per-row inputs
+  document
+    .querySelectorAll('.bulk-partial-amount, .bulk-partial-reason')
+    .forEach((el) => {
+      el.disabled = !enabled;
+      if (!enabled) el.value = '';
+    });
+
+  updateBulkTotal();
+}
+
+
 
 /**
  * Updates the text message in the global loading spinner.
@@ -228,7 +306,21 @@ function showLoading(btn, spinnerEl) {
       spinnerEl ||
       AppState.elements.globalSpinner ||
       document.getElementById("globalSpinner");
-    if (spinner) spinner.classList.remove("hidden");
+    if (spinner) {
+      // Ensure we have a reference to the global spinner element
+      AppState.elements.globalSpinner = spinner;
+      // Increment global loading counter when showing spinner without a button
+      if (!btn) {
+        AppState.globalLoadingCount = (AppState.globalLoadingCount || 0) + 1;
+        console.debug(`Spinner shown. Count: ${AppState.globalLoadingCount}`);
+      }
+      spinner.classList.remove("hidden");
+    }
+    // Ensure individual element spinners (if any) are shown
+    if (btn && btn.id) {
+        const loader = document.getElementById(`${btn.id}-loading`);
+        if (loader) loader.style.display = 'inline-block';
+    }
   } catch (error) {
     console.error("Error in showLoading:", error);
   }
@@ -253,11 +345,92 @@ function hideLoading(btn, spinnerEl) {
           0,
           AppState.globalLoadingCount - 1,
         ); // Decrement global counter
-      if (AppState.globalLoadingCount === 0 && !AppState.isPolling)
+      
+      console.debug(`Spinner hide request. Count: ${AppState.globalLoadingCount}`);
+      
+      if (AppState.globalLoadingCount === 0 && !AppState.isPolling) {
         spinner.classList.add("hidden");
+      }
+    }
+    // Ensure individual element spinners are hidden
+    if (btn && btn.id) {
+        const loader = document.getElementById(`${btn.id}-loading`);
+        if (loader) loader.style.display = 'none';
     }
   } catch (error) {
     console.error("Error in hideLoading:", error);
+  }
+}
+
+/**
+ * Toggle and populate the expandable details row for a bulk table employee.
+ * Fetches net-salary and deductions for the employee and renders them.
+ */
+async function toggleBulkDetails(empId) {
+  try {
+    const detailsRow = document.getElementById(`details-row-${empId}`);
+    const contentEl = document.getElementById(`details-content-${empId}`);
+    if (!detailsRow || !contentEl) return;
+
+    const isHidden = detailsRow.style.display === 'none' || !detailsRow.style.display;
+    if (!isHidden) {
+      detailsRow.style.display = 'none';
+      return;
+    }
+
+    // Show row
+    detailsRow.style.display = '';
+
+    // Avoid refetching if already loaded
+    if (contentEl.dataset && contentEl.dataset.loaded) return;
+
+    // Show skeleton while loading
+    contentEl.innerHTML = `<div class="skeleton" style="height:80px;"></div>`;
+
+    // Fetch net salary and deductions in parallel
+    const [netRes, dedRes] = await Promise.allSettled([
+      apiRequest(`/api/employees/${empId}/net-salary/`),
+      apiRequest(`/api/deductions/?employee=${empId}`),
+    ]);
+
+    let html = `<div class="bulk-details-header">Per-employee breakdown</div><table class="bulk-details-table">`;
+
+    if (netRes.status === 'fulfilled' && netRes.value && netRes.value.success && netRes.value.data) {
+      const d = netRes.value.data;
+      html += `<tr><td>Base Salary</td><td style="text-align:right">${formatCurrency(d.base_salary || 0)}</td></tr>`;
+      html += `<tr><td>Deductions</td><td style="text-align:right">${formatCurrency(d.pending_deductions || 0)}</td></tr>`;
+      html += `<tr><td>Adjustments (IOU/Bonus)</td><td style="text-align:right">${formatCurrency(d.approved_adjustments || 0)}</td></tr>`;
+      html += `<tr><td>Previous Balance</td><td style="text-align:right">${formatCurrency(d.previous_outstanding_balance || 0)}</td></tr>`;
+      html += `<tr><td><strong>Net Payable</strong></td><td style="text-align:right"><strong>${formatCurrency(d.net_salary || 0)}</strong></td></tr>`;
+    } else {
+      html += `<tr><td colspan="2">Could not load salary breakdown</td></tr>`;
+    }
+
+    // Deductions list
+    if (dedRes.status === 'fulfilled' && dedRes.value && dedRes.value.success) {
+      const data = dedRes.value.data;
+      const items = Array.isArray(data) ? data : (data.results || []);
+      if (items.length) {
+        html += `<tr><td colspan="2"><strong>Pending Deductions</strong></td></tr>`;
+        items.forEach((it) => {
+          const reason = it.reason || it.title || 'Deduction';
+          const amt = it.amount || it.value || 0;
+          html += `<tr><td>${escapeHtml(reason)}</td><td style="text-align:right">${formatCurrency(amt)}</td></tr>`;
+        });
+      } else {
+        html += `<tr><td colspan="2">No pending deductions</td></tr>`;
+      }
+    } else {
+      html += `<tr><td colspan="2">Could not load deductions</td></tr>`;
+    }
+
+    html += `</table>`;
+    contentEl.innerHTML = html;
+    contentEl.dataset.loaded = '1';
+  } catch (err) {
+    console.error('Failed to load details for', empId, err);
+    const contentEl = document.getElementById(`details-content-${empId}`);
+    if (contentEl) contentEl.innerHTML = 'Failed to load details';
   }
 }
 
@@ -361,6 +534,15 @@ function showSection(id) {
   }
   if (id === "audit-logs") {
     loadDownloadLogs();
+  }
+  if (id === "iou-management") {
+    loadAdjustments('iou');
+  }
+  if (id === "bonus-management") {
+    loadAdjustments('bonus');
+  }
+  if (id === "company-payments") {
+    loadClientPayments();
   }
 }
 
@@ -525,15 +707,23 @@ async function apiRequest(url, options = {}) {
       if (options._authRetried) {
         const errorData = await response.json().catch(() => ({}));
         logout();
+        let authErrorMessage =
+          errorData.detail ||
+          errorData.error ||
+          errorData.message ||
+          "Session expired. Please login again.";
+        if (typeof authErrorMessage === 'object') {
+          try {
+            authErrorMessage = JSON.stringify(authErrorMessage);
+          } catch (err) {
+            authErrorMessage = String(authErrorMessage);
+          }
+        }
         return {
           success: false,
           status: response.status,
           data: errorData,
-          message:
-            errorData.detail ||
-            errorData.error ||
-            errorData.message ||
-            "Session expired. Please login again.",
+          message: authErrorMessage,
         };
       }
 
@@ -562,15 +752,23 @@ async function apiRequest(url, options = {}) {
     const data = await response.json().catch(() => ({}));
 
     if (!response.ok) {
+      let message =
+        data.detail ||
+        data.error ||
+        data.message ||
+        `Request failed (${response.status})`;
+      if (typeof message === 'object') {
+        try {
+          message = JSON.stringify(message);
+        } catch (err) {
+          message = String(message);
+        }
+      }
       return {
         success: false,
         status: response.status,
         data,
-        message:
-          data.detail ||
-          data.error ||
-          data.message ||
-          `Request failed (${response.status})`,
+        message,
       };
     }
 
@@ -611,7 +809,10 @@ async function refreshAccessToken() {
       fetchOptions.body = JSON.stringify(refreshBody);
     }
 
-    const response = await fetch("/token/refresh/", fetchOptions);
+    const response = await fetch("/token/refresh/", {
+      ...fetchOptions,
+      credentials: "same-origin",
+    });
 
     if (response.status === 401 || response.status === 403) {
       throw new Error("AUTH_EXPIRED");
@@ -644,9 +845,6 @@ async function refreshAccessToken() {
 // NIGERIAN BANKS AUTO-LOADING
 // ==========================================
 
-// ==========================================
-// FIXED: NIGERIAN BANKS AUTO-LOADING
-// ==========================================
 
 async function loadNigerianBanks() {
   try {
@@ -765,15 +963,11 @@ async function verifyBankAccountFields({
     if (manual) showToast("Select a valid bank first", "error");
     return false;
   }
-  if (AppState.pendingAccountVerificationKey === verificationKey) {
-    return false;
-  }
+  // If we've verified recently for this key, skip external calls.
   if (
     AppState.lastVerifiedAccountKey === verificationKey &&
     safeHolderInput?.value.trim()
   ) {
-    // If we already verified this key earlier and the UI still has a holder name,
-    // reuse it to avoid re-calling Paystack (prevents 429 bursts).
     setAccountVerificationStatus(
       statusEl,
       `Verified: ${safeHolderInput.value.trim()}`,
@@ -782,7 +976,105 @@ async function verifyBankAccountFields({
     return true;
   }
 
+  // Single-flight: de-dup concurrent resolve-account requests for the same key.
+  // If there's already an in-flight promise for this verificationKey, reuse it.
+  const existingPromise = AppState.inFlightAccountVerifications.get(verificationKey);
+  if (existingPromise) {
+    // UI hint; don't trigger a new request.
+    if (safeHolderInput) {
+      safeHolderInput.value = safeHolderInput.value || "Verifying...";
+      safeHolderInput.disabled = true;
+      safeHolderInput.readOnly = true;
+    }
+    setAccountVerificationStatus(statusEl, "Verifying with Paystack...", "text-info");
 
+    try {
+      const res = await existingPromise;
+
+      // Mirror the normal-path outcome handling so callers get correct true/false.
+      if (res?.status === 429 || res?.data?.error_code === "rate_limited") {
+        let retryAfter = parseInt(res?.data?.retry_after, 10);
+
+        if (isNaN(retryAfter) && res?.data?.detail) {
+          const match = res?.data?.detail.match(/\d+/);
+          if (match) retryAfter = parseInt(match[0], 10);
+        }
+
+        const cooldownSeconds = Math.max(retryAfter || 60, 60);
+        const cooldownMs = cooldownSeconds * 1000;
+        AppState.rateLimitedKeys.set(verificationKey, Date.now() + cooldownMs);
+
+        let displayMsg =
+          res.message ||
+          (res.message && res.message.includes("5 minutes") ? res.message : null) ||
+          res?.data?.message ||
+          res?.data?.detail ||
+          "Verification service is temporarily unavailable. Please try again in a few minutes.";
+
+        if (!isNaN(retryAfter) && retryAfter > 0 && !displayMsg.includes("5 minutes")) {
+          const minutes = Math.max(1, Math.round(retryAfter / 60));
+          displayMsg =
+            minutes <= 1
+              ? "Verification service is temporarily unavailable. Please try again in 1 minute."
+              : `Verification service is temporarily unavailable. Please try again in ${minutes} minutes.`;
+        }
+
+        if (safeHolderInput) {
+          safeHolderInput.disabled = false;
+          safeHolderInput.readOnly = false;
+          safeHolderInput.placeholder = "Enter name manually (Service busy)";
+          safeHolderInput.style.background = "#fff3cd";
+        }
+
+        AppState.lastVerifiedAccountKey = null;
+        setAccountVerificationStatus(statusEl, displayMsg, "text-warning");
+        if (manual) showToast(displayMsg, "warning");
+        return false;
+      }
+
+      const accountName =
+        res?.data?.data?.account_name ||
+        res?.data?.account_name ||
+        res?.data?.data?.account_holder ||
+        res?.data?.account_holder ||
+        null;
+
+      const isVerifiedOk = res?.success && accountName && accountName.trim().length > 0;
+
+      if (isVerifiedOk) {
+        if (safeHolderInput) {
+          const nameToSet = accountName.trim();
+          safeHolderInput.disabled = false;
+          safeHolderInput.readOnly = true;
+          safeHolderInput.value = nameToSet;
+          safeHolderInput.style.background = "#d4edda";
+        }
+        AppState.lastVerifiedAccountKey = verificationKey;
+        setAccountVerificationStatus(statusEl, `Verified: ${accountName.trim()}`, "text-success");
+        if (manual) showToast("Account verified successfully", "success");
+        return true;
+      }
+
+      if (safeHolderInput) {
+        safeHolderInput.value = "";
+        safeHolderInput.style.background = "#f8d7da";
+      }
+      AppState.lastVerifiedAccountKey = null;
+
+      const errorMsg = res?.message || res?.data?.message || "Account could not be verified.";
+      setAccountVerificationStatus(statusEl, errorMsg, "text-danger");
+      if (manual) showToast(errorMsg, "error");
+      return false;
+    } finally {
+      // Critical: don't leave the single-flight map stuck forever.
+      // Only delete if it's still the same promise instance.
+      if (AppState.inFlightAccountVerifications.get(verificationKey) === existingPromise) {
+        AppState.inFlightAccountVerifications.delete(verificationKey);
+      }
+    }
+  }
+
+  // Only one run should own the UI state.
   AppState.pendingAccountVerificationKey = verificationKey;
   AppState.pendingAccountVerificationRunId =
     (AppState.pendingAccountVerificationRunId || 0) + 1;
@@ -800,12 +1092,26 @@ async function verifyBankAccountFields({
     "text-info",
   );
 
+  // Start single-flight promise and store it.
+  const resolvePromise = (async () => {
+    try {
+      const res = await apiRequest(
+        buildUrl("/paystack/resolve-account/", {
+          account_number: accountNumber,
+          bank_code: bankCode,
+        }),
+      );
+      return res;
+    } finally {
+      // Ensure removal is handled by the caller below.
+    }
+  })();
+
+  AppState.inFlightAccountVerifications.set(verificationKey, resolvePromise);
+
   try {
-    // Use GET endpoint with query parameters for account resolution
-    const res = await apiRequest(buildUrl("/paystack/resolve-account/", {
-      account_number: accountNumber,
-      bank_code: bankCode
-    }));
+    const res = await resolvePromise;
+
 
     if (
       AppState.pendingAccountVerificationRunId !== runId ||
@@ -823,8 +1129,9 @@ async function verifyBankAccountFields({
         if (match) retryAfter = parseInt(match[0], 10);
       }
 
-    // Reduce local cooldown to 30s to allow faster recovery
-    const cooldownMs = (retryAfter || 30) * 1000;
+      // Increase local cooldown to at least 60s to reduce immediate retries
+      const cooldownSeconds = Math.max(retryAfter || 60, 60);
+      const cooldownMs = cooldownSeconds * 1000;
       AppState.rateLimitedKeys.set(verificationKey, Date.now() + cooldownMs);
 
       let displayMsg =
@@ -832,7 +1139,7 @@ async function verifyBankAccountFields({
         res.message && res.message.includes("5 minutes") ? res.message :
         res.data?.message ||
         res.data?.detail ||
-        "Verification service is temporarily unavailable. Please try again in 5 minutes.";
+        "Verification service is temporarily unavailable. Please try again in a few minutes.";
 
       if (!isNaN(retryAfter) && retryAfter > 0 && !displayMsg.includes("5 minutes")) {
         const minutes = Math.max(1, Math.round(retryAfter / 60));
@@ -946,6 +1253,8 @@ function setupAccountVerification({
   holderInput.readOnly = true;
   holderInput.style.background = "#f8f9fa";
 
+  // Reduce Paystack burst traffic by debouncing more aggressively
+  // and by ensuring only one in-flight resolve call per account key.
   const verifyCurrentAccount = debounce(
     () =>
       verifyBankAccountFields({
@@ -954,8 +1263,8 @@ function setupAccountVerification({
         holderInput,
         statusEl,
       }),
-    1200,
-    800,
+    250,
+    600,
   );
 
   const mapKey = accountInputId;
@@ -1145,12 +1454,16 @@ async function handleLogin(e) {
 
   try {
     showLoading(btn);
+    const csrfToken = getCookie("csrftoken");
     const response = await fetch("/login/", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      credentials: "same-origin",
+      headers: {
+        "Content-Type": "application/json",
+        ...(csrfToken ? { "X-CSRFToken": csrfToken } : {}),
+      },
       body: JSON.stringify({ username, password }),
     });
-
     let data = {};
     try {
       const contentType = response.headers.get("content-type");
@@ -1274,7 +1587,11 @@ async function logout(silent = false) {
     if (refresh) {
       await fetch(`${window.location.origin}/logout/`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        credentials: "same-origin",
+        headers: {
+          "Content-Type": "application/json",
+          ...(AppState.accessToken ? { Authorization: `Bearer ${AppState.accessToken}` } : {}),
+        },
         body: JSON.stringify({ refresh }),
       }).catch(() => {}); // Ignore errors on logout
     }
@@ -1516,11 +1833,8 @@ async function viewEmployeeDetail(employeeId) {
   if (!content) return;
 
   showLoading(); // Global spinner for modal content loading
-  const res = await apiRequest(`/api/employees/${employeeId}/net_salary/`); // No spinner for this small API call
-
-  const netData = res.success
-    ? res.data
-    : { pending_deductions: 0, net_salary: employee.salary };
+  const res = await apiRequest(`/api/employees/${employeeId}/net_salary/`);
+  const d = res.success ? res.data : employee.salary_breakdown;
 
   content.innerHTML = `
         <div class="detail-grid">
@@ -1555,9 +1869,14 @@ async function viewEmployeeDetail(employeeId) {
             <div class="detail-section">
                 <h4>Salary Information</h4>
                 <table class="detail-table">
-                    <tr><td><strong>Base Salary:</strong></td><td>${formatCurrency(employee.salary)}</td></tr>
-                    <tr><td><strong>Pending Deductions:</strong></td><td class="text-danger">${formatCurrency(netData.pending_deductions)}</td></tr>
-                    <tr><td><strong>Net Salary:</strong></td><td class="text-success font-bold">${formatCurrency(netData.net_salary)}</td></tr>
+                    <tr><td><strong>Base Salary:</strong></td><td>${formatCurrency(d.base_salary)}</td></tr>
+                    <tr><td><strong>IOU Deduction:</strong></td><td class="text-danger">${formatCurrency(d.iou_deduction)}</td></tr>
+                    <tr><td><strong>Other Deductions:</strong></td><td class="text-danger">${formatCurrency(d.other_deductions)}</td></tr>
+                    <tr><td><strong>Bonus:</strong></td><td class="text-success">${formatCurrency(d.bonus)}</td></tr>
+                    <tr><td><strong>Prev. Month Balance Added:</strong></td><td class="text-info">${formatCurrency(d.previous_balance)}</td></tr>
+                    <tr><td><strong>Total Monthly Payable:</strong></td><td><strong>${formatCurrency(d.final_net_salary)}</strong></td></tr>
+                    <tr><td><strong>Total Paid This Month:</strong></td><td>${formatCurrency(d.total_paid)}</td></tr>
+                    <tr><td><strong>Outstanding Balance:</strong></td><td class="text-success font-bold">${formatCurrency(d.outstanding_balance)}</td></tr>
                 </table>
             </div>
         </div>
@@ -1615,6 +1934,27 @@ async function approveEmployee(empId) {
     showToast(err.message || "Failed to approve employee", "error");
   } finally {
     hideLoading(); // Global spinner
+  }
+}
+
+async function bulkUpdateBankCodes() {
+  if (!confirm("Are you sure you want to attempt resolving missing bank codes for all employees? This will look up Paystack codes based on existing bank names.")) return;
+  
+  try {
+    showLoading();
+    const res = await apiRequest("/api/employees/bulk_update_bank_codes/", { method: "POST" });
+    if (res.success) {
+      showToast(res.data.message, "success");
+      // Refresh the employee list to show updated codes
+      await loadEmployees();
+      if (typeof updateUIAfterEmployeeLoad === 'function') updateUIAfterEmployeeLoad();
+    } else {
+      showToast(res.message || "Failed to update bank codes", "error");
+    }
+  } catch (err) {
+    showToast("An error occurred during bulk update", "error");
+  } finally {
+    hideLoading();
   }
 }
 
@@ -1680,7 +2020,7 @@ function renderEmployees(list = []) {
             <td>${escapeHtml(emp.type ?? "-")}</td>
             <td>${escapeHtml(emp.location ?? "-")}</td>
             <td>${escapeHtml(emp.bank_name ?? "-")}</td>
-            <td>${formatCurrency(emp.salary)}</td>
+            <td>${formatCurrency(emp.salary_breakdown.outstanding_balance)}</td>
             <td><span class="badge ${emp.status === "active" ? "bg-success" : emp.status === "pending" ? "bg-warning" : "bg-danger"}">${escapeHtml(emp.status || "Active")}</span></td>
             <td>
                 <button type="button" class="btn btn-sm btn-info" onclick="viewEmployeeDetail('${emp.id}')">
@@ -2375,8 +2715,8 @@ async function bulkApproveDeductions() {
 async function deleteDeduction(id) {
   if (!confirm("Are you sure you want to delete this deduction?")) return;
 
-  showLoading(); // Global spinner
   try {
+    showLoading(null, AppState.elements.globalSpinner); // Global spinner
     const res = await apiRequest(`/api/deductions/${id}/`, {
       method: "DELETE",
     });
@@ -2387,6 +2727,8 @@ async function deleteDeduction(id) {
     updateDashboardStats();
   } catch (err) {
     showToast(`Failed to delete deduction: ${err.message}`, "error");
+  } finally {
+    hideLoading(null, AppState.elements.globalSpinner);
   }
 }
 
@@ -2713,24 +3055,29 @@ async function updatePaymentPreview() {
   }
 
   const res = await apiRequest(`/api/employees/${employeeId}/net_salary/`);
-  const netData = res.success
-    ? res.data
-    : { pending_deductions: 0, net_salary: employee.salary };
+  if (!res.success) return;
+  const d = res.data;
 
-  document.getElementById("previewBaseSalary").textContent = formatCurrency(
-    employee.salary,
-  );
-  document.getElementById("previewDeductions").textContent = formatCurrency(
-    netData.pending_deductions,
-  );
-  document.getElementById("previewNetAmount").textContent = formatCurrency(
-    netData.net_salary,
-  );
-  document.getElementById("previewBank").textContent =
-    employee.bank_name || "-";
-  document.getElementById("previewAccount").textContent =
-    employee.account_number || "-";
+  preview.dataset.netSalary = d.outstanding_balance;
+  document.getElementById("previewBaseSalary").textContent = formatCurrency(d.base_salary);
+  document.getElementById("previewIOUDeductions").textContent = formatCurrency(d.iou_deduction);
+  document.getElementById("previewDeductions").textContent = formatCurrency(d.other_deductions);
+  document.getElementById("previewBonus").textContent = formatCurrency(d.bonus);
+  document.getElementById("previewPrevBalance").textContent = formatCurrency(d.previous_balance);
+  
+  // New modal enhancement fields (initial render)
+  document.getElementById("previewTotalPayable").textContent = formatCurrency(d.final_net_salary);
+  document.getElementById("previewTotalPaid").textContent = formatCurrency(d.total_paid);
+  document.getElementById("previewNetAmount").textContent = formatCurrency(d.outstanding_balance);
+  if (document.getElementById('previewRemainingBalance')) {
+    document.getElementById('previewRemainingBalance').textContent = formatCurrency(d.outstanding_balance);
+  }
 
+  if (document.getElementById('partialAmountDisplay')) document.getElementById('partialAmountDisplay').textContent = formatCurrency(0);
+  if (document.getElementById('remainingBalanceDisplay')) document.getElementById('remainingBalanceDisplay').textContent = formatCurrency(d.outstanding_balance);
+
+  document.getElementById("previewBank").textContent = employee.bank_name || "-";
+  document.getElementById("previewAccount").textContent = employee.account_number || "-";
   preview.style.display = "block";
 }
 
@@ -2749,12 +3096,14 @@ async function loadPaymentHistory() {
     
     // AUTO-SHOW OTP MODAL if any payment needs Paystack OTP
     const pendingOtpPayment = list.find(p => p.status === 'pending_paystack_otp');
-    if (pendingOtpPayment && !document.getElementById('paystackOtpModal')?.classList.contains('active')) {
+    // Only show OTP modal when backend still expects OTP.
+    if (pendingOtpPayment && pendingOtpPayment.paystack_otp_required && !document.getElementById('paystackOtpModal')?.classList.contains('active')) {
         showPaystackOtpModal(
             pendingOtpPayment.transaction_reference, 
             pendingOtpPayment.paystack_transfer_code || ''
         );
     }
+
     
     tbody.innerHTML = "";
 
@@ -2780,9 +3129,20 @@ async function loadPaymentHistory() {
                 <td>${escapeHtml(payment.employee_id || payment.employee || "-")}</td>
                 <td>${escapeHtml(payment.employee_name || "-")}</td>
                 <td>${escapeHtml(payment.bank_account || "-")}</td>
-                <td>${formatCurrency(payment.net_amount)}</td>
+                <td>
+                    <div style="line-height: 1.2;">
+                        <span class="font-bold">${formatCurrency(payment.net_amount)}</span><br>
+                        <small class="text-danger">IOU: ${formatCurrency(payment.iou_amount)}</small> | 
+                        <small class="text-success">Bonus: ${formatCurrency(payment.bonus_amount)}</small> |
+                        <small class="text-muted">Ded: ${formatCurrency(payment.total_deductions)}</small>
+                    </div>
+                </td>
                 <td>${escapeHtml(payment.payment_method || "Paystack")}</td>
-                <td><span class="${statusClass}">${escapeHtml(payment.status || "-")}</span></td>
+                <td>
+                    <span class="${statusClass}">${escapeHtml(payment.status || "-")}</span>
+                    ${payment.is_partial ? `<br><small class="text-info">Paid: ${formatCurrency(payment.amount_paid)}</small>` : ""}
+                    ${payment.remaining_balance > 0 ? `<br><small class="text-danger" title="Outstanding Balance">Bal: ${formatCurrency(payment.remaining_balance)}</small>` : ""}
+                </td>
                 <td>
                     ${
                       isCompleted
@@ -2797,12 +3157,6 @@ async function loadPaymentHistory() {
       tbody.appendChild(row);
     });
 
-    // Update pending payments count
-    const pending = list.filter(
-      (p) => p.status === "pending" || p.status === "processing",
-    ).length;
-    const pendingEl = document.getElementById("pendingPayments");
-    if (pendingEl) pendingEl.textContent = pending;
   } catch (err) {
     console.error("Payment history load error:", err);
     const tbody = document.getElementById("historyTableBody");
@@ -2839,10 +3193,35 @@ async function processBulkPayment() {
 
   try {
     showLoading(btn);
+    // If bulk partial payments enabled, collect per-employee partials
+    const bulkPartialEnabled = document.getElementById('bulkPartialToggle')?.checked;
+    const bulkDefaultAmount = parseFloat(document.getElementById('bulkDefaultPartialAmount')?.value || 0);
+    const bulkDefaultReason = document.getElementById('bulkDefaultPartialReason')?.value || '';
 
-    const res = await apiRequest("/api/payments/bulk_payment/", {
-      method: "POST",
-      body: { employee_ids: checked },
+    let body = { employee_ids: checked };
+    if (bulkPartialEnabled) {
+      const partials = [];
+      for (const empId of checked) {
+        const amtEl = document.querySelector(`.bulk-partial-amount[data-emp-id="${empId}"]`);
+        const reasonEl = document.querySelector(`.bulk-partial-reason[data-emp-id="${empId}"]`);
+        let amt = amtEl ? parseFloat(amtEl.value || 0) : 0;
+        const reason = (reasonEl && reasonEl.value) || bulkDefaultReason || '';
+        if (!amt && bulkDefaultAmount) amt = bulkDefaultAmount;
+        if (amt && amt > 0) {
+          partials.push({ employee_id: empId, partial_amount: Math.round(amt * 100) / 100, partial_reason: reason });
+        }
+      }
+      if (partials.length === 0) {
+        hideLoading(btn);
+        showToast('No partial amounts provided. Either enter per-employee amounts or set a default.', 'warning');
+        return;
+      }
+      body.partials = partials;
+    }
+
+    const res = await apiRequest('/api/payments/bulk_payment/', {
+      method: 'POST',
+      body,
     });
 
     if (!res.success) {
@@ -2852,6 +3231,13 @@ async function processBulkPayment() {
     const results = res.data || {};
     const payments = results.payments || [];
     const errors = results.errors || [];
+
+    // NEW: Handle OTP requirement for Bulk Initiation
+    if (res.data.paystack_otp_required) {
+        showPaystackOtpModal(res.data.reference, res.data.paystack_transfer_code);
+        closeModal("bulkPaymentModal");
+        return;
+    }
 
     // Show initial summary
     let message = `Initiated ${payments.length}/${checked.length} transfers.`;
@@ -2934,17 +3320,21 @@ async function startBulkPaymentPolling(
 async function initiateIndividualPayment(empId) {
     // PRE-CHECK: Prevent calling API if already paid this month
     const currentMonth = new Date().toISOString().slice(0, 7);
+    const employee = AppState.employees.find(e => String(e.id) === String(empId));
+    const outstanding = employee?.salary_breakdown?.outstanding_balance || 0;
+    
     const existingPayment = AppState.payments?.find(p => 
         String(p.employee) === String(empId) && p.payment_month === currentMonth
     );
     
     if (existingPayment) {
         const status = existingPayment.status;
-        if (status === 'completed') {
+        // Only block if the status is completed AND there is no remaining balance to pay
+        if (outstanding <= 0) { // If outstanding is 0 or less, it's fully paid
             showToast("Salary already paid for this month", "info");
             return;
         }
-        if (status === 'processing' || status === 'pending' || status === 'pending_hr') {
+        if (['processing', 'pending', 'pending_hr'].includes(status)) {
             showToast(`Payment already ${status}. Checking status...`, "info");
             startPaymentStatusPolling(existingPayment.transaction_reference);
             return;
@@ -2952,6 +3342,12 @@ async function initiateIndividualPayment(empId) {
         // Only allow retry if failed
         if (status !== 'failed') {
             showToast(`Payment already initiated (${status}). Cannot re-initiate.`, "warning");
+            // If it's pending_paystack_otp, show the modal
+            if (status === 'pending_paystack_otp') {
+                showPaystackOtpModal(
+                    existingPayment.transaction_reference, existingPayment.paystack_transfer_code || ''
+                );
+            }
             return;
         }
     }
@@ -2960,14 +3356,46 @@ async function initiateIndividualPayment(empId) {
             `button[onclick="initiateIndividualPayment('${empId}')"]`,
         );
         showLoading(btn);
-        
-        const res = await apiRequest("/api/payments/initiate_payment/", {
-            method: "POST",
-            body: { employee_id: empId },
+
+        // If individual modal is open, read partial payment fields
+        const isPartial = document.getElementById('isPartialPaymentIndividual')?.checked;
+        let body = { employee_id: empId };
+        if (isPartial) {
+          const amt = parseFloat(document.getElementById('partialAmountIndividual')?.value || 0);
+          const reason = document.getElementById('partialReasonIndividual')?.value || '';
+          if (!amt || amt <= 0) {
+            hideLoading(btn);
+            showToast('Enter a valid partial amount', 'error');
+            return;
+          }
+          body.partial = true;
+          body.partial_amount = Math.round(amt * 100) / 100; // two decimals
+          body.partial_reason = reason;
+        }
+
+        // Pre-check: ensure employee has bank details locally before sending API request
+        const employee = AppState.employees.find(e => String(e.id) === String(empId));
+        if (employee && (!employee.bank_code || !employee.account_number)) {
+            hideLoading(btn);
+            showToast('Employee bank details incomplete. Please update account before initiating payment.', 'warning', 8000);
+            try { editEmployee(empId); } catch (e) { /* fallback */ }
+            return;
+        }
+
+        const res = await apiRequest('/api/payments/initiate_payment/', {
+            method: 'POST',
+            body,
         });
 
         if (!res.success) {
-            throw new Error(res.message || "Failed to initiate payment");
+          // Build a helpful error message from response
+          let detail = res.message || (res.data && (res.data.message || res.data.detail)) || JSON.stringify(res.data || res);
+          if (typeof detail === 'object') {
+            try { detail = JSON.stringify(detail); } catch (e) { detail = String(detail); }
+          }
+          const err = new Error(detail || "Failed to initiate payment");
+          err.raw = res;
+          throw err;
         }
 
         const reference = res.data.reference;
@@ -2982,15 +3410,21 @@ async function initiateIndividualPayment(empId) {
 
         showToast(res.data.message || "Payment initiated", "success");
         await loadPaymentHistory();
+        await loadEmployees();
         await updateDashboardStats();
         startPaymentStatusPolling(reference);
         
     } catch (err) {
-        console.error("Payment Initiation Detailed Error:", err);
+        console.error("Payment Initiation Detailed Error:", err, err.raw || {});
         let errorMsg = err.message || "Failed to initiate payment";
-        if (err.data && err.data.message) {
-            errorMsg = `Paystack Error: ${err.data.message}`;
+        
+        if (errorMsg.includes("bank_code is missing")) {
+            showToast("Bank Code missing. Redirecting to edit employee record...", "warning", 5000);
+            // Auto-open edit modal to let user fix the data
+            setTimeout(() => editEmployee(empId), 1500);
+            return;
         }
+
         showToast(errorMsg, "error", 8000);
     } finally {
         hideLoading(
@@ -3008,46 +3442,191 @@ function showPaystackOtpModal(reference, transferCode) {
         console.warn("showPaystackOtpModal called without reference");
         return;
     }
-    
+
     const modal = document.getElementById("paystackOtpModal");
     const input = document.getElementById("paystackOtpInput");
-    
-    if (modal) {
-        AppState.currentPaymentReference = reference;
-        AppState.currentPaystackTransferCode = transferCode;
-        if (input) input.value = "";
-        modal.style.display = "flex";
-        modal.classList.add("active");
+    if (!modal) return;
+
+    // Ensure OTP modal is always above other modals (z-index + stacking context hardening)
+    // This also prevents it from being hidden "behind" the individual payment modal.
+    modal.style.position = 'fixed';
+    modal.style.top = '0';
+    modal.style.left = '0';
+    modal.style.right = '0';
+    modal.style.bottom = '0';
+    // Ensure this modal always sits above any other modal stacking context
+    modal.style.zIndex = '200000';
+    modal.style.display = "flex";
+    modal.classList.add("active");
+
+    // Bring to front by moving to document.body and forcing a full z-index top layer.
+    // Also reduce any other open modal z-index briefly so stacking contexts don't fight.
+    const openModals = document.querySelectorAll('.modal.active');
+    openModals.forEach(m => {
+      if (m !== modal) m.style.zIndex = '999';
+    });
+
+    if (modal.parentElement !== document.body) {
+      document.body.appendChild(modal);
     }
+    modal.style.zIndex = String(Math.max(20000, 1000 + openModals.length + 1));
+
+
+    AppState.currentPaymentReference = reference;
+    AppState.currentPaystackTransferCode = transferCode;
+
+    if (input) {
+        input.value = "";
+        input.focus();
+    }
+}
+
+function isModalActive(id) {
+  const el = document.getElementById(id);
+  return !!(el && el.classList.contains('active') && el.style.display !== 'none');
+}
+
+function showPaystackOtpResendUI(opts = {}) {
+    const { canResend = true } = opts;
+    const resendBtn = document.getElementById('resendPaystackOtpBtn');
+    if (!resendBtn) return;
+    resendBtn.disabled = !canResend;
+    resendBtn.style.opacity = resendBtn.disabled ? 0.6 : 1;
+}
+
+async function resendPaystackOtp(e) {
+    e?.preventDefault?.();
+
+    const reference = AppState.currentPaymentReference;
+    if (!reference) {
+        showToast('Reference missing. Start payment again.', 'warning');
+        return;
+    }
+
+    const btn = document.getElementById('resendPaystackOtpBtn');
+    try {
+        showLoading(btn);
+        const res = await apiRequest('/api/payments/resend_otp/', {
+            method: 'POST',
+            body: { reference }
+        });
+        if (!res.success) throw new Error(res.message || 'Failed to resend OTP');
+
+        showToast(res.data?.message || 'OTP resent successfully', 'success');
+
+        // Reset input so user retypes OTP
+        const input = document.getElementById('paystackOtpInput');
+        if (input) {
+            input.value = '';
+            input.focus();
+        }
+
+        // Expire current OTP UI locally and disable resend briefly
+        showPaystackOtpResendUI({ canResend: false });
+        startPaystackOtpCountdown(30);
+    } catch (err) {
+        showToast(err.message || 'Failed to resend OTP', 'error');
+    } finally {
+        hideLoading(btn);
+    }
+}
+
+let paystackOtpCountdownInterval = null;
+function startPaystackOtpCountdown(seconds = 30) {
+    const timerEl = document.getElementById('paystackOtpTimer');
+    if (!timerEl) return;
+
+    let time = Number(seconds) || 30;
+    timerEl.textContent = time;
+
+    const resendBtn = document.getElementById('resendPaystackOtpBtn');
+    if (resendBtn) resendBtn.disabled = true;
+
+    if (paystackOtpCountdownInterval) clearInterval(paystackOtpCountdownInterval);
+    paystackOtpCountdownInterval = setInterval(() => {
+        time -= 1;
+        timerEl.textContent = Math.max(0, time);
+        if (time <= 0) {
+            clearInterval(paystackOtpCountdownInterval);
+            paystackOtpCountdownInterval = null;
+            showPaystackOtpResendUI({ canResend: true });
+            showToast('OTP expired. You can resend now.', 'warning');
+        }
+    }, 1000);
+}
+
+function closePaystackOtpModal() {
+    stopPaymentPolling();
+    const modal = document.getElementById('paystackOtpModal');
+    if (!modal) return;
+
+    modal.classList.remove('active');
+    modal.style.display = 'none';
+
+    // Expire OTP locally
+    if (paystackOtpCountdownInterval) {
+        clearInterval(paystackOtpCountdownInterval);
+        paystackOtpCountdownInterval = null;
+    }
+
+    const input = document.getElementById('paystackOtpInput');
+    if (input) {
+        input.value = '';
+    }
+
+    AppState.currentPaymentReference = null;
+    AppState.currentPaystackTransferCode = null;
+
+    // Disable resend until next valid showPaystackOtpModal
+    showPaystackOtpResendUI({ canResend: false });
 }
 
 // NEW: Handle Paystack OTP submission
 async function submitPaystackOtp(e) {
     e.preventDefault();
-    
+
     const otp = document.getElementById("paystackOtpInput")?.value.trim();
     const reference = AppState.currentPaymentReference;
-    
-    if (!otp || !reference) {
-        showToast("Please enter the OTP", "warning");
+
+    if (!reference) {
+        showToast("Reference missing. Start payment again.", "warning");
         return;
     }
-    
+
+    // If OTP input is empty, treat as "OTP disabled" flow and attempt auto-resolve.
+    if (!otp) {
+        try {
+            const res = await apiRequest(`/api/payments/verify-payment/${reference}/`, {
+                method: "POST",
+                body: { reference },
+            });
+            // If endpoint doesn’t support POST, fallback to GET polling
+        } catch (_) {
+            // ignore
+        }
+        // Always try normal polling endpoint (GET) which already has auto-resolve logic.
+        closeModal("paystackOtpModal");
+        startPaymentStatusPolling(reference);
+        return;
+    }
+
     const btn = e.target.querySelector('button[type="submit"]');
-    
+
     try {
         showLoading(btn);
-        
-        const res = await apiRequest("/api/payments/verify_payment/", {
+
+        // Correct endpoint for Paystack OTP finalization
+        const res = await apiRequest("/api/payments/finalize-transfer/", {
             method: "POST",
             body: {
                 reference: reference,
                 paystack_otp: otp
             }
         });
-        
+
         if (res.success) {
             if (res.data?.payment_completed) {
+                stopPaymentPolling();
                 showToast("Payment completed successfully!", "success");
                 closeModal("paystackOtpModal");
                 await loadPaymentHistory();
@@ -3056,12 +3635,14 @@ async function submitPaystackOtp(e) {
                 showToast("Payment is processing. You'll be notified when complete.", "info");
                 closeModal("paystackOtpModal");
                 startPaymentStatusPolling(reference);
+            } else {
+                // fallback: poll
+                closeModal("paystackOtpModal");
+                startPaymentStatusPolling(reference);
             }
         } else {
-            // Check if we can retry OTP
             if (res.data?.paystack_otp_required) {
                 showToast(res.message || "Invalid OTP. Please try again.", "error");
-                // Clear input for retry
                 document.getElementById("paystackOtpInput").value = "";
                 document.getElementById("paystackOtpInput").focus();
             } else {
@@ -3076,6 +3657,7 @@ async function submitPaystackOtp(e) {
     }
 }
 
+
 async function startPaymentStatusPolling(
   reference,
   maxAttempts = 30,
@@ -3084,28 +3666,84 @@ async function startPaymentStatusPolling(
   let attempts = 0;
   let currentDelay = interval;
 
+  // Keep a handle to allow clean polling stop
+  AppState.paymentPollTimeout = null;
+
+  const updatePaymentPreviewFromPolling = (data) => {
+    const preview = document.getElementById('paymentPreview');
+    if (!preview) return;
+
+    // Ensure preview is visible once polling starts
+    preview.style.display = 'block';
+
+    // Backend fields: total_amount_due, amount_paid, outstanding_balance, payment_status
+    const totalDue = data.total_amount_due ?? data.net_amount;
+    const amountPaid = data.amount_paid ?? data.total_paid;
+    const outstanding =
+      data.outstanding_balance ??
+      data.remaining_balance ??
+      data.outstanding_balance;
+
+    // New modal enhancement fields
+    if (typeof totalDue !== 'undefined' && document.getElementById('previewTotalPayable')) {
+      document.getElementById('previewTotalPayable').textContent = formatCurrency(totalDue);
+    }
+
+    if (typeof amountPaid !== 'undefined' && document.getElementById('previewTotalPaid')) {
+      document.getElementById('previewTotalPaid').textContent = formatCurrency(amountPaid);
+    }
+
+    // Outstanding + Remaining are the same figure in this model
+    if (typeof outstanding !== 'undefined' && document.getElementById('previewNetAmount')) {
+      document.getElementById('previewNetAmount').textContent = formatCurrency(outstanding);
+    }
+    if (typeof outstanding !== 'undefined' && document.getElementById('previewRemainingBalance')) {
+      document.getElementById('previewRemainingBalance').textContent = formatCurrency(outstanding);
+    }
+
+    // Payment status text
+    if (document.getElementById('previewPaymentStatus')) {
+      document.getElementById('previewPaymentStatus').textContent =
+        String(data.payment_status || data.payment_status_text || '-');
+    }
+
+    // Backward-compatible (older nodes if present)
+    const partialDisplay = document.getElementById('partialAmountDisplay');
+    const remainingDisplay = document.getElementById('remainingBalanceDisplay');
+    if (partialDisplay && typeof amountPaid !== 'undefined') partialDisplay.textContent = formatCurrency(amountPaid);
+    if (remainingDisplay && typeof outstanding !== 'undefined') remainingDisplay.textContent = formatCurrency(outstanding);
+  };
+
+
   const poll = async () => {
     attempts++; // No spinner here, as it's a background poll
     const res = await apiRequest(`/payments/verify-payment/${reference}/`);
 
-    if (
-      res.success &&
-      (res.data.is_completed || res.data.payment_status === "failed")
-    ) {
-      showToast(
-        `Payment ${res.data.payment_status}`,
-        res.data.is_completed ? "success" : "error",
-      );
-      await loadDashboard();
-      return;
+    if (res.success && res.data) {
+      updatePaymentPreviewFromPolling(res.data);
+
+      if (res.data.is_completed || res.data.payment_status === 'failed') {
+        showToast(
+          `Payment ${res.data.payment_status}`,
+          res.data.is_completed ? 'success' : 'error',
+        );
+        await loadDashboard();
+        // Ensure modal polling stops
+        stopPaymentPolling();
+        return;
+      }
     }
+
     if (attempts < maxAttempts) {
       currentDelay = Math.min(currentDelay * 1.5, 30000);
-      setTimeout(poll, currentDelay);
+      if (AppState.paymentPollTimeout) clearTimeout(AppState.paymentPollTimeout);
+      AppState.paymentPollTimeout = setTimeout(poll, currentDelay);
     }
   };
+
   poll();
 }
+
 
 async function syncPaymentsWithPaystack() {
   const btn = document.getElementById("syncPaymentsBtn");
@@ -3126,9 +3764,9 @@ async function syncPaymentsWithPaystack() {
 
 // ADD this helper to stop polling when modal closes:
 function stopPaymentPolling() {
-  if (AppState.paymentPollInterval) {
-    clearInterval(AppState.paymentPollInterval);
-    AppState.paymentPollInterval = null;
+  if (AppState.paymentPollTimeout) {
+    clearTimeout(AppState.paymentPollTimeout);
+    AppState.paymentPollTimeout = null;
   }
 }
 
@@ -3154,9 +3792,30 @@ async function updateBulkTotal() {
     return;
   }
 
+  const partials = [];
+  const bulkPartialEnabled = document.getElementById('bulkPartialToggle')?.checked;
+  const bulkDefaultAmount = parseFloat(document.getElementById('bulkDefaultPartialAmount')?.value || 0);
+  const bulkDefaultReason = document.getElementById('bulkDefaultPartialReason')?.value || '';
+
+  if (bulkPartialEnabled) {
+    for (const empId of selectedIds) {
+      const amtEl = document.querySelector(`.bulk-partial-amount[data-emp-id="${empId}"]`);
+      const reasonEl = document.querySelector(`.bulk-partial-reason[data-emp-id="${empId}"]`);
+      let amt = amtEl ? parseFloat(amtEl.value || 0) : 0;
+      const reason = (reasonEl && reasonEl.value) || bulkDefaultReason || '';
+      if (!amt && bulkDefaultAmount) amt = bulkDefaultAmount;
+      if (amt && amt > 0) {
+        partials.push({ employee_id: empId, partial_amount: Math.round(amt * 100) / 100, partial_reason: reason });
+      }
+    }
+  }
+
+  const body = { employee_ids: selectedIds };
+  if (partials.length) body.partials = partials;
+
   const res = await apiRequest("/api/payments/bulk_preview/", {
     method: "POST",
-    body: { employee_ids: selectedIds },
+    body,
   });
 
   if (res.success) {
@@ -3556,23 +4215,6 @@ async function updateDashboardStats() {
   updateRecentActivity(stats.recent_employees, stats.recent_payments);
 }
 
-async function syncPaymentsWithPaystack() {
-  const btn = document.getElementById("syncPaymentsBtn");
-  try {
-    showLoading(btn);
-    const res = await apiRequest("/api/payments/sync_processing_payments/", {
-      method: "POST",
-    }); // Button spinner
-    if (res.success) {
-      showToast(res.data.message, "success");
-      await loadPaymentHistory();
-      await updateDashboardStats();
-    }
-  } finally {
-    hideLoading(btn);
-  }
-}
-
 /**
  * Periodically check system health (Paystack connectivity)
  */
@@ -3601,16 +4243,30 @@ async function initiatePartialPayment(empId) {
   const amount = prompt(
     "Enter available amount to pay (Leave blank for full amount):",
   );
+  if (amount === null) {
+    return; // user cancelled
+  }
+  const trimmed = String(amount).trim();
+  const body = { employee_id: empId };
+  let successMessage = "Payment initiated";
+
+  if (trimmed !== "") {
+    const parsed = parseFloat(trimmed);
+    if (Number.isNaN(parsed) || parsed <= 0) {
+      showToast("Enter a valid amount", "error");
+      return;
+    }
+    body.custom_amount = Math.round(parsed * 100) / 100;
+    successMessage = `Partial payment of ${formatCurrency(body.custom_amount)} initiated`;
+  }
+
   const res = await apiRequest("/api/payments/initiate_payment/", {
     // No spinner here, caller manages
     method: "POST",
-    body: { employee_id: empId, custom_amount: amount },
+    body,
   });
   if (res.success) {
-    showToast(
-      `Partial payment of ${formatCurrency(amount)} initiated`,
-      "success",
-    );
+    showToast(successMessage, "success");
     loadPaymentHistory();
   }
 }
@@ -3664,6 +4320,7 @@ function updateUIAfterEmployeeLoad() {
     populateEmployeeSelect(id);
   });
   updateDashboardStats();
+  populatePaymentsTable();
 }
 
 async function fetchPaystackBalance() {
@@ -3778,12 +4435,274 @@ function populateBulkTable() {
             <td>${escapeHtml(emp.employee_id || "-")}</td>
             <td>${escapeHtml(emp.name)}</td>
             <td>${escapeHtml(emp.bank_name || "-")} - ${escapeHtml(emp.account_number || "-")}</td>
-            <td>${formatCurrency(netSalary)}</td>
+          <td id="net-${emp.id}">${formatCurrency(netSalary)}</td>
+          <td id="iou-${emp.id}">-</td>
+          <td id="other-${emp.id}">-</td>
+          <td id="adjustments-${emp.id}">-</td>
+          <td id="previous-${emp.id}">-</td>
+          <td><input type="number" class="bulk-partial-amount form-control" data-emp-id="${emp.id}" disabled min="0" step="0.01" placeholder="₦" onchange="updateBulkTotal()"></td>
+          <td><input type="text" class="bulk-partial-reason form-control" data-emp-id="${emp.id}" disabled placeholder="Reason" onchange="updateBulkTotal()"></td>
         `;
     tbody.appendChild(row);
   });
 
-  updateBulkTotal();
+  // Fetch detailed breakdowns for each visible employee in parallel
+  (async () => {
+    try {
+      const promises = activeEmployees.map((emp) =>
+        apiRequest(`/api/employees/${emp.id}/net-salary/`, { method: 'GET' }),
+      );
+      const results = await Promise.all(promises);
+      results.forEach((res, idx) => {
+        const emp = activeEmployees[idx];
+        if (res && res.success && res.data) {
+          const d = res.data;
+          const iouEl = document.getElementById(`iou-${emp.id}`);
+          const otherEl = document.getElementById(`other-${emp.id}`);
+          const adjustmentsEl = document.getElementById(`adjustments-${emp.id}`);
+          const previousEl = document.getElementById(`previous-${emp.id}`);
+          const netEl = document.getElementById(`net-${emp.id}`);
+          if (iouEl) {
+              iouEl.textContent = formatCurrency(d.iou_deduction);
+              iouEl.className = 'text-danger';
+          }
+          if (otherEl) {
+              otherEl.textContent = formatCurrency(d.other_deductions);
+              otherEl.className = 'text-danger';
+          }
+          if (adjustmentsEl) {
+              adjustmentsEl.textContent = formatCurrency(d.bonus);
+              adjustmentsEl.className = 'text-success';
+          }
+          if (previousEl) {
+              previousEl.innerHTML = `${formatCurrency(d.previous_balance)}${d.previous_balance > 0 ? '<br><small class="text-info">Prev. Bal</small>' : ''}`;
+              previousEl.className = 'text-info';
+          }
+          if (netEl) {
+              netEl.textContent = formatCurrency(d.outstanding_balance);
+              netEl.classList.add('font-bold');
+          }
+        }
+      });
+    } catch (e) {
+      console.warn('Failed to load per-employee salary breakdowns', e);
+    } finally {
+      updateBulkTotal();
+    }
+  })();
+}
+
+// ==========================================
+// IOU & BONUS MANAGEMENT
+// ==========================================
+
+async function loadAdjustments(type, search = "", status = "") {
+    const tbodyId = type === 'iou' ? 'iouTableBody' : 'bonusTableBody';
+    const tbody = document.getElementById(tbodyId);
+    if (!tbody) return;
+
+    // Reset select all checkbox
+    const selectAllId = type === 'iou' ? 'selectAllIOU' : 'selectAllBonus';
+    const selectAll = document.getElementById(selectAllId);
+    if (selectAll) selectAll.checked = false;
+
+    try {
+        let url = `/api/salary-adjustments/?type=${type}`;
+        if (search) url += `&search=${encodeURIComponent(search)}`;
+        if (status) url += `&status=${status}`;
+
+        const res = await apiRequest(url);
+        if (!res.success) throw new Error(res.message);
+        
+        const list = res.data?.results || res.data || [];
+        tbody.innerHTML = "";
+
+        if (!list.length) {
+            tbody.innerHTML = `<tr><td colspan="8" class="text-center">No ${type.toUpperCase()} records found</td></tr>`;
+            return;
+        }
+
+        list.forEach(adj => {
+            const row = document.createElement("tr");
+            const canApprove = adj.status === 'pending';
+            row.innerHTML = `
+                <td>${canApprove ? `<input type="checkbox" class="${type}-checkbox" value="${adj.id}">` : ''}</td>
+                <td>${formatDate(adj.date_added)}</td>
+                <td>${escapeHtml(adj.employee_name)}</td>
+                <td>${formatCurrency(adj.amount)}</td>
+                <td>${escapeHtml(adj.reason)}</td>
+                <td><span class="badge status-${adj.status}">${adj.status.toUpperCase()}</span></td>
+                <td>${escapeHtml(adj.added_by_name || 'System')}</td>
+                <td>
+                    ${adj.status === 'pending' ? `
+                        <button class="btn btn-sm btn-success" onclick="approveAdjustment('${adj.id}', '${type}')">Approve</button>
+                        <button class="btn btn-sm btn-danger" onclick="deleteAdjustment('${adj.id}', '${type}')">Delete</button>
+                    ` : '-'}
+                </td>
+            `;
+            tbody.appendChild(row);
+        });
+    } catch (err) {
+        showToast(`Failed to load ${type}s`, "error");
+    }
+}
+
+async function approveAdjustment(id, type) {
+    if (!confirm(`Approve this ${type}?`)) return;
+    const res = await apiRequest(`/api/salary-adjustments/${id}/approve/`, { method: 'POST' });
+    if (res.success) {
+        showToast(`${type.toUpperCase()} approved`, "success");
+        loadAdjustments(type);
+        updateDashboardStats();
+    }
+}
+
+async function deleteAdjustment(id, type) {
+    if (!confirm(`Delete this ${type}?`)) return;
+    const res = await apiRequest(`/api/salary-adjustments/${id}/`, { method: 'DELETE' });
+    if (res.success) {
+        showToast(`${type.toUpperCase()} deleted`, "success");
+        loadAdjustments(type);
+        updateDashboardStats();
+    }
+}
+
+async function searchAdjustments(type) {
+    const search = document.getElementById(`${type}Search`)?.value || "";
+    const status = document.getElementById(`${type}StatusFilter`)?.value || "";
+    loadAdjustments(type, search, status);
+}
+
+function showAddAdjustmentModal(type) {
+    const form = document.getElementById("addAdjustmentForm");
+    if (form) form.reset();
+    
+    document.getElementById("adjustmentType").value = type;
+    document.getElementById("adjustmentModalTitle").textContent = type === 'iou' ? 'Add New IOU' : 'Add New Bonus';
+    document.getElementById("adjustmentDate").value = new Date().toISOString().split('T')[0];
+    
+    populateEmployeeSelect("adjustmentEmployee");
+    openModal("addAdjustmentModal");
+}
+
+async function handleAddAdjustment(e) {
+    e.preventDefault();
+    const btn = e.target.querySelector('button[type="submit"]');
+    
+    const type = document.getElementById("adjustmentType").value;
+    const payload = {
+        employee: document.getElementById("adjustmentEmployee").value,
+        amount: parseFloat(document.getElementById("adjustmentAmount").value),
+        date_added: document.getElementById("adjustmentDate").value,
+        reason: document.getElementById("adjustmentReason").value,
+        type: type
+    };
+    
+    if (!payload.employee || !payload.amount || !payload.date_added || !payload.reason) {
+        showToast("Please fill all required fields", "warning");
+        return;
+    }
+    
+    try {
+        showLoading(btn);
+        const res = await apiRequest("/api/salary-adjustments/", {
+            method: "POST",
+            body: payload
+        });
+        
+        if (res.success) {
+            showToast(`${type.toUpperCase()} added successfully`, "success");
+            closeModal("addAdjustmentModal");
+            loadAdjustments(type);
+            updateDashboardStats();
+        } else {
+            showToast(res.message || "Failed to add adjustment", "error");
+        }
+    } catch (err) {
+        showToast("An error occurred", "error");
+    } finally {
+        hideLoading(btn);
+    }
+}
+
+function toggleAllAdjustments(type) {
+    const selectAllId = type === 'iou' ? 'selectAllIOU' : 'selectAllBonus';
+    const selectAll = document.getElementById(selectAllId);
+    const checkboxes = document.querySelectorAll(`.${type}-checkbox`);
+    if (selectAll) {
+        checkboxes.forEach(cb => cb.checked = selectAll.checked);
+    }
+}
+
+async function bulkApproveAdjustments(type) {
+    const checkboxes = document.querySelectorAll(`.${type}-checkbox:checked`);
+    const ids = Array.from(checkboxes).map(cb => cb.value);
+
+    if (!ids.length) {
+        showToast(`Please select at least one pending ${type} to approve`, "warning");
+        return;
+    }
+
+    if (!confirm(`Are you sure you want to approve ${ids.length} selected ${type}(s)?`)) return;
+
+    try {
+        showLoading();
+        const res = await apiRequest("/api/salary-adjustments/bulk_approve/", {
+            method: "POST",
+            body: { ids }
+        });
+
+        if (res.success) {
+            showToast(res.data.message || `${type.toUpperCase()}s approved successfully`, "success");
+            loadAdjustments(type);
+            updateDashboardStats();
+        } else {
+            showToast(res.message || "Failed to approve adjustments", "error");
+        }
+    } catch (err) {
+        showToast("An error occurred during bulk approval", "error");
+    } finally {
+        hideLoading();
+    }
+}
+
+// ==========================================
+// COMPANY PAYMENT STATUS
+// ==========================================
+
+async function loadClientPayments() {
+    const tbody = document.getElementById("clientPaymentsTableBody");
+    if (!tbody) return;
+
+    try {
+        const res = await apiRequest("/api/client-payments/");
+        if (!res.success) throw new Error(res.message);
+        
+        const list = res.data?.results || res.data || [];
+        tbody.innerHTML = "";
+
+        list.forEach(cp => {
+            const row = document.createElement("tr");
+            const statusClass = 
+                cp.status === 'paid' ? 'bg-success' : 
+                cp.status === 'partial' ? 'bg-warning' : 'bg-danger';
+            
+            row.innerHTML = `
+                <td>${escapeHtml(cp.month_key)}</td>
+                <td>${escapeHtml(cp.client_name)}</td>
+                <td>${formatCurrency(cp.amount_paid)}</td>
+                <td>${formatCurrency(cp.outstanding_balance)}</td>
+                <td><span class="badge ${statusClass}">${cp.status.toUpperCase()}</span></td>
+                <td>${formatDate(cp.payment_date)}</td>
+                <td>
+                    <button class="btn btn-sm btn-primary" onclick="editClientPayment('${cp.id}')">Update</button>
+                </td>
+            `;
+            tbody.appendChild(row);
+        });
+    } catch (err) {
+        showToast("Failed to load company payments", "error");
+    }
 }
 
 async function cancelStuckPayment(paymentId) {
@@ -3824,49 +4743,32 @@ function populatePaymentsTable() {
   const currentMonth = new Date().toISOString().slice(0, 7);
 
   activeEmployees.forEach((emp) => {
-    const monthlyPayment = (AppState.payments || []).find(
-      (p) => idsMatch(p.employee, emp.id) && p.payment_month === currentMonth,
-    );
-    const baseSalary = Number(emp.salary || 0);
-    const netSalary =
-      emp.net_salary !== null &&
-      emp.net_salary !== undefined &&
-      Number.isFinite(Number(emp.net_salary))
-        ? Number(emp.net_salary)
-        : baseSalary;
-    const deductions = Number.isFinite(Number(emp.applied_deductions))
-      ? Number(emp.applied_deductions)
-      : Math.max(baseSalary - netSalary, 0);
+    const d = emp.salary_breakdown;
+    const isPaidFully = d.outstanding_balance <= 0;
 
-    let statusBadge = '<span class="badge bg-secondary">Not Paid</span>';
-    let actionBtn = `<button type="button" class="btn btn-sm btn-success" onclick="initiateIndividualPayment('${emp.id}')">Pay</button>`;
+    let statusBadge = '';
+    let actionBtn = '';
 
-    if (monthlyPayment) {
-        const s = monthlyPayment.status;
-        const statusClass = 
-            s === "completed" ? "bg-success" : 
-            s === "failed" ? "bg-danger" : 
-            s === "pending_paystack_otp" ? "bg-warning" : "bg-warning";
-        statusBadge = `<span class="badge ${statusClass}">${s.replace(/_/g, ' ').toUpperCase()}</span>`;
-
-        if (s === "completed") {
-            actionBtn = '<span class="text-success"><i class="fas fa-check-circle"></i> Paid</span>';
-        } else if (s === "pending_paystack_otp") {
-            // FIXED: Single block with BOTH Enter OTP and Cancel buttons
+    if (isPaidFully) {
+        statusBadge = '<span class="badge bg-success">PAID</span>';
+        actionBtn = '<span class="text-success"><i class="fas fa-check-circle"></i> Settled</span>';
+    } else {
+        const monthlyPayment = (AppState.payments || []).find(
+            (p) => idsMatch(p.employee, emp.id) && p.payment_month === currentMonth && p.status !== 'failed'
+        );
+        
+        if (monthlyPayment && (monthlyPayment.status === 'pending' || monthlyPayment.status === 'processing')) {
+            statusBadge = '<span class="badge bg-warning">PROCESSING</span>';
+            actionBtn = `<button type="button" class="btn btn-sm btn-info" onclick="retryPayment('${monthlyPayment.transaction_reference}')">Sync</button>`;
+        } else if (monthlyPayment && monthlyPayment.status === 'pending_paystack_otp' && monthlyPayment.paystack_otp_required) {
+            statusBadge = '<span class="badge bg-warning">AWAITING OTP</span>';
             actionBtn = `
-                <button type="button" class="btn btn-sm btn-warning" onclick="showPaystackOtpModal('${monthlyPayment.transaction_reference}', '${monthlyPayment.paystack_transfer_code || ''}')">
-                    <i class="fas fa-key"></i> Enter OTP
-                </button>
-                <button type="button" class="btn btn-sm btn-danger" onclick="cancelStuckPayment('${monthlyPayment.id}')">
-                    <i class="fas fa-times"></i> Cancel
-                </button>
-            `;
-        } else if (s === "processing" || s === "pending" || s === "pending_hr") {
-            actionBtn = `<button type="button" class="btn btn-sm btn-info" onclick="retryPayment('${monthlyPayment.transaction_reference}')">Checking...</button>`;
-        } else if (s === "failed") {
-            actionBtn = `<button type="button" class="btn btn-sm btn-warning" onclick="initiateIndividualPayment('${emp.id}')">Retry</button>`;
+                <button type="button" class="btn btn-sm btn-warning" onclick="showPaystackOtpModal('${monthlyPayment.transaction_reference}', '${monthlyPayment.paystack_transfer_code || ''}')">OTP</button>
+                <button type="button" class="btn btn-sm btn-danger" onclick="cancelStuckPayment('${monthlyPayment.id}')">×</button>`;
         } else {
-            actionBtn = `<button type="button" class="btn btn-sm btn-secondary" disabled title="Payment already initiated for this month">Pay</button>`;
+
+            statusBadge = d.total_paid > 0 ? '<span class="badge bg-info">PARTIAL</span>' : '<span class="badge bg-secondary">UNPAID</span>';
+            actionBtn = `<button type="button" class="btn btn-sm btn-success" onclick="initiateIndividualPayment('${emp.id}')">Pay ${d.total_paid > 0 ? 'Bal' : ''}</button>`;
         }
     }
 
@@ -3876,14 +4778,25 @@ function populatePaymentsTable() {
             <td>${escapeHtml(emp.employee_id || "-")}</td>
             <td>${escapeHtml(emp.name)}</td>
             <td>${escapeHtml(emp.bank_name || "-")} - ${escapeHtml(emp.account_number || "-")}</td>
-            <td>${formatCurrency(baseSalary)}</td>
-            <td>${formatCurrency(deductions)}</td>
-            <td>${formatCurrency(netSalary)}</td>
+            <td>${formatCurrency(d.base_salary)}</td>
+            <td class="text-danger">${formatCurrency(d.iou_deduction)}</td>
+            <td class="text-danger">${formatCurrency(d.other_deductions)}</td>
+            <td class="text-success">${formatCurrency(d.bonus)}</td>
+            <td class="text-info">
+                ${formatCurrency(d.previous_balance || 0)}
+                ${(d.previous_balance || 0) > 0 ? '<br><small class="text-muted" style="font-size: 0.7em;">Prev. Month Unpaid Bal</small>' : ''}
+            </td>
+            <td class="font-bold" title="Outstanding Balance = Total Due - Total Paid">${formatCurrency(d.outstanding_balance)}</td>
             <td>${statusBadge}</td>
             <td>${actionBtn}</td>
         `;
     tbody.appendChild(row);
   });
+
+  // Update Pending Payments Count (Unpaid or Partial)
+  const pendingCount = activeEmployees.filter(e => e.salary_breakdown.outstanding_balance > 0).length;
+  const pendingEl = document.getElementById("pendingPayments");
+  if (pendingEl) pendingEl.textContent = pendingCount;
 }
 
 function updatePaymentSelection() {
@@ -3903,7 +4816,9 @@ function toggleAllPayments() {
 function toggleAllEmployees() {
   const selectAllCheckbox = document.getElementById("selectAllEmployees");
   const checkboxes = document.querySelectorAll(".employee-checkbox");
-  checkboxes.forEach((cb) => (cb.checked = selectAllCheckbox?.checked));
+  if (selectAllCheckbox) {
+    checkboxes.forEach((cb) => (cb.checked = selectAllCheckbox.checked));
+  }
 }
 
 // ==========================================
@@ -4252,6 +5167,7 @@ function exportPaymentHistory() {
   openModal("exportPasswordModal");
 }
 
+
 // REPLACE the existing triggerSecureDownload function
 async function triggerSecureDownload(url, token, filename, { method = null } = {}) {
   try {
@@ -4339,7 +5255,11 @@ async function finishDownload(token, type, modal, url, downloadFilename) {
 }
 
 // REPLACE the existing confirmExport function
-async function confirmExport() {
+async function confirmExport(e) {
+  if (e && typeof e.preventDefault === "function") {
+    e.preventDefault();
+  }
+
   const password = document.getElementById("exportPassword")?.value;
   const modal = document.getElementById("exportPasswordModal");
   const type = modal?.dataset.exportType;
@@ -4354,12 +5274,23 @@ async function confirmExport() {
     return;
   }
 
-  let url = type === "payments" ? "/api/payments/request_export/" : "/api/employees/request_export/";
+  let url =
+    type === "payments"
+      ? "/api/payments/request-export/"
+      : type === "employees"
+        ? "/api/employees/request_export/"
+          : type === "payslip"
+          ? "/api/payments/request-payslip-export/"
+          : type === "receipt"
+            ? `/api/payments/${modal.dataset.paymentId}/request-receipt-export/`
+            : "/api/employees/request_export/";
   let payload = { password };
   let downloadFilename = type === "payments" ? "payment_history.csv" : "employees.csv";
 
+
   if (type === "payslip") {
-    url = "/api/payments/request_payslip_export/";
+    url = "/api/payments/request-payslip-export/";
+
     payload.employee_id = modal.dataset.employeeId;
     payload.month = modal.dataset.month;
     downloadFilename = `payslip_${modal.dataset.month}.pdf`;
@@ -4432,7 +5363,7 @@ async function confirmExport() {
 //     type === "payments" ? "payment_history.csv" : "employees.csv";
 
 //   if (type === "payslip") {
-//     url = "/api/payments/request_payslip_export/";
+    url = "/api/payments/request-payslip-export/";
 //     payload.employee_id = modal.dataset.employeeId;
 //     payload.month = modal.dataset.month;
 //     downloadFilename = `payslip_${modal.dataset.month}.pdf`;
@@ -4670,6 +5601,20 @@ function initEmployeeSearch() {
   if (typeFilter) typeFilter.addEventListener("change", filterEmployees);
 }
 
+function initAdjustmentSearch() {
+    ['iou', 'bonus'].forEach(type => {
+        const searchInput = document.getElementById(`${type}Search`);
+        const statusFilter = document.getElementById(`${type}StatusFilter`);
+        
+        if (searchInput) {
+            searchInput.addEventListener("input", debounce(() => searchAdjustments(type), 300));
+        }
+        if (statusFilter) {
+            statusFilter.addEventListener("change", () => searchAdjustments(type));
+        }
+    });
+}
+
 function setupBankCodeTracking() {
   const bankSelects = [
     document.getElementById("accountBankName"),
@@ -4691,15 +5636,13 @@ function setupBankCodeTracking() {
 
 function setupEventListeners() {
   initEmployeeSearch();
+  initAdjustmentSearch();
   setupEmployeeIdGeneration();
   setupBankCodeTracking(); // Fixed: Ensure bank code tracking is set up
   setupBankVerification();
   document
     .getElementById("verifyAccountBtn")
     ?.addEventListener("click", verifyBankAccountManual);
-
-  // Bulk Approval "Check All" Listener
-  // document.getElementById('selectAllEmployees')?.addEventListener('change', toggleAllEmployees);
 
   // Bulk Actions Listeners
   document
@@ -4751,9 +5694,9 @@ function setupEventListeners() {
     { id: "resetPasswordForm", handler: handleResetPassword },
     { id: "leaveForm", handler: handleMarkLeave }, // ADDED
     { id: "requestForm", handler: handleCreateRequest },
+    { id: "addAdjustmentForm", handler: handleAddAdjustment },
     // FIX: Ensure export confirm submit actually triggers confirmExport()
     { id: "exportPasswordForm", handler: confirmExport },
-    // Add to the forms array in setupEventListeners
     { id: "paystackOtpForm", handler: submitPaystackOtp },
   ];
   document.getElementById("selfSignupForm")?.addEventListener("submit", handleSelfSignup);
@@ -4762,24 +5705,21 @@ function setupEventListeners() {
     const form = document.getElementById(id);
     if (!form) return;
 
-    // DEBUG/SAFETY: ensure confirmExport handlers are correctly invoked.
+    // DEBUG/SAFETY: ensure submit handlers are called without triggering default form navigation.
     form.addEventListener("submit", (e) => {
+      if (e && typeof e.preventDefault === "function") {
+        e.preventDefault();
+      }
       try {
         handler(e);
       } catch (err) {
         console.error(`Submit handler failed for #${id}:`, err);
-        showToast(err.message || "Export failed", "error");
+        showToast(err.message || "Form submission failed", "error");
       }
     });
   });
 }
 
-/** Select or deselect all employee checkboxes for bulk approval */
-function toggleAllEmployees() {
-  const selectAllCheckbox = document.getElementById("selectAllEmployees");
-  const checkboxes = document.querySelectorAll(".employee-checkbox");
-  checkboxes.forEach((cb) => (cb.checked = selectAllCheckbox?.checked));
-}
 // ==========================================
 // DASHBOARD & INITIALIZATION
 // ==========================================
@@ -5277,6 +6217,7 @@ const EXPOSED_FUNCTIONS = {
   handleCreateEmployee,
   handleDelete,
   bulkApproveEmployees,
+  bulkUpdateBankCodes,
   resendConfirmationMail,
   approveEmployee,
   fetchNextEmployeeId, // Fixed: Ensure fetchNextEmployeeId is exposed
@@ -5297,6 +6238,12 @@ const EXPOSED_FUNCTIONS = {
   updateDeduction,
   deleteDeduction,
   editDeduction,
+
+  // Adjustments
+  searchAdjustments,
+  showAddAdjustmentModal,
+  toggleAllAdjustments,
+  bulkApproveAdjustments,
 
   // Attendance
   loadAttendance,
@@ -5354,9 +6301,7 @@ const EXPOSED_FUNCTIONS = {
   toggleAllEmployees,
 
   // OTP
-  showOTPModal,
-  verifyOTP, // Fixed: Ensure verifyOTP is exposed
-  resendOTP,
+  // Internal OTP functions removed
   startOtpCountdown,
 
   // Bank verification

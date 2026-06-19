@@ -107,6 +107,12 @@
                 <li><a href="javascript:void(0)" onclick="showSection('deductions')">
                     <i class="fas fa-minus-circle"></i> <span>Deductions</span>
                 </a></li>
+                <li><a href="javascript:void(0)" onclick="showSection('iou-management')">
+                    <i class="fas fa-hand-holding-usd"></i> <span>IOU Management</span>
+                </a></li>
+                <li><a href="javascript:void(0)" onclick="showSection('bonus-management')">
+                    <i class="fas fa-gift"></i> <span>Bonus Management</span>
+                </a></li>
                 <li><a href="javascript:void(0)" onclick="showSection('payments')">
                     <i class="fas fa-money-bill-wave"></i> <span>Payments</span>
                 </a></li>
@@ -191,6 +197,12 @@
 
             <!-- Requests Section -->
             <section class="content-section" id="requests">
+                <select id="requestFilter" onchange="filterRequests(this.value)">
+                    <option value="">All Status</option>
+                    <option value="pending">Pending</option>
+                    <option value="approved">Approved</option>
+                    <option value="declined">Declined</option>
+                </select>
                 <div class="section-header">
                     <h2><i class="fas fa-envelope-open-text"></i> Employee Requests</h2>
                     <button onclick="showRequestModal()" class="btn btn-primary">
@@ -231,15 +243,15 @@
                                 </button>
                             </div>
                         </div>
-
                         <div class="filter-bar">
                             <label for="employeeSearch">Search Employees</label>
-                            <input type="text" id="employeeSearch" placeholder="Search employees..." class="search-input">
+                            <input type="text" id="employeeSearch" placeholder="Search employees..." 
+                                oninput="debounce(searchEmployees, 300)(this.value)" class="search-input">
                             <select id="employeeTypeFilter" class="filter-select">
                                 <option value="all">All Types</option>
                                 <option value="staff">Staff</option>
                                 <option value="guard">Guard</option>
-                                <option value="employee">Employee</option>
+                                <option value="employee">VENDOR</option>
                             </select>
                             <button onclick="exportAllEmployees()" class="btn btn-success">
                                 <i class="fas fa-file-export"></i> Export
@@ -280,7 +292,6 @@
                                 </button>
                             </div>
                         </div>
-
                         <div class="attendance-summary">
                             <div class="summary-card">
                                 <h4>Present Today</h4>
@@ -343,6 +354,88 @@
                         </div>
                     </section>
 
+                    <!-- IOU Management Section -->
+                    <section class="content-section" id="iou-management">
+                        <div class="section-header">
+                            <h2><i class="fas fa-hand-holding-usd"></i> IOU Management</h2>
+                            <div class="btn-group">
+                                <button onclick="bulkApproveAdjustments('iou')" class="btn btn-success">
+                                    <i class="fas fa-check-double"></i> Bulk Approve
+                                </button>
+                                <button onclick="showAddAdjustmentModal('iou')" class="btn btn-primary">
+                                    <i class="fas fa-plus"></i> Add IOU
+                                </button>
+                            </div>
+                        </div>
+                        <div class="filter-bar">
+                            <input type="text" id="iouSearch" placeholder="Search employee..." class="search-input">
+                            <select id="iouStatusFilter" class="filter-select">
+                                <option value="">All Status</option>
+                                <option value="pending">Pending</option>
+                                <option value="approved">Approved</option>
+                                <option value="declined">Declined</option>
+                            </select>
+                        </div>
+                        <div class="table-responsive">
+                            <table class="data-table">
+                                <thead>
+                                    <tr>
+                                        <th><input type="checkbox" id="selectAllIOU" onclick="toggleAllAdjustments('iou')"></th>
+                                        <th>Date</th>
+                                        <th>Employee</th>
+                                        <th>Amount</th>
+                                        <th>Reason</th>
+                                        <th>Status</th>
+                                        <th>Added By</th>
+                                        <th>Actions</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="iouTableBody"></tbody>
+                            </table>
+                        </div>
+                    </section>
+
+                    <!-- Bonus Management Section -->
+                    <section class="content-section" id="bonus-management">
+                        <div class="section-header">
+                            <h2><i class="fas fa-gift"></i> Bonus Management</h2>
+                            <div class="btn-group">
+                                <button onclick="bulkApproveAdjustments('bonus')" class="btn btn-success">
+                                    <i class="fas fa-check-double"></i> Bulk Approve
+                                </button>
+                                <button onclick="showAddAdjustmentModal('bonus')" class="btn btn-primary">
+                                    <i class="fas fa-plus"></i> Add Bonus
+                                </button>
+                            </div>
+                        </div>
+                        <div class="filter-bar">
+                            <input type="text" id="bonusSearch" placeholder="Search employee..." class="search-input">
+                            <select id="bonusStatusFilter" class="filter-select">
+                                <option value="">All Status</option>
+                                <option value="pending">Pending</option>
+                                <option value="approved">Approved</option>
+                                <option value="declined">Declined</option>
+                            </select>
+                        </div>
+                        <div class="table-responsive">
+                            <table class="data-table">
+                                <thead>
+                                    <tr>
+                                        <th><input type="checkbox" id="selectAllBonus" onclick="toggleAllAdjustments('bonus')"></th>
+                                        <th>Date</th>
+                                        <th>Employee</th>
+                                        <th>Amount</th>
+                                        <th>Reason</th>
+                                        <th>Status</th>
+                                        <th>Added By</th>
+                                        <th>Actions</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="bonusTableBody"></tbody>
+                            </table>
+                        </div>
+                    </section>
+
                     <!-- Edit Deduction Modal -->
                     <div id="editDeductionModal" class="modal" style="display: none;">
                         <div class="modal-content">
@@ -391,7 +484,8 @@
                                 <p id="monthlyPayments">₦0</p>
                             </div>
                         </div>
-
+                        <input type="number" id="customAmount" placeholder="Enter custom amount" 
+                            style="display:none;width:100%;padding:10px;margin-bottom:10px;border:1px solid #ddd;border-radius:6px;">
                         <div class="table-responsive">
                             <table class="data-table">
                                 <thead>
@@ -401,8 +495,11 @@
                                         <th>Name</th>
                                         <th>Bank Account</th>
                                         <th>Base Salary</th>
+                                        <th>IOU</th>
                                         <th>Deductions</th>
-                                        <th>Net Salary</th>
+                                        <th>Bonus</th>
+                                        <th>Prev. Bal</th>
+                                        <th>Outstanding</th>
                                         <th>Status</th>
                                         <th>Action</th>
                                     </tr>
@@ -610,14 +707,12 @@
                                 <i class="fas fa-file-export"></i> Export
                             </button>
                         </div>
-
                         <div class="filter-bar">
                             <input type="text" id="historySearch" placeholder="Search by employee..." class="search-input">
                             <input type="date" id="historyDateFrom" class="form-control">
                             <input type="date" id="historyDateTo" class="form-control">
                             <button onclick="filterHistory()" class="btn btn-secondary">Filter</button>
                         </div>
-
                         <div class="table-responsive">
                             <table class="data-table">
                                 <thead>
@@ -637,7 +732,6 @@
                         </div>
                     </section>
                 </div>
-
                 <!-- Sacked Employees Section -->
                 <div id="admin-controls-sacked">
                     <section class="content-section" id="sacked">
@@ -752,7 +846,7 @@
                         <select id="newEmployeeType" class="form-control" required>
                             <option value="staff">Staff</option>
                             <option value="guard">Guard</option>
-                            <option value="employee">Employee</option>
+                            <option value="employee">Vendor</option>
                         </select>
                     </div>
                     <!-- <input type="hidden" id="newEmployeeId" value=""> -->
@@ -918,21 +1012,65 @@
                         <label for="paymentEmployee">Select Employee</label>
                         <select id="paymentEmployee" class="form-control" required onchange="updatePaymentPreview()"></select>
                     </div>
+                    <div class="form-group">
+                        <label><input type="checkbox" id="isPartialPaymentIndividual" onchange="togglePartialPaymentIndividual()"> Partial Payment</label>
+                    </div>
+                    <div id="partialFieldsIndividual" style="display:none;">
+                        <div class="form-group">
+                            <label for="partialAmountIndividual">Partial Payment Amount (₦)</label>
+                            <input type="number" id="partialAmountIndividual" class="form-control" min="0" step="0.01">
+                        </div>
+                        <div class="form-group">
+                            <label for="partialReasonIndividual">Reason for Partial Payment</label>
+                            <textarea id="partialReasonIndividual" class="form-control" rows="2"></textarea>
+                        </div>
+                    </div>
                     
-                    <!-- ADDED: Payment Preview -->
+                        <!-- ADDED: Payment Preview -->
                     <div id="paymentPreview" class="payment-preview" style="display: none;">
+                        <div class="payment-preview-row">
+                            <span>Total Amount Due:</span>
+                            <span id="previewTotalPayable">₦0</span>
+                        </div>
+                        <div class="payment-preview-row">
+                            <span>Partial Amount Paid:</span>
+                            <span id="previewTotalPaid" class="text-success">₦0</span>
+                        </div>
+                        <div class="payment-preview-row">
+                            <span>Outstanding Balance:</span>
+                            <span id="previewNetAmount" class="text-danger font-bold">₦0</span>
+                        </div>
+                        <div class="payment-preview-row">
+                            <span>Remaining Balance:</span>
+                            <span id="previewRemainingBalance" class="text-danger font-bold">₦0</span>
+                        </div>
+                        <div class="payment-preview-row" style="margin-top:6px;">
+                            <span>Payment Status:</span>
+                            <span id="previewPaymentStatus" class="text-muted">-</span>
+                        </div>
+
+                        <!-- Keep existing breakdown for context (non-breaking IDs used elsewhere) -->
                         <div class="payment-preview-row">
                             <span>Base Salary:</span>
                             <span id="previewBaseSalary">₦0</span>
                         </div>
                         <div class="payment-preview-row">
+                            <span>IOU Deduction:</span>
+                            <span id="previewIOUDeductions" class="text-danger">₦0</span>
+                        </div>
+                        <div class="payment-preview-row">
                             <span>Deductions:</span>
-                            <span id="previewDeductions">₦0</span>
+                            <span id="previewDeductions" class="text-danger">₦0</span>
                         </div>
-                        <div class="payment-preview-row payment-preview-total">
-                            <span>Net Amount:</span>
-                            <span id="previewNetAmount">₦0</span>
+                        <div class="payment-preview-row">
+                            <span>Bonus:</span>
+                            <span id="previewBonus" class="text-success">₦0</span>
                         </div>
+                        <div class="payment-preview-row">
+                            <span>Prev. Month Balance:</span>
+                            <span id="previewPrevBalance" class="text-info">₦0</span>
+                        </div>
+
                         <div class="payment-preview-row" style="margin-top: 10px; font-size: 0.9em; color: #666;">
                             <span>Bank:</span>
                             <span id="previewBank">-</span>
@@ -942,6 +1080,7 @@
                             <span id="previewAccount">-</span>
                         </div>
                     </div>
+
                     
                     <div class="alert alert-info" style="margin: 15px 0; padding: 10px; background: #d1ecf1; border-radius: 4px;">
                         <i class="fas fa-info-circle"></i> You will be redirected to Paystack to complete the payment securely.
@@ -987,6 +1126,15 @@
                             Total Amount: <span id="bulkTotalAmount">₦0</span>
                         </div>
                     </div>
+                    <div style="margin:10px 0;">
+                        <label><input type="checkbox" id="bulkPartialToggle" onchange="toggleBulkPartial()"> Enable Partial Payments for selected employees</label>
+                        <div id="bulkPartialControls" style="display:none;margin-top:8px;">
+                            <label>Default Partial Amount for selected (₦)</label>
+                            <input type="number" id="bulkDefaultPartialAmount" class="form-control" min="0" step="0.01" placeholder="Leave empty to enter per-employee amounts">
+                            <label style="margin-top:8px;">Default Reason</label>
+                            <input type="text" id="bulkDefaultPartialReason" class="form-control" placeholder="Reason for partial payments">
+                        </div>
+                    </div>
                     <div class="table-responsive">
                         <table class="data-table">
                             <thead>
@@ -995,7 +1143,13 @@
                                     <th>Employee ID</th>
                                     <th>Name</th>
                                     <th>Bank Account</th>
-                                    <th>Net Salary</th>
+                                    <th>Outstanding</th>
+                                    <th>IOU</th>
+                                    <th>Deductions</th>
+                                    <th>Bonus</th>
+                                    <th>Prev. Bal</th>
+                                    <th>Partial Amount</th>
+                                    <th>Partial Reason</th>
                                 </tr>
                             </thead>
                             <tbody id="bulkPaymentTableBody"></tbody>
@@ -1074,6 +1228,36 @@
                         <select id="companyAssignedGuards" name="assigned_guards" multiple style="display:none;"></select>
                     </div>
                     <button type="submit" id="saveCompanyBtn" class="btn btn-primary btn-block">Add Company</button>
+                </form>
+            </div>
+        </div>
+
+        <!-- Add Adjustment Modal -->
+        <div id="addAdjustmentModal" class="modal" style="display: none;">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h3 id="adjustmentModalTitle">Add Adjustment</h3>
+                    <span class="close" onclick="closeModal('addAdjustmentModal')">&times;</span>
+                </div>
+                <form id="addAdjustmentForm">
+                    <input type="hidden" id="adjustmentType">
+                    <div class="form-group">
+                        <label for="adjustmentEmployee">Select Employee</label>
+                        <select id="adjustmentEmployee" class="form-control" required></select>
+                    </div>
+                    <div class="form-group">
+                        <label for="adjustmentAmount">Amount (₦)</label>
+                        <input type="number" id="adjustmentAmount" class="form-control" required min="0" step="0.01">
+                    </div>
+                    <div class="form-group">
+                        <label for="adjustmentDate">Date</label>
+                        <input type="date" id="adjustmentDate" class="form-control" required>
+                    </div>
+                    <div class="form-group">
+                        <label for="adjustmentReason">Reason/Description</label>
+                        <textarea id="adjustmentReason" class="form-control" rows="3" required></textarea>
+                    </div>
+                    <button type="submit" class="btn btn-primary btn-block">Submit Adjustment</button>
                 </form>
             </div>
         </div>
