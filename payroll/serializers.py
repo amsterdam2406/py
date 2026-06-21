@@ -435,6 +435,7 @@ class PaymentSerializer(serializers.ModelSerializer):
     employee_name = serializers.CharField(source='employee.name', read_only=True)
     employee_id = serializers.CharField(source='employee.employee_id', read_only=True)
     bank_account = serializers.SerializerMethodField()
+    paystack_otp_required = serializers.SerializerMethodField()
 
     class Meta:
         model = Payment
@@ -458,6 +459,7 @@ class PaymentSerializer(serializers.ModelSerializer):
             'transaction_reference',
             'paystack_reference',
             'paystack_transfer_code',
+            'paystack_otp_required',
             'status',
             'payment_date',
             'processed_by',
@@ -469,7 +471,12 @@ class PaymentSerializer(serializers.ModelSerializer):
 
 
     def get_bank_account(self, obj):
+        if not obj.employee:
+            return "-"
         return f"{obj.employee.bank_name} - {obj.employee.account_number}"
+
+    def get_paystack_otp_required(self, obj):
+        return obj.status == 'pending_paystack_otp'
 
     def validate_net_amount(self, value):
         if value <= 0:
@@ -579,6 +586,17 @@ class OTPSerializer(serializers.ModelSerializer):
         if self.instance and self.instance.expires_at < timezone.now():
             raise serializers.ValidationError("OTP has expired")
         return attrs
+
+
+class PaystackResolveAccountSerializer(serializers.Serializer):
+    account_number = serializers.RegexField(
+        regex=r'^\d{10}$',
+        error_messages={'invalid': 'A valid 10-digit account number is required.'},
+    )
+    bank_code = serializers.RegexField(
+        regex=r'^\d{3,6}$',
+        error_messages={'invalid': 'A valid Paystack bank code is required.'},
+    )
 
 
 class ExportTokenSerializer(serializers.ModelSerializer):

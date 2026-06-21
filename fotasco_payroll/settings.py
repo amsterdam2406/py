@@ -106,8 +106,8 @@ INSTALLED_APPS = [
     'django_celery_beat',
     
     # cloud
-    'cloudinary_storage',
     'cloudinary',
+
 ]
 
 # Add cloudinary_storage only if available

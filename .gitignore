@@ -95,3 +95,5 @@ Thumbs.db
 
 # Render/Production
 *.pyc
+payroll/test_paystack_account_resolution.py
+.payroll/test_paystack_account_resolution.py

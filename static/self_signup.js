@@ -3,6 +3,9 @@
   function showSelfSignupModal() {
     const modal = document.getElementById('selfSignupModal');
     if (!modal) return;
+    if (typeof window.loadNigerianBanks === 'function') {
+      window.loadNigerianBanks();
+    }
     modal.style.display = 'flex';
     modal.classList.add('active');
   }
@@ -48,13 +51,18 @@
   async function submitSelfSignup() {
     const form = document.getElementById('selfSignupForm');
     if (!form) return;
+    if (form.dataset.submitHandlerBound === 'true') return;
+    if (form.dataset.selfSignupSubmitBound === 'true') return;
+    form.dataset.selfSignupSubmitBound = 'true';
+    form.dataset.submitHandlerBound = 'true';
 
     form.addEventListener('submit', async (e) => {
       e.preventDefault();
 
       const getVal = (id) => (document.getElementById(id)?.value || '').trim();
       const bankSelect = document.getElementById('signupBankName');
-      const bankCode = bankSelect?.options[bankSelect.selectedIndex]?.dataset?.code || '';
+      const selectedBank = bankSelect?.selectedOptions?.[0] || bankSelect?.options?.[bankSelect?.selectedIndex];
+      const bankCode = selectedBank?.dataset?.code || '';
 
       const payload = {
         username: getVal('signupUsername'),

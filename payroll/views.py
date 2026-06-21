@@ -7,6 +7,7 @@ import io
 import logging
 import os
 import random
+import re
 import secrets
 import string
 import uuid
@@ -72,9 +73,10 @@ from .serializers import (
     EmployeeSalaryAdjustmentSerializer,
     EmployeeBalanceLedgerSerializer,
     ClientMonthlyPaymentSerializer,
+    PaystackResolveAccountSerializer,
 )
 
-from .paystack import PaystackAPI
+from .paystack import PaystackAPI, PaystackAccountResolutionService
 from .services import (
     applied_deductions_for_month,
     get_employee_bank_code,
@@ -96,7 +98,7 @@ from .permissions import (
     IsAdmin, CanCreateEmployee, IsSackAdmin, IsPayrollAdmin, IsHRAdmin,
     IsDeductionAdmin, CanEditNotification, CanViewAndEditCompany, IsRequestAdmin
 )
-from payroll.throttles import AttendanceThrottle, PaymentThrottle, BulkPaymentThrottle, ExportThrottle, BankVerifyThrottle
+from payroll.throttles import AttendanceThrottle, PaymentThrottle, BulkPaymentThrottle, ExportThrottle
 from .utils import log_audit, get_client_ip
 
 User = get_user_model()
@@ -185,10 +187,11 @@ def _apply_paystack_transfer_result(payment, transfer_data, save=True):
 
     Important for your requirement:
     - If Paystack reports `status == 'otp'` but OTP is effectively not required,
-      we immediately verify the transfer and complete/failed automatically.
+    we immediately verify the transfer and complete/failed automatically.
     """
     transfer_data = transfer_data if isinstance(transfer_data, dict) else {}
     transfer_status = transfer_data.get('status')
+    original_status = payment.status
     paystack_ref = _paystack_reference_from_data(transfer_data)
     transfer_code = _paystack_transfer_code_from_data(transfer_data)
 
@@ -196,9 +199,6 @@ def _apply_paystack_transfer_result(payment, transfer_data, save=True):
         payment.paystack_reference = paystack_ref
     if transfer_code:
         payment.paystack_transfer_code = transfer_code
-
-    # Normalize common Paystack shapes so we can deterministically map outcomes.
-    # Some Paystack SDKs return `status: 'success'` at the transfer level.
     if transfer_status in [None, ''] and isinstance(transfer_data.get('data'), dict):
         # Defensive: in case nested structure exists.
         transfer_status = transfer_data.get('data', {}).get('status')
@@ -241,13 +241,27 @@ def _apply_paystack_transfer_result(payment, transfer_data, save=True):
     elif transfer_status in ['pending', 'processing', 'queued', 'received']:
         payment.status = 'processing'
 
+    elif transfer_status:
+        logger.warning(
+            "Unknown Paystack transfer status reference=%s paystack_status=%s payment_status=%s",
+            payment.transaction_reference,
+            transfer_status,
+            original_status,
+        )
+
+    if save:
+        payment.save(update_fields=['status', 'paystack_reference', 'paystack_transfer_code', 'updated_at'])
+    return payment
+
 
 
 
 def _sync_payment_with_paystack(payment):
     if payment.payment_method != 'bank_transfer':
         return payment
-    if payment.status not in ['processing', 'pending', 'pending_hr', 'pending_paystack_otp']:
+    if payment.status not in ['processing', 'pending', 'pending_paystack_otp']:
+        return payment
+    if not payment.transaction_reference:
         return payment
 
     result = PaystackAPI().verify_transfer(payment.transaction_reference)
@@ -255,7 +269,7 @@ def _sync_payment_with_paystack(payment):
     if result.get('status') is True:
         with transaction.atomic():
             locked = Payment.objects.select_for_update().get(pk=payment.pk)
-            return _apply_paystack_transfer_result(locked, transfer_data)
+            return _apply_paystack_transfer_result(locked, transfer_data, save=True)
     return payment
 
 
@@ -309,158 +323,47 @@ def paystack_banks(request):
 
 class PaystackVerifyAccountView(APIView):
     permission_classes = [AllowAny]
-    # Throttle this endpoint to avoid bursts hammering Paystack (429s).
-    throttle_classes = [BankVerifyThrottle]
+    throttle_classes = []
 
     def post(self, request):
-        """Verify bank account number"""
-        account_number = request.data.get('account_number')
-        bank_code = request.data.get('bank_code')
-
-        if not account_number or not bank_code:
-            return Response(
-                {'error': 'account_number and bank_code required'},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-
-        # Check for existing active employees to avePaystack API calls and prevent duplicates
-        duplicate = Employee.objects.filter(
-            account_number=account_number,
-            bank_code=bank_code,
-            status__in=['active', 'pending']
-        ).first()
-
-        if duplicate:
-            return Response({
-                'status': True,
-                'message': 'Account already verified and registered in system',
-                'data': {
-                    'account_name': duplicate.account_holder,
-                    'account_number': duplicate.account_number,
-                    'bank_name': duplicate.bank_name
-                }
-            }, status=status.HTTP_200_OK)
-
-        paystack = PaystackAPI()
-        # Map partials by employee id for quick lookup (frontend sends list of partials)
-        partials_list = request.data.get('partials') or []
-        partials_map = {str(p.get('employee_id')): p for p in partials_list if p and p.get('employee_id')}
-        result = paystack.verify_account(account_number, bank_code)
-
-        # Normalize Paystack 429/rate-limited payloads so frontend doesn't hammer the endpoint.
-        if (
-            result.get('error_code') == 'rate_limited'
-            or result.get('status') is False and str(result.get('message', '')).lower().find('rate limit') >= 0
-        ):
-            retry_after = result.get('retry_after')
-            message = "Verification service is temporarily unavailable. Please try again in 5 minutes."
-            if retry_after:
-                message = f"Rate limited. Try again in {retry_after}s."
-
-            return Response(
-                {
-                    'success': False,
-                    'message': message,
-                    'detail': message,
-                    'retry_after': retry_after,
-                    'error_code': 'rate_limited'
-                },
-                status=status.HTTP_429_TOO_MANY_REQUESTS
-            )
-        return Response(result)
+        serializer = PaystackResolveAccountSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        payload = PaystackAccountResolutionService().resolve(**serializer.validated_data)
+        legacy_payload = PaystackAccountResolutionService.to_legacy_paystack_result(payload)
+        legacy_payload['verified'] = payload.get('verified', False)
+        legacy_payload['account_name'] = payload.get('account_name', '')
+        legacy_payload['account_number'] = payload.get('account_number', '')
+        legacy_payload['bank_code'] = payload.get('bank_code', '')
+        http_status = (
+            status.HTTP_503_SERVICE_UNAVAILABLE
+            if payload.get('temporary') and payload.get('error_code') != 'rate_limited'
+            else status.HTTP_200_OK
+        )
+        return Response(legacy_payload, status=http_status)
 
 
 
 @api_view(['GET'])
 @permission_classes([AllowAny])
-@throttle_classes([BankVerifyThrottle])
+@throttle_classes([])
 def paystack_resolve_account(request):
-    """Resolve Paystack account name (GET /paystack/resolve-account/).
-
-    Hardening vs Paystack 429 bursts:
-    - server-side caching of successful resolutions
-    - caching of rate-limited responses to avoid hammering during retry windows
-    """
-    account_number = request.GET.get('account_number')
-    bank_code = request.GET.get('bank_code')
-
-    if not account_number or not bank_code:
-        return Response(
-            {'success': False, 'message': 'account_number and bank_code are required'},
-            status=status.HTTP_400_BAD_REQUEST
-        )
-
-    account_number = str(account_number).strip()
-    bank_code = str(bank_code).strip()
-
-    cache_key = f"paystack:resolve:{bank_code}:{account_number}"
-
-    # If already resolved/registered, avoid external calls
-    duplicate = Employee.objects.filter(
-        account_number=account_number,
-        bank_code=bank_code,
-        status__in=['active', 'pending']
-    ).first()
-    if duplicate:
-        payload = {
-            'success': True,
-            'message': 'Account already verified and registered in system',
-            'data': {
-                'account_name': duplicate.account_holder,
-                'account_number': duplicate.account_number,
-                'bank_name': duplicate.bank_name,
-            }
-        }
-        # Still cache it to reduce DB hits for repeated UI triggers.
-        cache.set(cache_key, payload, timeout=60 * 60 * 24)
-        return Response(payload, status=status.HTTP_200_OK)
-
-    cached = cache.get(cache_key)
-    if cached is not None:
-        # Cached payload can be either success or error marker.
-        status_code = cached.get('_cache_status', status.HTTP_200_OK)
-        return Response(cached.get('payload', cached), status=status_code)
-
-
-    paystack = PaystackAPI()
-    result = paystack.verify_account(account_number, bank_code)
-
-    is_rate_limited = (
-        result.get('error_code') == 'rate_limited'
-        or result.get('status') is False and str(result.get('message', '')).lower().find('rate limit') >= 0
+    serializer = PaystackResolveAccountSerializer(data=request.query_params)
+    serializer.is_valid(raise_exception=True)
+    payload = PaystackAccountResolutionService().resolve(**serializer.validated_data)
+    http_status = (
+        status.HTTP_503_SERVICE_UNAVAILABLE
+        if payload.get('temporary') and payload.get('error_code') != 'rate_limited'
+        else status.HTTP_200_OK
     )
-
-    if is_rate_limited:
-        retry_after = result.get('retry_after')
-        message = "Verification service is temporarily unavailable. Please try again in 5 minutes."
-        if retry_after:
-            message = f"Rate limited. Try again in {retry_after}s."
-
-        payload = {
-            'success': False,
-            'message': message,
-            'detail': message,
-            'retry_after': retry_after,
-            'error_code': 'rate_limited'
-        }
-
-        # Cache the rate-limited marker to avoid hammering Paystack/this endpoint.
-        # Fallback to 5 minutes if Paystack didn't give a clear retry_after.
-        try:
-            retry_after_seconds = int(retry_after) if retry_after is not None else 0
-        except Exception:
-            retry_after_seconds = 0
-
-        timeout_seconds = max(retry_after_seconds or 300, 60)  # at least 60s
-        cache.set(cache_key, {'payload': payload, '_cache_status': status.HTTP_429_TOO_MANY_REQUESTS}, timeout=timeout_seconds)
-
-        return Response(payload, status=status.HTTP_429_TOO_MANY_REQUESTS)
-
-    # Expect verify_account payload to contain account_name/account_number/bank_name
-    # Cache successes for a short window.
-    cache_payload = result
-    cache.set(cache_key, {'payload': cache_payload, '_cache_status': status.HTTP_200_OK}, timeout=60 * 60 * 6)  # 6 hours
-    return Response(cache_payload, status=status.HTTP_200_OK)
+    return Response({
+        'verified': bool(payload.get('verified')),
+        'account_name': payload.get('account_name', ''),
+        'account_number': payload.get('account_number', serializer.validated_data['account_number']),
+        'bank_code': payload.get('bank_code', serializer.validated_data['bank_code']),
+        'message': payload.get('message', ''),
+        'error_code': payload.get('error_code', ''),
+        **({'retry_after': payload['retry_after']} if payload.get('retry_after') else {}),
+    }, status=http_status)
 
 
 
@@ -881,33 +784,11 @@ def verify_payment_status(request, reference):
             status=status.HTTP_404_NOT_FOUND
         )
 
-    if payment.status == 'processing' and payment.payment_method == 'bank_transfer':
+    if payment.status in ['pending', 'processing', 'pending_paystack_otp'] and payment.payment_method == 'bank_transfer':
         try:
-            verification = PaystackAPI().verify_transfer(reference)
-            transfer_data = verification.get('data') if isinstance(verification.get('data'), dict) else {}
-            if verification.get('status') is True and transfer_data.get('status') == 'success':
-                with transaction.atomic():
-                    payment = Payment.objects.select_for_update().get(pk=payment.pk)
-                    if payment.status == 'processing':
-                        _apply_paystack_transfer_result(payment, transfer_data)
-            elif verification.get('status') is True and transfer_data.get('status') in ['failed', 'reversed']:
-                _apply_paystack_transfer_result(payment, transfer_data)
+            payment = _sync_payment_with_paystack(payment)
         except Exception as exc:
             logger.error(f"Payment status polling failed for {reference}: {exc}")
-
-    # If Paystack OTP is marked as required but Paystack already indicates success,
-    # auto-resolve here to avoid blocking the frontend.
-    if payment.status == 'pending_paystack_otp' and payment.payment_method == 'bank_transfer' and payment.transaction_reference:
-        try:
-            verify = PaystackAPI().verify_transfer(reference)
-            transfer_data = verify.get('data') if isinstance(verify.get('data'), dict) else {}
-            if verify.get('status') is True and transfer_data.get('status') == 'success':
-                with transaction.atomic():
-                    payment = Payment.objects.select_for_update().get(pk=payment.pk)
-                    if payment.status == 'pending_paystack_otp':
-                        _apply_paystack_transfer_result(payment, transfer_data)
-        except Exception:
-            pass
 
     return Response({
         'status': True,
@@ -1093,7 +974,7 @@ class EmployeeViewSet(viewsets.ModelViewSet):
                 type='info'
             )
             send_email_notification(
-                user,
+                employee.user,
                 'Terminated - BYE',
                 f'Your account (ID: {employee.employee_id}) has been terminated.',
                 f'<p>Welcome! Your account (ID: <b>{employee.employee_id}</b>) has been terminated.</p>'
@@ -1729,32 +1610,25 @@ class PaymentViewSet(viewsets.ModelViewSet):
 
     @action(detail=False, methods=['post'], permission_classes=[IsAuthenticated, IsPayrollAdmin])
     def sync_processing_payments(self, request):
-        """Backend logic to check all processing payments against Paystack API"""
-        processing_payments = Payment.objects.filter(status='processing')
+        """Check Paystack-backed non-terminal payments and persist terminal outcomes."""
+        syncable_payments = Payment.objects.filter(
+            payment_method='bank_transfer',
+            status__in=['pending', 'processing', 'pending_paystack_otp'],
+        )
         updated_count = 0
-        paystack = PaystackAPI()
+        checked_count = syncable_payments.count()
 
-        for payment in processing_payments:
+        for payment in syncable_payments:
             try:
-                res = paystack.verify_transfer(payment.transaction_reference)
-                if res.get('status'):
-                    data = res.get('data', {})
-                    if data.get('status') == 'success':
-                        with transaction.atomic():
-                            payment = Payment.objects.select_for_update().get(pk=payment.pk)
-                            _apply_paystack_transfer_result(payment, data)
-                        updated_count += 1
-                    elif data.get('status') in ['failed', 'reversed']:
-                        with transaction.atomic():
-                            payment = Payment.objects.select_for_update().get(pk=payment.pk)
-                            _apply_paystack_transfer_result(payment, data)
-                        updated_count += 1
+                before = payment.status
+                synced = _sync_payment_with_paystack(payment)
+                if synced.status != before:
+                    updated_count += 1
             except Exception as e:
                 logger.error(f"Sync error for {payment.transaction_reference}: {e}")
-
         return Response({
             'message': f'Sync complete. {updated_count} payments updated.',
-            'checked': processing_payments.count()
+            'checked': checked_count
         })
 
     def get_queryset(self):
@@ -1821,18 +1695,20 @@ class PaymentViewSet(viewsets.ModelViewSet):
         # 1) Verify/resolve account on Paystack first
         resolve_result = paystack.verify_account(str(account_number), bank_code_str)
         if resolve_result.get('status') is False:
-            # Preserve structured rate-limit information so bulk payroll can
-            # report retry_after without flattening it into an opaque string.
+            # Preserve structured rate-limit information.
             retry_after = resolve_result.get('retry_after')
             error_code = resolve_result.get('error_code')
 
             msg = resolve_result.get('message') or 'Account could not be resolved.'
             if error_code == 'rate_limited' or resolve_result.get('error_code') == 'rate_limited':
-                if retry_after:
-                    raise ValueError(f"Paystack account resolve failed: {msg} (retry_after={retry_after})")
+                logger.warning(
+                    "Paystack account resolve rate-limited during payment; trying recipient creation fallback employee=%s retry_after=%s",
+                    employee.id,
+                    retry_after,
+                )
+            else:
                 raise ValueError(f"Paystack account resolve failed: {msg}")
 
-            raise ValueError(f"Paystack account resolve failed: {msg}")
 
         # Optional: you can enforce account_holder match here if desired
         # (currently we only use resolve success as a gate)
@@ -1866,9 +1742,16 @@ class PaymentViewSet(viewsets.ModelViewSet):
         try:
             recipient_code = self._get_or_create_paystack_recipient(employee, paystack)
         except ValueError as e:
+            # If we surfaced a structured Paystack rate-limit from resolve/verify,
+            # bubble it up as a retryable 429 instead of hard-failing.
+            payload = e.args[0] if e.args else None
+            if isinstance(payload, dict) and payload.get('type') in {'paystack_rate_limited', 'paystack_rate_limit', 'paystack_rate'}:
+                return False, payload
+
             payment.status = 'failed'
             payment.save(update_fields=['status', 'updated_at'])
             return False, str(e)
+
 
         # Transfer amount_paid if partial, else net_amount
         transfer_amount = payment.amount_paid if payment.amount_paid is not None else payment.net_amount
@@ -2053,6 +1936,20 @@ class PaymentViewSet(viewsets.ModelViewSet):
 
                 if initial_status == 'pending':
                     success, result = self._execute_paystack_transfer(payment, employee, bank_code)
+
+                    # If recipient resolve/verify is rate-limited, return HTTP 429 with retry_after
+                    if not success and isinstance(result, dict) and result.get('type') in {'paystack_rate_limited', 'paystack_rate_limit', 'paystack_rate'}:
+                        retry_after = result.get('retry_after')
+                        return Response(
+                            {
+                                'error': result.get('message') or 'Paystack is rate limiting account verification',
+                                'detail': result.get('message') or 'Please retry later',
+                                'retry_after': retry_after,
+                                'error_code': 'rate_limited',
+                            },
+                            status=status.HTTP_429_TOO_MANY_REQUESTS,
+                        )
+
                     if success:
                         return Response(
                             {
@@ -2065,9 +1962,11 @@ class PaymentViewSet(viewsets.ModelViewSet):
                                 'employee_name': employee.name,
                                 'outstanding': float(remaining_balance),
                             },
-                            status=status.HTTP_200_OK
+                            status=status.HTTP_200_OK,
                         )
+
                     return Response({'error': result}, status=status.HTTP_400_BAD_REQUEST)
+
 
                 hr_users = User.objects.filter(Q(is_superuser=True) | Q(is_hr_admin=True) | Q(role='admin'))
                 for hr in hr_users:
@@ -2106,33 +2005,36 @@ class PaymentViewSet(viewsets.ModelViewSet):
         
         employee = payment.employee
         bank_code = get_employee_bank_code(employee)
-        
+
         with transaction.atomic():
             payment.status = 'pending'
             payment.hr_approved = True
             payment.hr_approved_by = request.user
             payment.save(update_fields=['status', 'hr_approved', 'hr_approved_by', 'updated_at'])
-            
-            success, result = self._execute_paystack_transfer(payment, employee, bank_code)
-            
-            # NOTIFY payroll admin who initiated this payment
-            if payment.processed_by:
-                send_email_notification(
-                    payment.processed_by,
-                    'Payment HR Approved',
-                    f'Payment for {employee.name} has been HR approved and sent to Paystack.',
-                    f'<p>Payment for <b>{employee.name}</b> has been <b>HR approved</b> and sent to Paystack.</p>'
-                )
-            
-            if success:
-                return Response({
-                    'message': f"Payment approved. {result['message']}",
-                    'reference': payment.transaction_reference,
-                    'status': result['status'],
-                    'paystack_otp_required': result['paystack_otp_required']
-                })
-            else:
-                return Response({'error': result}, status=status.HTTP_400_BAD_REQUEST)
+
+        success, result = self._execute_paystack_transfer(payment, employee, bank_code)
+
+        # NOTIFY payroll admin who initiated this payment
+        if payment.processed_by:
+            send_email_notification(
+                payment.processed_by,
+                'Payment HR Approved',
+                f'Payment for {employee.name} has been HR approved and sent to Paystack.',
+                f'<p>Payment for <b>{employee.name}</b> has been <b>HR approved</b> and sent to Paystack.</p>'
+            )
+
+        if success:
+            return Response({
+                'message': f"Payment approved. {result['message']}",
+                'reference': payment.transaction_reference,
+                'status': result['status'],
+                'paystack_otp_required': result['paystack_otp_required']
+            })
+        return Response({
+            'error': result,
+            'status': payment.status,
+            'reference': payment.transaction_reference,
+        }, status=status.HTTP_400_BAD_REQUEST)
             
 
     @action(detail=False, methods=['post'], permission_classes=[IsAuthenticated, IsHRAdmin])
@@ -2158,12 +2060,12 @@ class PaymentViewSet(viewsets.ModelViewSet):
                     payment.hr_approved = True
                     payment.hr_approved_by = request.user
                     payment.save(update_fields=['status', 'hr_approved', 'hr_approved_by', 'updated_at'])
-                    
-                    success, result = self._execute_paystack_transfer(payment, employee, bank_code)
-                    if success:
-                        approved_count += 1
-                    else:
-                        errors.append(f"{employee.name}: {result}")
+
+                success, result = self._execute_paystack_transfer(payment, employee, bank_code)
+                if success:
+                    approved_count += 1
+                else:
+                    errors.append(f"{employee.name}: {result}")
             except Payment.DoesNotExist:
                 errors.append(f"Payment {pid} not found or not awaiting HR approval")
             except Exception as e:

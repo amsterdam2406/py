@@ -1,4 +1,5 @@
 from rest_framework.throttling import UserRateThrottle, AnonRateThrottle, ScopedRateThrottle
+from rest_framework.throttling import SimpleRateThrottle
 
 
 # ---------------------------------------------------------------------------
@@ -10,15 +11,32 @@ class LoginThrottle(AnonRateThrottle):
     scope = 'login'
     rate = '5/min'
 
-class BankVerifyThrottle(UserRateThrottle):
-    """Throttle bank account verification lookups.
-
-    NOTE: This rate must remain permissive enough for normal UX retries,
-    otherwise users hit Paystack (and backend) rate limits quickly.
-    """
+class BankVerifyThrottle(SimpleRateThrottle):
     scope = 'bank_verify'
-    # Increased to reduce “slow down” experiences during normal usage.
-    rate = '60/min'
+    rate = '5/min'
+    
+    def get_cache_key(self, request, view):
+        # Use IP as the base identifier
+        ident = self.get_ident(request)
+        return self.cache_format % {
+            'scope': self.scope,
+            'ident': ident
+        }
+    
+    def allow_request(self, request, view):
+        from django.core.cache import cache
+        acc = request.GET.get('account_number') or request.data.get('account_number')
+        bank = request.GET.get('bank_code') or request.data.get('bank_code')
+        if acc and bank:
+            bank = str(bank).strip()
+            acc = str(acc).strip()
+            cache_keys = [
+                f"paystack:resolve:{bank}:{acc}",
+                f"paystack_resolve_{bank}_{acc}",
+            ]
+            if any(cache.get(cache_key) for cache_key in cache_keys):
+                return True
+        return super().allow_request(request, view)
 
 
 # ---------------------------------------------------------------------------
@@ -97,5 +115,5 @@ class ExportTokenThrottle(UserRateThrottle):
 
 class ExportThrottle(ScopedRateThrottle):
     """Throttle for export CSV downloads."""
-    scope = 'exports'
+    scope = 'export'
     rate = '10/hour'

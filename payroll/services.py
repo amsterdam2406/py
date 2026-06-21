@@ -74,13 +74,12 @@ def approved_adjustment_totals_for_month(employee, month_key):
         date_added__month=int(month_key.split('-')[1]),
     )
     
-    additions = qs.filter(
-        type__in=[AdjustmentType.BONUS, AdjustmentType.EXTRA_PAYMENT]
-    ).aggregate(total=Sum('amount'))['total'] or Decimal('0')
-    
-    subtractions = qs.filter(
-        type__in=[AdjustmentType.LOAN, AdjustmentType.SALARY_ADVANCE, AdjustmentType.IOU]
-    ).aggregate(total=Sum('amount'))['total'] or Decimal('0')
+    try:
+        additions = qs.filter(type__in=[AdjustmentType.BONUS, AdjustmentType.EXTRA_PAYMENT]).aggregate(total=Sum('amount'))['total'] or Decimal('0')
+        subtractions = qs.filter(type__in=[AdjustmentType.LOAN, AdjustmentType.SALARY_ADVANCE, AdjustmentType.IOU]).aggregate(total=Sum('amount'))['total'] or Decimal('0')
+    except:
+        additions = Decimal('0')
+        subtractions = Decimal('0')
     
     return additions, subtractions
 
@@ -125,8 +124,12 @@ def compute_total_salary_payable(employee, month_key):
         date_added__month=m,
     )
     
-    bonus = adj_qs.filter(type__in=[AdjustmentType.BONUS, AdjustmentType.EXTRA_PAYMENT]).aggregate(total=Sum('amount'))['total'] or Decimal('0')
-    iou = adj_qs.filter(type__in=[AdjustmentType.IOU, AdjustmentType.LOAN, AdjustmentType.SALARY_ADVANCE]).aggregate(total=Sum('amount'))['total'] or Decimal('0')
+    try:
+        bonus = adj_qs.filter(type__in=[AdjustmentType.BONUS, AdjustmentType.EXTRA_PAYMENT]).aggregate(total=Sum('amount'))['total'] or Decimal('0')
+        iou = adj_qs.filter(type__in=[AdjustmentType.IOU, AdjustmentType.LOAN, AdjustmentType.SALARY_ADVANCE]).aggregate(total=Sum('amount'))['total'] or Decimal('0')
+    except:
+        bonus = Decimal('0')
+        iou = Decimal('0')
     
     prev_balance = outstanding_previous_balance_for_month(employee, month_key)
 

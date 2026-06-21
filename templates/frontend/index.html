@@ -1388,20 +1388,19 @@
 
                     <h4>Bank Account Details</h4>
                     <div class="form-group">
-                        <label>Bank Name</label>
-                        <input type="text" id="signupBankName" class="form-control" required>
+                        <label for="signupBankName">Bank Name</label>
+                        <select id="signupBankName" class="form-control" required>
+                            <option value="">Select Bank</option>
+                        </select>
                     </div>
                     <div class="form-group">
-                        <label>Bank Code</label>
-                        <input type="text" id="signupBankCode" class="form-control" required>
-                    </div>
-                    <div class="form-group">
-                        <label>Account Number</label>
+                        <label for="signupAccountNumber">Account Number</label>
                         <input type="text" id="signupAccountNumber" class="form-control" maxlength="10" required placeholder="10 digits">
+                        <small id="signupVerificationStatus" class="text-muted">Enter 10-digit account number to auto-verify</small>
                     </div>
                     <div class="form-group">
-                        <label>Account Holder Name</label>
-                        <input type="text" id="signupAccountHolder" class="form-control" required placeholder="Must match account holder">
+                        <label for="signupAccountHolder">Account Holder Name</label>
+                        <input type="text" id="signupAccountHolder" class="form-control" required placeholder="Auto-filled after verification" readonly style="background: #f8f9fa;">
                     </div>
 
 

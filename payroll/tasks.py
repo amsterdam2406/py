@@ -15,12 +15,13 @@ logger = logging.getLogger(__name__)
 @shared_task
 def verify_processing_payments():
     """
-    Task to automatically verify payments stuck in 'processing' status
+    Task to automatically verify Paystack-backed payments stuck in non-terminal status
     that haven't received a webhook update within 30 minutes.
     """
     threshold = timezone.now() - timedelta(minutes=30)
     stale_payments = Payment.objects.filter(
-        status='processing',
+        payment_method='bank_transfer',
+        status__in=['pending', 'processing', 'pending_paystack_otp'],
         updated_at__lt=threshold
     )
     
@@ -42,7 +43,7 @@ def verify_processing_payments():
             if transfer_status == 'success':
                 with transaction.atomic():
                     payment = Payment.objects.select_for_update().get(pk=payment.pk)
-                    if payment.status == 'processing':
+                    if payment.status in ['pending', 'processing', 'pending_paystack_otp']:
                         payment.status = 'completed'
                         payment.paystack_reference = str(
                             transfer_data.get('id') or
@@ -57,7 +58,7 @@ def verify_processing_payments():
             elif transfer_status in ['failed', 'reversed']:
                 with transaction.atomic():
                     payment = Payment.objects.select_for_update().get(pk=payment.pk)
-                    if payment.status == 'processing':
+                    if payment.status in ['pending', 'processing', 'pending_paystack_otp']:
                         payment.status = 'failed'
                         payment.paystack_reference = str(
                             transfer_data.get('id') or
@@ -68,6 +69,15 @@ def verify_processing_payments():
                         )
                         payment.paystack_transfer_code = str(transfer_data.get('transfer_code') or payment.paystack_transfer_code or '')
                         payment.save(update_fields=['status', 'paystack_reference', 'paystack_transfer_code', 'updated_at'])
+                        count += 1
+
+            elif transfer_status == 'otp':
+                with transaction.atomic():
+                    payment = Payment.objects.select_for_update().get(pk=payment.pk)
+                    if payment.status in ['pending', 'processing']:
+                        payment.status = 'pending_paystack_otp'
+                        payment.paystack_transfer_code = str(transfer_data.get('transfer_code') or payment.paystack_transfer_code or '')
+                        payment.save(update_fields=['status', 'paystack_transfer_code', 'updated_at'])
                         count += 1
 
         except Exception as e:

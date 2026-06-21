@@ -1,9 +1,25 @@
 import requests
 import logging
+import math
+import re
+import time
 from django.conf import settings
 from django.core.cache import cache
 
 logger = logging.getLogger(__name__)
+PAYSTACK_RESOLVE_GLOBAL_COOLDOWN_KEY = "paystack:resolve:global_temporary_unavailable"
+PAYSTACK_ACCOUNT_RESOLVE_TTL_SECONDS = 60 * 60 * 24
+
+
+def _mask_account_number(account_number):
+    value = str(account_number or "")
+    if len(value) <= 4:
+        return "****"
+    return f"{'*' * (len(value) - 4)}{value[-4:]}"
+
+
+def _is_live_secret_key(secret_key):
+    return str(secret_key or '').startswith('sk_live_')
 
 def _paystack_error_response(exc, fallback_status='failed'):
     error_payload = None
@@ -25,6 +41,339 @@ def _paystack_error_response(exc, fallback_status='failed'):
         'data': error_payload if error_payload is not None else {'status': fallback_status},
     }
 
+
+class PaystackAccountResolutionService:
+    """Resolve Nigerian bank accounts through Paystack with cache and network retries."""
+
+    BASE_URL = "https://api.paystack.co"
+    SUCCESS_TTL_SECONDS = PAYSTACK_ACCOUNT_RESOLVE_TTL_SECONDS
+    REQUEST_TIMEOUT_SECONDS = 8
+    MAX_NETWORK_ATTEMPTS = 3
+    NETWORK_RETRY_BACKOFF_SECONDS = (0.25, 0.75)
+    _session = requests.Session()
+
+    def __init__(self):
+        self.secret_key = getattr(settings, 'PAYSTACK_SECRET_KEY', '')
+        self.headers = {
+            'Authorization': f'Bearer {self.secret_key}',
+            'Content-Type': 'application/json',
+        }
+        if not self.secret_key:
+            logger.error("PAYSTACK_SECRET_KEY not configured in settings!")
+
+    def _live_mode_error_payload(self, account_number, bank_code):
+        logger.error(
+            "Paystack account resolve blocked because PAYSTACK_SECRET_KEY is not a live key bank_code=%s account=%s",
+            bank_code,
+            _mask_account_number(account_number),
+        )
+        return self._temporary_failure_payload(
+            account_number,
+            bank_code,
+            'Live Paystack secret key is required for production bank account verification.',
+            error_code='paystack_live_key_required',
+        )
+
+    @staticmethod
+    def cache_key(bank_code, account_number):
+        return f"paystack:resolve:{bank_code}:{account_number}"
+
+    @staticmethod
+    def legacy_cache_key(bank_code, account_number):
+        return f"paystack_resolve_{bank_code}_{account_number}"
+
+    def global_cooldown_key(self):
+        mode = 'live' if _is_live_secret_key(self.secret_key) else 'test'
+        return f"{PAYSTACK_RESOLVE_GLOBAL_COOLDOWN_KEY}:{mode}"
+
+    @staticmethod
+    def _invalid_payload(account_number, bank_code, message):
+        return {
+            'verified': False,
+            'account_name': '',
+            'account_number': account_number,
+            'bank_code': bank_code,
+            'status': False,
+            'message': message,
+            'error_code': 'invalid_account',
+        }
+
+    @staticmethod
+    def _success_payload(account_number, bank_code, account_name):
+        return {
+            'verified': True,
+            'account_name': account_name,
+            'account_number': account_number,
+            'bank_code': bank_code,
+            'status': True,
+            'message': 'Account resolved successfully.',
+            'data': {
+                'account_name': account_name,
+                'account_number': account_number,
+                'bank_code': bank_code,
+            },
+        }
+
+    @staticmethod
+    def _temporary_failure_payload(account_number, bank_code, message, error_code='verification_unavailable', retry_after=None):
+        payload = {
+            'verified': False,
+            'account_name': '',
+            'account_number': account_number,
+            'bank_code': bank_code,
+            'status': False,
+            'message': message,
+            'error_code': error_code,
+            'temporary': True,
+        }
+        if retry_after:
+            payload['retry_after'] = retry_after
+        return payload
+
+    @classmethod
+    def to_legacy_paystack_result(cls, payload):
+        if payload.get('verified'):
+            return {
+                'status': True,
+                'message': payload.get('message') or 'Account resolved successfully.',
+                'data': {
+                    'account_name': payload.get('account_name'),
+                    'account_number': payload.get('account_number'),
+                    'bank_code': payload.get('bank_code'),
+                },
+            }
+        return {
+            'status': False,
+            'message': payload.get('message') or 'Account could not be verified.',
+            'error_code': payload.get('error_code'),
+            'retry_after': payload.get('retry_after'),
+            'data': None,
+        }
+
+    def resolve(self, account_number, bank_code):
+        account_number = str(account_number or '').strip()
+        bank_code = str(bank_code or '').strip()
+        masked_account = _mask_account_number(account_number)
+
+        if not re.fullmatch(r'\d{10}', account_number) or not re.fullmatch(r'\d{3,6}', bank_code):
+            logger.info(
+                "Paystack account resolve rejected invalid input bank_code=%s account=%s",
+                bank_code,
+                masked_account,
+            )
+            return self._invalid_payload(
+                account_number,
+                bank_code,
+                'A valid 10-digit account number and Paystack bank code are required.',
+            )
+
+        if not _is_live_secret_key(self.secret_key):
+            return self._live_mode_error_payload(account_number, bank_code)
+
+        cache_key = self.cache_key(bank_code, account_number)
+        legacy_cache_key = self.legacy_cache_key(bank_code, account_number)
+
+        global_cooldown = cache.get(self.global_cooldown_key())
+        if global_cooldown:
+            payload = dict(global_cooldown)
+            payload['account_number'] = account_number
+            payload['bank_code'] = bank_code
+            logger.info(
+                "Paystack account resolve global cooldown hit bank_code=%s account=%s error_code=%s",
+                bank_code,
+                masked_account,
+                payload.get('error_code'),
+            )
+            return payload
+
+        cached = cache.get(cache_key) or cache.get(legacy_cache_key)
+        if cached:
+            normalized = self._normalize_cached_payload(cached, account_number, bank_code)
+            if normalized.get('verified'):
+                cache.set(cache_key, normalized, self.SUCCESS_TTL_SECONDS)
+                logger.info(
+                    "Paystack account resolve cache hit bank_code=%s account=%s",
+                    bank_code,
+                    masked_account,
+                )
+                return normalized
+
+        logger.info(
+            "Paystack account resolve cache miss bank_code=%s account=%s",
+            bank_code,
+            masked_account,
+        )
+
+        lock_key = f"paystack:resolve:lock:{bank_code}:{account_number}"
+        acquired = cache.add(lock_key, True, 10)
+        if not acquired:
+            time.sleep(0.35)
+            cached_after_wait = cache.get(cache_key) or cache.get(legacy_cache_key)
+            if cached_after_wait:
+                normalized = self._normalize_cached_payload(cached_after_wait, account_number, bank_code)
+                if normalized.get('verified'):
+                    logger.info(
+                        "Paystack account resolve cache hit after wait bank_code=%s account=%s",
+                        bank_code,
+                        masked_account,
+                    )
+                    return normalized
+
+        try:
+            return self._resolve_from_paystack(account_number, bank_code, masked_account, cache_key, legacy_cache_key)
+        finally:
+            if acquired:
+                try:
+                    cache.delete(lock_key)
+                except Exception:
+                    pass
+
+    def _resolve_from_paystack(self, account_number, bank_code, masked_account, cache_key, legacy_cache_key):
+        url = f"{self.BASE_URL}/bank/resolve"
+        params = {'account_number': account_number, 'bank_code': bank_code}
+        last_error = None
+
+        for attempt in range(1, self.MAX_NETWORK_ATTEMPTS + 1):
+            try:
+                response = self._session.get(
+                    url,
+                    headers=self.headers,
+                    params=params,
+                    timeout=self.REQUEST_TIMEOUT_SECONDS,
+                )
+                response_payload = self._response_json(response)
+                logger.info(
+                    "Paystack account resolve response bank_code=%s account=%s status_code=%s paystack_status=%s message=%s",
+                    bank_code,
+                    masked_account,
+                    response.status_code,
+                    response_payload.get('status') if isinstance(response_payload, dict) else None,
+                    response_payload.get('message') if isinstance(response_payload, dict) else '',
+                )
+
+                if response.status_code == 429:
+                    paystack_message = self._paystack_message(response_payload)
+                    retry_after = self._retry_after_seconds(response, paystack_message)
+                    logger.warning(
+                        "Paystack account resolve rate limited bank_code=%s account=%s retry_after=%s message=%s",
+                        bank_code,
+                        masked_account,
+                        retry_after,
+                        paystack_message,
+                    )
+                    payload = self._temporary_failure_payload(
+                        account_number,
+                        bank_code,
+                        paystack_message or 'Account verification is temporarily rate limited. Please try again shortly.',
+                        error_code='rate_limited',
+                        retry_after=retry_after,
+                    )
+                    cache.set(self.global_cooldown_key(), payload, retry_after)
+                    return payload
+
+                if response.status_code >= 500:
+                    return self._temporary_failure_payload(
+                        account_number,
+                        bank_code,
+                        'Account verification service is temporarily unavailable.',
+                    )
+
+                if response.status_code >= 400:
+                    return self._invalid_payload(
+                        account_number,
+                        bank_code,
+                        self._paystack_message(response_payload) or 'Invalid account details.',
+                    )
+
+                if isinstance(response_payload, dict) and response_payload.get('status'):
+                    data = response_payload.get('data') if isinstance(response_payload.get('data'), dict) else {}
+                    account_name = str(data.get('account_name') or '').strip()
+                    if account_name:
+                        payload = self._success_payload(account_number, bank_code, account_name)
+                        cache.set(cache_key, payload, self.SUCCESS_TTL_SECONDS)
+                        cache.set(legacy_cache_key, payload, self.SUCCESS_TTL_SECONDS)
+                        return payload
+
+                return self._invalid_payload(
+                    account_number,
+                    bank_code,
+                    self._paystack_message(response_payload) or 'Invalid account details.',
+                )
+
+            except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as exc:
+                last_error = exc
+                logger.warning(
+                    "Paystack account resolve network failure attempt=%s bank_code=%s account=%s error=%s",
+                    attempt,
+                    bank_code,
+                    masked_account,
+                    exc,
+                )
+                if attempt < self.MAX_NETWORK_ATTEMPTS:
+                    time.sleep(self.NETWORK_RETRY_BACKOFF_SECONDS[attempt - 1])
+                    continue
+                break
+            except requests.exceptions.RequestException as exc:
+                logger.error(
+                    "Paystack account resolve request failure bank_code=%s account=%s error=%s",
+                    bank_code,
+                    masked_account,
+                    exc,
+                )
+                return self._temporary_failure_payload(
+                    account_number,
+                    bank_code,
+                    'Account verification failed due to a temporary network error.',
+                )
+
+        logger.error(
+            "Paystack account resolve network exhausted bank_code=%s account=%s error=%s",
+            bank_code,
+            masked_account,
+            last_error,
+        )
+        return self._temporary_failure_payload(
+            account_number,
+            bank_code,
+            'Account verification failed due to a temporary network error.',
+        )
+
+    @staticmethod
+    def _response_json(response):
+        try:
+            payload = response.json()
+            return payload if isinstance(payload, dict) else {}
+        except ValueError:
+            return {}
+
+    @staticmethod
+    def _paystack_message(payload):
+        if isinstance(payload, dict):
+            return str(payload.get('message') or '').strip()
+        return ''
+
+    @staticmethod
+    def _retry_after_seconds(response, message=''):
+        if 'daily limit' in str(message or '').lower():
+            return 60 * 60 * 24
+        retry_after = response.headers.get('Retry-After') if response is not None else None
+        try:
+            return max(30, int(math.ceil(float(retry_after))))
+        except (TypeError, ValueError):
+            return 300
+
+    @classmethod
+    def _normalize_cached_payload(cls, cached, account_number, bank_code):
+        if isinstance(cached, dict) and 'verified' in cached:
+            return cached
+        if isinstance(cached, dict) and cached.get('status'):
+            data = cached.get('data') if isinstance(cached.get('data'), dict) else {}
+            account_name = str(data.get('account_name') or cached.get('account_name') or '').strip()
+            if account_name:
+                return cls._success_payload(account_number, bank_code, account_name)
+        return {}
+
+
 class PaystackAPI:
     """Paystack Payment Gateway Integration"""
     
@@ -41,6 +390,18 @@ class PaystackAPI:
         self.headers = {
             'Authorization': f'Bearer {self.secret_key}',
             'Content-Type': 'application/json'
+        }
+
+    def _require_live_mode(self, operation):
+        if _is_live_secret_key(self.secret_key):
+            return None
+        message = f"Live Paystack secret key is required for production {operation}."
+        logger.error("Paystack %s blocked because PAYSTACK_SECRET_KEY is not a live key", operation)
+        return {
+            'status': False,
+            'message': message,
+            'error_code': 'paystack_live_key_required',
+            'data': None,
         }
     
     def initialize_transaction(self, email, amount, reference, metadata=None):
@@ -105,6 +466,10 @@ class PaystackAPI:
     
     def create_recipient(self, name, account_number, bank_code):
         """Create a transfer recipient for bank transfer"""
+        live_mode_error = self._require_live_mode('recipient creation')
+        if live_mode_error:
+            return live_mode_error
+
         url = f"{self.BASE_URL}/transferrecipient"
         payload = {
             "type": "nuban",
@@ -113,7 +478,13 @@ class PaystackAPI:
             "bank_code": bank_code,
             "currency": "NGN"
         }
-        logger.info(f"[Paystack {self.env_label}] Creating recipient: {name}, Acc: {account_number}, Bank: {bank_code}")
+        logger.info(
+            "[Paystack %s] Creating recipient: %s, Acc: %s, Bank: %s",
+            self.env_label,
+            name,
+            _mask_account_number(account_number),
+            bank_code,
+        )
         
         try:
             response = requests.post(url, json=payload, headers=self.headers, timeout=20)
@@ -148,143 +519,8 @@ class PaystackAPI:
             return {'status': False, 'message': str(e), 'data': []}
     
     def verify_account(self, account_number, bank_code):
-        """Verify bank account number.
-
-        Goal: be fast and reliable for account-holder name verification by:
-        - caching successful resolutions for 24h
-        - using short negative-cache / cooldown for 429 to avoid hammering Paystack
-        - doing a small in-process retry (fast) when Paystack returns 429
-        """
-        url = f"{self.BASE_URL}/bank/resolve?account_number={account_number}&bank_code={bank_code}"
-        cache_key = f"paystack:resolve:{bank_code}:{account_number}"
-        rate_limit_key = f"paystack:resolve:rate_limited:{bank_code}:{account_number}"
-
-        # 1) Return cached resolution immediately
-        cached = cache.get(cache_key)
-        if cached:
-            return cached
-
-        # 2) Negative cache / cooldown for this exact account
-        cached_rate_limit = cache.get(rate_limit_key)
-        if cached_rate_limit:
-            return cached_rate_limit
-
-        # Concurrency guard to prevent a stampede of identical lookups.
-        # If one worker is already resolving this exact account, other workers will wait briefly.
-        lock_key = f"paystack:resolve:lock:{bank_code}:{account_number}"
-        lock_ttl_seconds = 8  # short lock window; should exceed typical network RTT
-
-        try:
-            # Acquire lock if possible
-            acquired = cache.add(lock_key, True, lock_ttl_seconds)
-            if not acquired:
-                # Someone else is resolving; re-check caches before hitting Paystack.
-                cached_now = cache.get(cache_key)
-                if cached_now:
-                    return cached_now
-                cached_rate_limit_now = cache.get(rate_limit_key)
-                if cached_rate_limit_now:
-                    return cached_rate_limit_now
-
-                # Wait a moment for the in-flight request to populate cache.
-                try:
-                    import time
-                    time.sleep(0.4)
-                except Exception:
-                    pass
-
-                # Still re-check again; if still missing, fall through to attempt resolution.
-                cached_now = cache.get(cache_key)
-                if cached_now:
-                    return cached_now
-                cached_rate_limit_now = cache.get(rate_limit_key)
-                if cached_rate_limit_now:
-                    return cached_rate_limit_now
-
-            response = requests.get(url, headers=self.headers, timeout=10)
-            response.raise_for_status()
-            result = response.json()
-
-            # Cache successful resolutions (prefer when account_name exists)
-            if result.get('status'):
-                ttl = 60 * 60 * 24  # 24h
-                if result.get('data', {}).get('account_name'):
-                    cache.set(cache_key, result, ttl)
-                else:
-                    # Still cache for a short time to avoid repeating lookups
-                    cache.set(cache_key, result, 60 * 30)  # 30 minutes
-
-            # Success: clear lock early so future calls can proceed immediately.
-            try:
-                cache.delete(lock_key)
-            except Exception:
-                pass
-
-            return result
-
-        except requests.exceptions.HTTPError as e:
-            try:
-                # Release lock early on HTTP errors.
-                cache.delete(lock_key)
-            except Exception:
-                pass
-            status_code = getattr(e.response, 'status_code', None)
-            if status_code == 429:
-                retry_after = e.response.headers.get('Retry-After') if e.response is not None else None
-
-                logger.warning(
-                    "Paystack verify account rate limited bank_code=%s account_last4=%s retry_after=%s",
-                    bank_code, str(account_number)[-4:], retry_after
-                )
-
-                # Build structured rate-limited payload
-                rate_limited_result = {
-                    'status': False,
-                    'message': 'Account verification temporarily rate limited. Please wait and try again.',
-                    'error_code': 'rate_limited',
-                    'retry_after': retry_after or 30,
-                    'data': None,
-                }
-
-                # Cache cooldown so subsequent calls immediately return without hitting Paystack
-                try:
-                    cooldown = int(retry_after or 30)
-                except (TypeError, ValueError):
-                    cooldown = 30
-
-                # But keep it bounded: if Retry-After is huge, cap so UX still works.
-                cooldown = min(cooldown, 900)  # max 15 minutes
-                cache.set(rate_limit_key, rate_limited_result, cooldown)
-                return rate_limited_result
-
-            return {
-                'status': False,
-                'message': f'Account verification failed: {str(e)}',
-                'data': None
-            }
-
-        except requests.exceptions.RequestException as e:
-            # network/timeout
-            try:
-                cache.delete(lock_key)
-            except Exception:
-                pass
-
-            logger.error(f"Paystack verify account network error: {e}")
-            return {
-                'status': False,
-                'message': f'Network error during verification: {str(e)}',
-                'data': None
-            }
-
-        except Exception as e:
-            try:
-                cache.delete(lock_key)
-            except Exception:
-                pass
-
-            logger.error(f"Paystack verify account unexpected error: {e}")
-            return {'status': False, 'message': str(e), 'data': None}
+        payload = PaystackAccountResolutionService().resolve(account_number, bank_code)
+        return PaystackAccountResolutionService.to_legacy_paystack_result(payload)
 
 
     def get_transfer_balance(self):
@@ -309,6 +545,10 @@ class PaystackAPI:
 
     def initiate_transfer(self, amount, recipient_code, reference, reason='Salary payment'):
         """Initiate a single Paystack transfer."""
+        live_mode_error = self._require_live_mode('transfer initiation')
+        if live_mode_error:
+            return live_mode_error
+
         url = f"{self.BASE_URL}/transfer"
         payload = {
             "source": "balance",
@@ -335,6 +575,10 @@ class PaystackAPI:
 
     def bulk_transfer(self, transfers):
         """Initiate multiple Paystack transfers."""
+        live_mode_error = self._require_live_mode('bulk transfer initiation')
+        if live_mode_error:
+            return live_mode_error
+
         url = f"{self.BASE_URL}/transfer/bulk"
         payload = {"currency": "NGN", "source": "balance", "transfers": transfers}
         try:
@@ -369,6 +613,10 @@ class PaystackAPI:
         Finalizes a transfer that requires an OTP from Paystack.
         https://paystack.com/docs/api/transfer/#finalize-transfer
         """
+        live_mode_error = self._require_live_mode('transfer finalization')
+        if live_mode_error:
+            return live_mode_error
+
         url = f"{self.BASE_URL}/transfer/finalize_transfer"
         headers = {
             "Authorization": f"Bearer {self.secret_key}",

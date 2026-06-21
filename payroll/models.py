@@ -599,9 +599,12 @@ class Employee(TimeStampedModel, SoftDeleteModel):
             raise IntegrityError(
                 f"Employee ID collision could not be resolved after retries for suffix={suffix}."
             )
-
-
-
+            
+    def clean(self):
+        super().clean()
+        if self.bank_code and (not self.bank_code.isdigit() or len(self.bank_code) not in [3, 6]):
+            raise ValidationError({"bank_code": "Invalid bank code. Must be 3 or 6 digits."})
+    
     def save(self, *args, **kwargs):
         if not self.employee_id and self.type in (EmployeeType.STAFF, EmployeeType.GUARD, EmployeeType.EMPLOYEE):
             self.employee_id = self.generate_employee_id()
