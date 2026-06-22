@@ -70,6 +70,23 @@ def normalize_payment_partial_amounts(apps, schema_editor):
     ).update(amount_paid=models.F('net_amount'), remaining_balance=Decimal('0'))
 
 
+def ensure_payment_balance_columns(apps, schema_editor):
+    Payment = apps.get_model('payroll', 'Payment')
+    table_name = Payment._meta.db_table
+
+    with schema_editor.connection.cursor() as cursor:
+        existing_columns = {
+            column.name
+            for column in schema_editor.connection.introspection.get_table_description(cursor, table_name)
+        }
+
+    for field_name in ('remaining_balance', 'previous_balance'):
+        field = Payment._meta.get_field(field_name)
+        if field.column not in existing_columns:
+            schema_editor.add_field(Payment, field)
+            existing_columns.add(field.column)
+
+
 def _serialize_company_payment(row):
     return {
         'id': str(row.id),
@@ -183,6 +200,12 @@ class Migration(migrations.Migration):
         migrations.RemoveConstraint(
             model_name='payment',
             name='partial_payment_consistency',
+        ),
+        migrations.SeparateDatabaseAndState(
+            database_operations=[
+                migrations.RunPython(ensure_payment_balance_columns, migrations.RunPython.noop),
+            ],
+            state_operations=[],
         ),
         migrations.RunPython(normalize_payment_partial_amounts, migrations.RunPython.noop),
         migrations.RunPython(resolve_company_month_duplicates, restore_company_month_duplicates),
