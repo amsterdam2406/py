@@ -87,6 +87,19 @@ def ensure_payment_balance_columns(apps, schema_editor):
             existing_columns.add(field.column)
 
 
+def _table_exists(schema_editor, table_name):
+    with schema_editor.connection.cursor() as cursor:
+        return table_name in schema_editor.connection.introspection.table_names(cursor)
+
+
+def ensure_company_monthly_payments_table(apps, schema_editor):
+    CompanyMonthlyPayment = apps.get_model('payroll', 'CompanyMonthlyPayment')
+    table_name = CompanyMonthlyPayment._meta.db_table
+
+    if not _table_exists(schema_editor, table_name):
+        schema_editor.create_model(CompanyMonthlyPayment)
+
+
 def _serialize_company_payment(row):
     return {
         'id': str(row.id),
@@ -112,6 +125,8 @@ def _payment_status(amount_due, amount_paid):
 
 def resolve_company_month_duplicates(apps, schema_editor):
     CompanyMonthlyPayment = apps.get_model('payroll', 'CompanyMonthlyPayment')
+    if not _table_exists(schema_editor, CompanyMonthlyPayment._meta.db_table):
+        return
 
     duplicates = (
         CompanyMonthlyPayment.objects
@@ -152,6 +167,8 @@ def resolve_company_month_duplicates(apps, schema_editor):
 
 def restore_company_month_duplicates(apps, schema_editor):
     CompanyMonthlyPayment = apps.get_model('payroll', 'CompanyMonthlyPayment')
+    if not _table_exists(schema_editor, CompanyMonthlyPayment._meta.db_table):
+        return
 
     archived_rows = CompanyMonthlyPayment.objects.filter(notes__contains=COMPANY_PAYMENT_ARCHIVE_MARKER)
     for keeper in archived_rows:
@@ -208,6 +225,7 @@ class Migration(migrations.Migration):
             state_operations=[],
         ),
         migrations.RunPython(normalize_payment_partial_amounts, migrations.RunPython.noop),
+        migrations.RunPython(ensure_company_monthly_payments_table, migrations.RunPython.noop),
         migrations.RunPython(resolve_company_month_duplicates, restore_company_month_duplicates),
         migrations.AddConstraint(
             model_name='companymonthlypayment',
