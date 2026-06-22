@@ -321,10 +321,6 @@ class User(AbstractUser):
         db_table = 'users'
         verbose_name = _('User')
         verbose_name_plural = _('Users')
-        permissions = [
-            ('approve_payment', _('Can approve payment')),
-            ('process_salary', _('Can process salary')),
-        ]
 
     def __str__(self):
         return self.email
@@ -993,8 +989,18 @@ class Payment(TimeStampedModel):
             ),
             models.CheckConstraint(
                 check=(
-                    models.Q(is_partial=False) |
-                    models.Q(amount_paid__lt=models.F('net_amount'))
+                    (
+                        models.Q(is_partial=True) &
+                        models.Q(amount_paid__isnull=False) &
+                        models.Q(amount_paid__lt=models.F('net_amount'))
+                    ) |
+                    (
+                        models.Q(is_partial=False) &
+                        (
+                            models.Q(amount_paid__isnull=True) |
+                            models.Q(amount_paid__gte=models.F('net_amount'))
+                        )
+                    )
                 ),
                 name='partial_payment_consistency'
             )
@@ -1226,6 +1232,12 @@ class CompanyMonthlyPayment(TimeStampedModel):
     class Meta:
         db_table = 'company_monthly_payments'
         ordering = ['-payment_month']
+        constraints = [
+            models.UniqueConstraint(
+                fields=['company', 'payment_month'],
+                name='unique_company_payment_per_month'
+            )
+        ]
 
     @property
     def outstanding(self):

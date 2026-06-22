@@ -217,24 +217,28 @@ class PaystackService:
 
     def initiate_salary_transfer(self, employee, custom_amount=None, processed_by=None):
         with transaction.atomic():
-            payment_month = None
+            payment_month = timezone.now().strftime('%Y-%m')
             is_partial = False
             total_deductions = 0
+            amount_paid = None
 
             if custom_amount:
                 try:
-                    net_salary = Decimal(str(custom_amount))
+                    amount_paid = Decimal(str(custom_amount))
                     is_partial = True
-                    if net_salary <= 0:
+                    if amount_paid <= 0:
                         raise ValueError("Invalid custom amount")
                 except (ValueError, InvalidOperation):
                     raise ValueError("Invalid custom amount")
-            else:
-                payment_month = timezone.now().strftime('%Y-%m')
-                total_deductions = applied_deductions_for_month(
-                    employee, payment_month
-                ).aggregate(Sum('amount'))['amount__sum'] or 0
-                net_salary = employee.salary - total_deductions
+
+            total_deductions = applied_deductions_for_month(
+                employee, payment_month
+            ).aggregate(Sum('amount'))['amount__sum'] or 0
+            net_salary = employee.salary - total_deductions
+
+            if amount_paid is not None and amount_paid >= net_salary:
+                is_partial = False
+            remaining_balance = max(Decimal('0'), net_salary - (amount_paid or net_salary))
 
             if net_salary <= 0:
                 raise ValueError("Net salary is zero or negative after deductions")
@@ -250,13 +254,15 @@ class PaystackService:
                 processed_by=processed_by,
                 status='processing',
                 is_partial=is_partial,
+                amount_paid=amount_paid,
+                remaining_balance=remaining_balance,
                 payment_method='bank_transfer'
             )
 
             recipient_code = self.get_or_create_recipient(employee)
             
             transfer_result = self.paystack.initiate_transfer(
-                amount=int(net_salary * 100),
+                amount=int((amount_paid or net_salary) * 100),
                 recipient_code=recipient_code,
                 reference=payment.transaction_reference,
                 reason=f"Salary - {employee.name} ({employee.employee_id})"
