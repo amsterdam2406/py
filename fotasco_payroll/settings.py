@@ -104,10 +104,6 @@ INSTALLED_APPS = [
     'payroll',
     'django_extensions',
     'django_celery_beat',
-    
-    # cloud
-    'cloudinary',
-
 ]
 
 # Add cloudinary_storage only if available
