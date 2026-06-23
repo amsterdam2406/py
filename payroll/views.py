@@ -1607,7 +1607,15 @@ class PaymentViewSet(viewsets.ModelViewSet):
     throttle_classes = [PaymentThrottle]
 
     def get_permissions(self):
-        if self.action in ["initiate_payment", "create", "update", "partial_update", "destroy"]:
+        if self.action in [
+            "initiate_payment",
+            "finalize_paystack_transfer",
+            "submit_paystack_otp",
+            "create",
+            "update",
+            "partial_update",
+            "destroy",
+        ]:
             return [IsAuthenticated(), IsPayrollAdmin()]
         if  self.action in ["hr_approve", "bulk_hr_approve"]:
             return [IsAuthenticated(), IsHRAdmin()]
@@ -2345,6 +2353,11 @@ class PaymentViewSet(viewsets.ModelViewSet):
         except Exception as e:
             logger.error(f"Error finalizing Paystack transfer: {e}")
             return Response({'error': 'An error occurred during Paystack transfer finalization'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+    @action(detail=False, methods=['post'], permission_classes=[IsAuthenticated, IsPayrollAdmin])
+    def finalize_paystack_transfer(self, request):
+        """Compatibility endpoint for Paystack OTP finalization."""
+        return self.submit_paystack_otp(request)
 
     @action(detail=False, methods=['post'], permission_classes=[IsAuthenticated])
     def resend_otp(self, request):

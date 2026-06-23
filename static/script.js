@@ -58,6 +58,12 @@ const AppState = {
   paymentPollInterval: null,
   bulkPollInterval: null,
   isPolling: false,
+  currentSection: "dashboard",
+  autoRefreshTimer: null,
+  autoRefreshVisibilityBound: false,
+  pendingRefreshTimer: null,
+  lastSectionRefresh: {},
+  sectionRefreshInFlight: new Map(),
 
   elements: {
     tbody: null,
@@ -78,6 +84,9 @@ const _autoVerifiedKeys = new Map();
 const ACCOUNT_VERIFICATION_MIN_COOLDOWN_MS = 30 * 1000;
 const ACCOUNT_VERIFICATION_DEFAULT_COOLDOWN_MS = 5 * 60 * 1000;
 const ACCOUNT_VERIFICATION_DEBOUNCE_MS = 800;
+const SECTION_STALE_MS = 30 * 1000;
+const AUTO_REFRESH_DELAY_MS = 350;
+const BACKGROUND_REFRESH_INTERVAL_MS = 60 * 1000;
 
 // ==========================================
 // UTILITY FUNCTIONS
@@ -519,7 +528,164 @@ document.addEventListener("click", (e) => {
   }
 });
 
-function showSection(id) {
+const SECTION_LABELS = {
+  dashboard: "dashboard",
+  employees: "employees",
+  attendance: "attendance",
+  deductions: "deductions",
+  "iou-management": "IOU records",
+  "bonus-management": "bonus records",
+  payments: "payments",
+  payslips: "payslips",
+  companies: "companies",
+  accounts: "accounts",
+  history: "payment history",
+  requests: "requests",
+  sacked: "sacked employees",
+  notifications: "notifications",
+  "audit-logs": "audit logs",
+  "company-payments": "company payments",
+};
+
+async function refreshSectionData(id = AppState.currentSection, options = {}) {
+  const { showSpinner = false, force = false } = options;
+  if (!id || !AppState.currentUser) return false;
+
+  const lastRefresh = AppState.lastSectionRefresh[id] || 0;
+  if (!force && Date.now() - lastRefresh < SECTION_STALE_MS) return true;
+
+  if (AppState.sectionRefreshInFlight.has(id)) {
+    return AppState.sectionRefreshInFlight.get(id);
+  }
+
+  const loaders = {
+    dashboard: async () => {
+      await updateDashboardStats();
+      await loadNotifications();
+    },
+    employees: async () => {
+      await loadEmployees();
+      updateUIAfterEmployeeLoad();
+    },
+    attendance: loadAttendance,
+    deductions: async () => {
+      await loadDeductions();
+      await loadEmployees();
+      updateUIAfterEmployeeLoad();
+    },
+    "iou-management": () => loadAdjustments("iou"),
+    "bonus-management": () => loadAdjustments("bonus"),
+    payments: async () => {
+      await loadEmployees();
+      await loadPaymentHistory();
+      populatePaymentsTable();
+    },
+    payslips: async () => {
+      await loadEmployees();
+      populateEmployeeSelect("payslipEmployee");
+    },
+    companies: loadCompanies,
+    accounts: async () => {
+      await loadEmployees();
+      await loadNigerianBanks();
+    },
+    history: loadPaymentHistory,
+    requests: loadRequests,
+    sacked: loadSackedEmployees,
+    notifications: loadNotifications,
+    "audit-logs": loadDownloadLogs,
+    "company-payments": loadClientPayments,
+  };
+
+  const loader = loaders[id];
+  if (!loader) return false;
+
+  const refreshPromise = (async () => {
+    try {
+      if (showSpinner) {
+        updateLoadingProgress(`Loading ${SECTION_LABELS[id] || "section"}...`);
+        showLoading();
+      }
+      await loader();
+      AppState.lastSectionRefresh[id] = Date.now();
+      return true;
+    } catch (err) {
+      console.error(`Failed to refresh section ${id}:`, err);
+      if (showSpinner) {
+        showToast(`Failed to refresh ${SECTION_LABELS[id] || "section"}`, "error");
+      }
+      return false;
+    } finally {
+      if (showSpinner) {
+        updateLoadingProgress("Loading...");
+        hideLoading();
+      }
+      AppState.sectionRefreshInFlight.delete(id);
+    }
+  })();
+
+  AppState.sectionRefreshInFlight.set(id, refreshPromise);
+  return refreshPromise;
+}
+
+function shouldRefreshAfterMutation(url, method) {
+  const normalizedMethod = String(method || "GET").toUpperCase();
+  if (!["POST", "PUT", "PATCH", "DELETE"].includes(normalizedMethod)) return false;
+
+  const normalizedUrl = String(url || "");
+  return ![
+    "/token/refresh/",
+    "/login/",
+    "/logout/",
+    "/request-reset/",
+    "/bulk_preview/",
+    "/request-export/",
+    "/request_export/",
+    "/request-payslip-export/",
+    "/request_receipt_export/",
+    "/download_",
+    "/export_csv/",
+    "/verify_2fa/",
+  ].some((path) => normalizedUrl.includes(path));
+}
+
+function scheduleVisibleSectionRefresh(reason = "mutation") {
+  if (!AppState.currentUser) return;
+  if (AppState.pendingRefreshTimer) clearTimeout(AppState.pendingRefreshTimer);
+
+  AppState.pendingRefreshTimer = setTimeout(async () => {
+    AppState.pendingRefreshTimer = null;
+    try {
+      await refreshSectionData(AppState.currentSection, { force: true, showSpinner: false });
+      if (AppState.currentSection !== "dashboard") {
+        await updateDashboardStats();
+      }
+    } catch (err) {
+      console.warn(`Automatic refresh after ${reason} failed:`, err);
+    }
+  }, AUTO_REFRESH_DELAY_MS);
+}
+
+function initAutoRefresh() {
+  if (AppState.autoRefreshTimer) return;
+
+  AppState.autoRefreshTimer = setInterval(() => {
+    if (!AppState.currentUser || document.hidden) return;
+    refreshSectionData(AppState.currentSection, { force: true, showSpinner: false });
+  }, BACKGROUND_REFRESH_INTERVAL_MS);
+
+  if (!AppState.autoRefreshVisibilityBound) {
+    AppState.autoRefreshVisibilityBound = true;
+    document.addEventListener("visibilitychange", () => {
+      if (!document.hidden && AppState.currentUser) {
+        refreshSectionData(AppState.currentSection, { force: true, showSpinner: false });
+      }
+    });
+  }
+}
+
+async function showSection(id) {
+  AppState.currentSection = id;
   document
     .querySelectorAll(".content-section")
     .forEach((sec) => sec.classList.remove("active"));
@@ -532,25 +698,7 @@ function showSection(id) {
     link.classList.toggle("active", isActive);
   });
 
-  // Load data for specific sections
-  if (id === "payments") {
-    populatePaymentsTable();
-  }
-  if (id === "requests") {
-    loadRequests();
-  }
-  if (id === "audit-logs") {
-    loadDownloadLogs();
-  }
-  if (id === "iou-management") {
-    loadAdjustments('iou');
-  }
-  if (id === "bonus-management") {
-    loadAdjustments('bonus');
-  }
-  if (id === "company-payments") {
-    loadClientPayments();
-  }
+  await refreshSectionData(id, { showSpinner: true });
 }
 
 function openModal(id) {
@@ -785,6 +933,10 @@ async function apiRequest(url, options = {}) {
         data,
         message,
       };
+    }
+
+    if (shouldRefreshAfterMutation(url, fetchOptions.method)) {
+      scheduleVisibleSectionRefresh("data change");
     }
 
     return { success: true, status: response.status, data };
@@ -1383,6 +1535,7 @@ async function handleLogin(e) {
     document.getElementById("dashboardPage")?.classList.remove("hidden");
 
     await loadDashboard();
+    initAutoRefresh();
 
     showToast("Login successful", "success");
   } catch (err) {
@@ -1471,6 +1624,16 @@ async function logout(silent = false) {
     AppState.accessToken = null;
     AppState.refreshToken = null;
     AppState.currentUser = null;
+    if (AppState.autoRefreshTimer) {
+      clearInterval(AppState.autoRefreshTimer);
+      AppState.autoRefreshTimer = null;
+    }
+    if (AppState.pendingRefreshTimer) {
+      clearTimeout(AppState.pendingRefreshTimer);
+      AppState.pendingRefreshTimer = null;
+    }
+    AppState.sectionRefreshInFlight.clear();
+    AppState.lastSectionRefresh = {};
     localStorage.clear();
     sessionStorage.clear();
     if (!silent) hideLoading(null, AppState.elements.globalSpinner);
@@ -5886,6 +6049,10 @@ async function loadDashboard() {
 
       // Step 5: Non-critical
       setTimeout(loadNigerianBanks, 2000);
+      const now = Date.now();
+      ["dashboard", "employees", "attendance", "deductions", "requests", "sacked", "notifications"].forEach((sectionId) => {
+        AppState.lastSectionRefresh[sectionId] = now;
+      });
     } catch (innerErr) {
       loadError = innerErr;
       throw innerErr; // Re-throw so outer catch gets it
@@ -6013,6 +6180,7 @@ document.addEventListener("DOMContentLoaded", async () => {
       console.log("Token valid, loading dashboard");
       AppState.currentUser = res.data;
       await loadDashboard();
+      initAutoRefresh();
       initHealthPoller();
     } else {
       console.log("Token invalid, attempting refresh once...");
@@ -6023,6 +6191,7 @@ document.addEventListener("DOMContentLoaded", async () => {
       if (retryRes.success && retryRes.data) {
         AppState.currentUser = retryRes.data;
         await loadDashboard();
+        initAutoRefresh();
       } else {
         throw new Error("Token refresh failed - user data missing");
       }
