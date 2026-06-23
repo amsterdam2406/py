@@ -111,10 +111,11 @@ INSTALLED_APPS = [
     'django_celery_beat',
 ]
 
-# Add cloudinary_storage only if available
+# Cloudinary is used for uploaded media only. Do not add cloudinary_storage to
+# INSTALLED_APPS here because its collectstatic command overrides Django's and
+# breaks WhiteNoise static manifest processing on Render.
 if cloudinary_available:
-    INSTALLED_APPS.insert(0, 'cloudinary_storage')  # Must be before django.contrib.staticfiles
-    INSTALLED_APPS.insert(1, 'cloudinary')
+    INSTALLED_APPS.insert(0, 'cloudinary')
 
 MIDDLEWARE = [
     'simple_history.middleware.HistoryRequestMiddleware',
