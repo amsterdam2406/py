@@ -2101,6 +2101,8 @@ async function handleRegistration(e, isSelfSignup = false) {
   e.preventDefault();
   const btn = document.getElementById("createAccountBtn");
   const endpoint = isSelfSignup ? "/self-register/" : "/register/";
+  const generatedEmployeeId =
+    document.getElementById("generatedEmployeeIdInput")?.value?.trim() || "";
 
   function parseMoney(value) {
     return Number(String(value).replace(/,/g, "").trim()) || 0;
@@ -2118,7 +2120,9 @@ async function handleRegistration(e, isSelfSignup = false) {
     bank_code: getSelectedBankCode(document.getElementById("accountBankName")),
     account_number: document.getElementById("accountNumber")?.value.trim(),
     account_holder: document.getElementById("accountHolderName")?.value.trim(),
-    employee_id: document.getElementById("generatedEmployeeIdInput")?.value || document.getElementById("generatedEmployeeId")?.textContent.trim() || "",
+    employee_id: /^FSS-\d{3,}-(STAFF|GUARD)$/.test(generatedEmployeeId)
+      ? generatedEmployeeId
+      : "",
 };
 
   // Password Strength Check

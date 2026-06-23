@@ -42,6 +42,7 @@ urlpatterns = [
     path('change-password/', auth_views.change_password, name='change_password'),
     path('next-employee-id/', auth_views.get_next_employee_id, name='next_employee_id'),
     path('payments/verify-payment/<str:reference>/', views.verify_payment_status, name='verify_payment_status'),
+    path('api/payments/verify-payment/<str:reference>/', views.verify_payment_status, name='api_verify_payment_status'),
     path('health-check/', views.system_health_check, name='health_check'),
 
     # === MISSING ENDPOINTS ADDED ===

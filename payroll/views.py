@@ -776,13 +776,25 @@ def _handle_charge_success(data):
 @api_view(['GET']) # This is the polling endpoint
 @permission_classes([IsAuthenticated])
 def verify_payment_status(request, reference):
+    payment_lookup = (
+        Q(transaction_reference=reference) |
+        Q(paystack_reference=reference) |
+        Q(paystack_transfer_code=reference)
+    )
     try:
-        payment = Payment.objects.get(transaction_reference=reference)
+        payment_lookup |= Q(id=uuid.UUID(str(reference)))
+    except (TypeError, ValueError):
+        pass
+
+    try:
+        payment = Payment.objects.get(payment_lookup)
     except Payment.DoesNotExist:
         return Response(
             {'status': False, 'message': 'Payment not found'},
             status=status.HTTP_404_NOT_FOUND
         )
+    except Payment.MultipleObjectsReturned:
+        payment = Payment.objects.filter(payment_lookup).order_by('-created_at').first()
 
     if payment.status in ['pending', 'processing', 'pending_paystack_otp'] and payment.payment_method == 'bank_transfer':
         try:
@@ -794,7 +806,7 @@ def verify_payment_status(request, reference):
         'status': True,
         'payment_status': payment.status,
         'is_completed': payment.status == 'completed',
-        'reference': reference,
+        'reference': payment.transaction_reference,
 
         # Transaction-level amounts for UI (full due vs this transaction paid)
         'total_amount_due': float(payment.net_amount),

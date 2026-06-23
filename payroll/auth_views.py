@@ -271,8 +271,12 @@ def register_view(request):
     last_name = data.get('last_name')
     full_name = (data.get('full_name') or '').strip()
     current_user = request.user
-    employee_id = data.get('employee_id')  # May be provided from frontend
-        # Rolevalidation
+    employee_id = (data.get('employee_id') or '').strip()  # May be provided from frontend
+    if employee_id and not re.fullmatch(r'FSS-\d{3,}-(STAFF|GUARD)', employee_id):
+        logger.warning("Ignoring invalid employee_id submitted during registration: %s", employee_id[:80])
+        employee_id = ''
+
+    # Role validation
     if role not in ['admin', 'staff', 'guard']:
         return Response(
             {'error': 'Invalid role. Must be admin, staff, or guard'},
