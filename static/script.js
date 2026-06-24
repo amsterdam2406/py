@@ -806,6 +806,24 @@ function showImagePreview(src) {
 // API COMMUNICATION
 // ==========================================
 
+function formatApiError(data, fallback) {
+  if (!data || typeof data !== "object") return fallback;
+
+  const direct = data.detail || data.error || data.message;
+  if (direct) {
+    return typeof direct === "object" ? JSON.stringify(direct) : String(direct);
+  }
+
+  const fieldErrors = Object.entries(data)
+    .map(([field, value]) => {
+      const text = Array.isArray(value) ? value.join(", ") : String(value);
+      return `${field}: ${text}`;
+    })
+    .join("; ");
+
+  return fieldErrors || fallback;
+}
+
 async function apiRequest(url, options = {}) {
   // FIXED: Ensure proper URL construction
   const baseUrl = window.location.origin;
@@ -915,11 +933,7 @@ async function apiRequest(url, options = {}) {
     const data = await response.json().catch(() => ({}));
 
     if (!response.ok) {
-      let message =
-        data.detail ||
-        data.error ||
-        data.message ||
-        `Request failed (${response.status})`;
+      let message = formatApiError(data, `Request failed (${response.status})`);
       if (typeof message === 'object') {
         try {
           message = JSON.stringify(message);
@@ -1140,7 +1154,10 @@ function renderPaymentAction(payment) {
   if (payment.status === "pending_paystack_otp") {
     return `<button type="button" class="btn btn-sm btn-warning" onclick="showPaystackOtpModal('${reference}', '${payment.paystack_transfer_code || ""}')">OTP</button>`;
   }
-  if (payment.status === "processing" || payment.status === "pending") {
+  if (payment.status === "pending") {
+    return `<button type="button" class="btn btn-sm btn-warning" onclick="showInternalOtpModal('${reference}')">Authorize</button>`;
+  }
+  if (payment.status === "processing") {
     return `<button type="button" class="btn btn-sm btn-info" onclick="retryPayment('${reference}')">Sync</button>`;
   }
   if (payment.status === "pending_hr") {
@@ -1150,6 +1167,14 @@ function renderPaymentAction(payment) {
     return `<span class="text-danger">Failed</span>`;
   }
   return `<button type="button" class="btn btn-sm btn-info" onclick="retryPayment('${reference}')">Check</button>`;
+}
+
+function showInternalOtpModal(reference) {
+  AppState.currentPaymentReference = reference;
+  showOTPModal(
+    "Authorize Payment",
+    "Enter the internal OTP sent to your email to authorize this payment."
+  );
 }
 
 async function verifyBankAccountFields({
@@ -3255,7 +3280,18 @@ async function processBulkPayment() {
     const payments = results.payments || [];
     const errors = results.errors || [];
 
-    // NEW: Handle OTP requirement for Bulk Initiation
+    if (results.internal_otp_required) {
+        AppState.currentPaymentReference = results.reference;
+        showOTPModal(
+          "Authorize Bulk Payment",
+          "A security verification code has been sent to your email. Enter it to authorize this bulk payment."
+        );
+        closeModal("bulkPaymentModal");
+        showToast(results.message || "Internal OTP sent", "info");
+        return;
+    }
+
+    // Handle Paystack OTP requirement for bulk transfer after internal OTP.
     if (res.data.paystack_otp_required) {
         showPaystackOtpModal(res.data.reference, res.data.paystack_transfer_code);
         closeModal("bulkPaymentModal");
@@ -3428,6 +3464,16 @@ async function initiateIndividualPayment(empId) {
 
         const reference = res.data.reference;
         AppState.currentPaymentReference = reference;
+
+        if (res.data.internal_otp_required) {
+            showOTPModal(
+              "Authorize Payment",
+              "A security verification code has been sent to your email. Enter it to authorize this payment."
+            );
+            showToast(res.data.message || "Internal OTP sent", "info");
+            hideLoading(btn);
+            return;
+        }
 
         // Check if Paystack OTP is required immediately
         if (res.data.paystack_otp_required) {
@@ -4864,7 +4910,10 @@ function showOTPModal(
   if (otpTitle) otpTitle.textContent = title;
   if (otpMessage) otpMessage.textContent = message;
 
-  if (modal) modal.classList.add("active");
+  if (modal) {
+    modal.style.display = "flex";
+    modal.classList.add("active");
+  }
   if (input) input.value = "";
   startOtpCountdown();
 }
@@ -4924,22 +4973,11 @@ async function verifyOTP(e, isPaystackOtp = false) {
 
     if (res.success) {
       if (res.data?.paystack_otp_required) {
-        // Transition to Paystack OTP verification
-        showOTPModal(
-          "Paystack Transfer Authorization",
-          "This transfer requires a second-level authorization from Paystack. Please enter the OTP sent to your registered business phone or email.",
+        closeModal("otpModal");
+        showPaystackOtpModal(
+          res.data.reference || AppState.currentPaymentReference,
+          res.data.paystack_transfer_code || ""
         );
-
-        const otpForm = document.getElementById("otpForm");
-        if (otpForm) {
-          // Remove old listener and attach Paystack-specific one
-          const newForm = otpForm.cloneNode(true);
-          otpForm.parentNode.replaceChild(newForm, otpForm);
-          newForm.addEventListener("submit", (e) => {
-            e.preventDefault();
-            verifyOTP(e, true);
-          });
-        }
         return;
       }
 
@@ -4951,6 +4989,11 @@ async function verifyOTP(e, isPaystackOtp = false) {
       closeModal("individualPaymentModal"); // Fixed: Close individual payment modal
       await loadPaymentHistory();
       await updateDashboardStats();
+      if (res.data?.payments?.length) {
+        startBulkPaymentPolling(res.data.payments);
+      } else if (res.data?.payment_processing || res.data?.status === "processing") {
+        startPaymentStatusPolling(res.data.reference || AppState.currentPaymentReference);
+      }
     } else {
       showToast(res.message || "Verification failed", "error");
     }
@@ -4962,11 +5005,26 @@ async function verifyOTP(e, isPaystackOtp = false) {
 }
 
 async function resendOTP() {
-  // INTERNAL OTP FLOW REMOVED (no longer used for initiating/authorizing transfers)
-  showToast(
-    "Resend OTP is disabled. Payments are verified via Paystack confirmation.",
-    "warning",
-  );
+  if (!AppState.currentPaymentReference) {
+    showToast("Reference missing. Start payment again.", "warning");
+    return;
+  }
+
+  const btn = document.getElementById("resendOtpBtn");
+  try {
+    showLoading(btn);
+    const res = await apiRequest("/api/payments/resend-otp/", {
+      method: "POST",
+      body: { reference: AppState.currentPaymentReference },
+    });
+    if (!res.success) throw new Error(res.message || "Failed to resend OTP");
+    showToast(res.data?.message || "OTP sent successfully", "success");
+    startOtpCountdown();
+  } catch (err) {
+    showToast(err.message || "Failed to resend OTP", "error");
+  } finally {
+    hideLoading(btn);
+  }
 }
 
 // ADDED: Function to handle password change submission
@@ -6289,6 +6347,7 @@ const EXPOSED_FUNCTIONS = {
   populateBulkTable,
   showPaystackOtpModal,
   submitPaystackOtp,
+  showInternalOtpModal,
   retryPayment, // Fixed: Ensure retryPayment is exposed
   cancelStuckPayment,
 
@@ -6323,7 +6382,8 @@ const EXPOSED_FUNCTIONS = {
   toggleAllEmployees,
 
   // OTP
-  // Internal OTP functions removed
+  verifyOTP,
+  resendOTP,
   startOtpCountdown,
 
   // Bank verification

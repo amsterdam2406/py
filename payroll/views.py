@@ -1609,6 +1609,7 @@ class PaymentViewSet(viewsets.ModelViewSet):
     def get_permissions(self):
         if self.action in [
             "initiate_payment",
+            "verify_payment",
             "finalize_paystack_transfer",
             "submit_paystack_otp",
             "create",
@@ -1749,6 +1750,163 @@ class PaymentViewSet(viewsets.ModelViewSet):
         employee.paystack_recipient_code = recipient_code
         employee.save(update_fields=['paystack_recipient_code'])
         return recipient_code
+
+    def _send_internal_payment_otp(self, user, reference, payments, subject='Internal Payment Verification OTP'):
+        if not user.email:
+            raise ValueError('Your user account has no email configured to send OTPs.')
+
+        otp_code = ''.join(random.choices(string.digits, k=6))
+        OTP.objects.filter(reference=reference, email=user.email, is_used=False).update(is_used=True)
+        OTP.objects.create(
+            email=user.email,
+            code=otp_code,
+            reference=reference,
+            expires_at=timezone.now() + timezone.timedelta(minutes=5),
+        )
+
+        total_amount = sum(Decimal(str(p.amount_paid or p.net_amount or 0)) for p in payments)
+        employee_names = ', '.join(p.employee.name for p in payments[:5])
+        if len(payments) > 5:
+            employee_names += f", and {len(payments) - 5} more"
+
+        send_mail(
+            subject,
+            (
+                f'Your internal OTP for payment authorization is: {otp_code}\n\n'
+                f'Reference: {reference}\n'
+                f'Employees: {employee_names}\n'
+                f'Total amount: NGN {total_amount:,.2f}\n\n'
+                'Expires in 5 minutes.'
+            ),
+            settings.DEFAULT_FROM_EMAIL,
+            [user.email],
+            fail_silently=False,
+        )
+
+    def _stage_internal_payment_otp(self, user, payments, reference=None):
+        reference = reference or str(uuid.uuid4())
+        cache.set(
+            f"payment_internal_otp:{reference}",
+            [str(payment.id) for payment in payments],
+            60 * 15,
+        )
+        self._send_internal_payment_otp(user, reference, list(payments))
+        return reference
+
+    def _payment_ids_for_internal_otp_reference(self, reference):
+        cached_ids = cache.get(f"payment_internal_otp:{reference}")
+        if cached_ids:
+            return cached_ids
+
+        try:
+            payment = Payment.objects.get(transaction_reference=reference)
+            return [str(payment.id)]
+        except Payment.DoesNotExist:
+            return []
+
+    def _verify_internal_payment_otp(self, user, reference, otp_code):
+        if not user.email:
+            return False, 'Your user account has no email configured for OTP verification.'
+
+        otp_obj = OTP.objects.filter(
+            email=user.email,
+            reference=reference,
+            is_used=False,
+        ).order_by('-created_at').first()
+
+        if not otp_obj:
+            return False, 'Invalid or expired OTP.'
+        if otp_obj.has_expired():
+            otp_obj.is_used = True
+            otp_obj.save(update_fields=['is_used', 'updated_at'])
+            return False, 'OTP has expired. Please request a new one.'
+        if otp_obj.attempt_count >= otp_obj.max_attempts:
+            return False, 'Maximum OTP attempts reached. Please request a new OTP.'
+        if otp_obj.code != str(otp_code).strip():
+            otp_obj.increment_attempt()
+            return False, 'Invalid OTP.'
+
+        otp_obj.is_used = True
+        otp_obj.save(update_fields=['is_used', 'updated_at'])
+        return True, None
+
+    def _execute_bulk_paystack_transfer(self, payments):
+        paystack = PaystackAPI()
+        transfers_payload = []
+        errors = []
+        transfer_payment_ids = []
+
+        for payment in payments:
+            employee = payment.employee
+            try:
+                recipient_code = self._get_or_create_paystack_recipient(employee, paystack)
+            except ValueError as e:
+                payment.status = 'failed'
+                payment.save(update_fields=['status', 'updated_at'])
+                errors.append(f"{employee.name}: {str(e)}")
+                continue
+
+            amount_to_pay = payment.amount_paid if payment.amount_paid is not None else payment.net_amount
+            transfers_payload.append({
+                "amount": int(amount_to_pay * 100),
+                "recipient": recipient_code,
+                "reference": payment.transaction_reference,
+                "reason": f"Salary - {employee.name} ({employee.employee_id})",
+            })
+            transfer_payment_ids.append(payment.id)
+
+        if not transfers_payload:
+            return {
+                'message': 'No transfers were sent to Paystack.',
+                'errors': errors,
+                'payments': [],
+                'status': 'failed',
+            }
+
+        Payment.objects.filter(id__in=transfer_payment_ids, status='pending').update(status='processing')
+        bulk_result = paystack.bulk_transfer(transfers_payload)
+        data = bulk_result.get('data', {}) if isinstance(bulk_result.get('data'), dict) else {}
+        target_payments = list(Payment.objects.filter(id__in=transfer_payment_ids).select_related('employee'))
+
+        if not bulk_result.get('status'):
+            Payment.objects.filter(id__in=transfer_payment_ids, status='processing').update(status='failed')
+            errors.append(f"Bulk transfer error: {bulk_result.get('message')}")
+            return {
+                'message': 'Bulk transfer failed.',
+                'errors': errors,
+                'payments': [],
+                'status': 'failed',
+            }
+
+        if data.get('status') == 'otp':
+            transfer_code = data.get('transfer_code')
+            Payment.objects.filter(id__in=transfer_payment_ids).update(
+                status='pending_paystack_otp',
+                paystack_transfer_code=transfer_code,
+            )
+            return {
+                'message': 'Internal OTP verified. Paystack requires OTP to authorize this bulk transfer batch.',
+                'paystack_otp_required': True,
+                'paystack_transfer_code': transfer_code,
+                'reference': target_payments[0].transaction_reference if target_payments else None,
+                'status': 'pending_paystack_otp',
+                'errors': errors,
+            }
+
+        return {
+            'message': f'Internal OTP verified. Initiated {len(target_payments)} salary transfers.',
+            'paystack_otp_required': False,
+            'status': 'processing',
+            'errors': errors,
+            'payments': [
+                {
+                    'employee_id': p.employee.employee_id,
+                    'employee_name': p.employee.name,
+                    'reference': p.transaction_reference,
+                }
+                for p in target_payments
+            ],
+        }
 
 
 
@@ -1955,37 +2113,24 @@ class PaymentViewSet(viewsets.ModelViewSet):
                     )
 
                 if initial_status == 'pending':
-                    success, result = self._execute_paystack_transfer(payment, employee, bank_code)
-
-                    # If recipient resolve/verify is rate-limited, return HTTP 429 with retry_after
-                    if not success and isinstance(result, dict) and result.get('type') in {'paystack_rate_limited', 'paystack_rate_limit', 'paystack_rate'}:
-                        retry_after = result.get('retry_after')
-                        return Response(
-                            {
-                                'error': result.get('message') or 'Paystack is rate limiting account verification',
-                                'detail': result.get('message') or 'Please retry later',
-                                'retry_after': retry_after,
-                                'error_code': 'rate_limited',
-                            },
-                            status=status.HTTP_429_TOO_MANY_REQUESTS,
-                        )
-
-                    if success:
-                        return Response(
-                            {
-                                'message': result['message'],
-                                'reference': payment.transaction_reference,
-                                'amount': float(amount_paid),
-                                'status': result['status'],
-                                'paystack_otp_required': result.get('paystack_otp_required', False),
-                                'paystack_transfer_code': payment.paystack_transfer_code,
-                                'employee_name': employee.name,
-                                'outstanding': float(remaining_balance),
-                            },
-                            status=status.HTTP_200_OK,
-                        )
-
-                    return Response({'error': result}, status=status.HTTP_400_BAD_REQUEST)
+                    otp_reference = self._stage_internal_payment_otp(
+                        request.user,
+                        [payment],
+                        reference=payment.transaction_reference,
+                    )
+                    return Response(
+                        {
+                            'message': 'Internal OTP sent to your email. Verify it to authorize this payment.',
+                            'reference': otp_reference,
+                            'amount': float(amount_paid),
+                            'status': payment.status,
+                            'internal_otp_required': True,
+                            'paystack_otp_required': False,
+                            'employee_name': employee.name,
+                            'outstanding': float(remaining_balance),
+                        },
+                        status=status.HTTP_200_OK,
+                    )
 
 
                 hr_users = User.objects.filter(Q(is_superuser=True) | Q(is_hr_admin=True) | Q(role='admin'))
@@ -2099,21 +2244,16 @@ class PaymentViewSet(viewsets.ModelViewSet):
     @action(detail=False, methods=['post'], permission_classes=[IsAuthenticated, IsPayrollAdmin])
     def bulk_payment(self, request):
         """
-        Initiate multiple transfers.
-
-        Internal OTP authorization has been removed; security is handled by:
-        - authenticated access (IsPayrollAdmin)
-        - Paystack transfer status + webhook confirmation
+        Stage multiple transfers and send one internal OTP to the payroll admin.
+        Paystack is called only after the internal OTP is verified.
         """
         try:
             employee_ids = request.data.get('employee_ids', [])
             if not employee_ids:
                 return Response({'error': 'No employees selected'}, status=status.HTTP_400_BAD_REQUEST)
 
-            paystack = PaystackAPI()
             payments_created = []
             local_payments = []
-            transfers_payload = []
             errors = []
             total_amount = 0
 
@@ -2176,27 +2316,12 @@ class PaymentViewSet(viewsets.ModelViewSet):
                         payment_date=timezone.now().date(),
                         payment_month=current_month,
                         processed_by=request.user,
-                        status='processing',
+                        status='pending',
                         payment_method='bank_transfer',
                         is_partial=is_partial,
                         previous_balance=salary_data['previous_balance'],
                         partial_reason=part.get('partial_reason') if part else None,
                     )
-
-                    try:
-                        recipient_code = self._get_or_create_paystack_recipient(employee, paystack)
-                    except ValueError as e:
-                        payment.status = 'failed'
-                        payment.save(update_fields=['status', 'updated_at'])
-                        errors.append(f"{employee.name}: {str(e)}")
-                        continue
-
-                    transfers_payload.append({
-                        "amount": int(amount_to_pay * 100),
-                        "recipient": recipient_code,
-                        "reference": payment.transaction_reference,
-                        "reason": f"Salary - {employee.name} ({employee.employee_id})",
-                    })
 
                     payments_created.append({
                         'employee_id': employee.employee_id,
@@ -2214,48 +2339,27 @@ class PaymentViewSet(viewsets.ModelViewSet):
                 except Exception as e:
                     errors.append(f"Error for employee ID {emp_id}: {str(e)}")
 
-            if transfers_payload:
-                bulk_result = paystack.bulk_transfer(transfers_payload)
-                data = bulk_result.get('data', {})
-
-                if not bulk_result.get('status'):
-                    logger.error(f"Bulk transfer API error: {bulk_result.get('message')}")
-
-                    if 'otp' in str(bulk_result.get('message', '')).lower():
-                        return Response({
-                            'error': 'Paystack requires OTP for bulk transfers. Please enable automated transfers in Paystack or handle individually.',
-                            'paystack_otp_required': True,
-                            'status': 'failed'
-                        }, status=400)
-
-                    errors.append(f"Bulk transfer error: {bulk_result.get('message')}")
-                    failed_ids = [p.id for p in local_payments]
-                    Payment.objects.filter(id__in=failed_ids, status='processing').update(status='failed')
-                    payments_created = []
-                    total_amount = 0
-
-                elif data.get('status') == 'otp':
-                    transfer_code = data.get('transfer_code')
-                    batch_ids = [p.id for p in local_payments]
-                    Payment.objects.filter(id__in=batch_ids).update(
-                        status='pending_paystack_otp',
-                        paystack_transfer_code=transfer_code
-                    )
-                    return Response({
-                        'message': 'Paystack requires OTP to authorize this bulk transfer batch.',
-                        'paystack_otp_required': True,
-                        'paystack_transfer_code': transfer_code,
-                        'reference': local_payments[0].transaction_reference if local_payments else None,
-                        'status': 'pending_paystack_otp'
-                    })
+            if local_payments:
+                otp_reference = self._stage_internal_payment_otp(request.user, local_payments)
+                return Response({
+                    'message': 'Internal OTP sent to your email. Verify it to authorize this bulk payment.',
+                    'reference': otp_reference,
+                    'internal_otp_required': True,
+                    'paystack_otp_required': False,
+                    'status': 'pending',
+                    'total_amount': total_amount,
+                    'total_employees': len(payments_created),
+                    'payments': payments_created,
+                    'errors': errors,
+                })
 
             return Response({
-                'message': f'Initiated {len(payments_created)} salary transfers',
+                'message': f'Staged {len(payments_created)} salary transfers',
                 'total_amount': total_amount,
                 'total_employees': len(payments_created),
                 'payments': payments_created,
                 'errors': errors,
-                'note': 'Payments will be confirmed automatically via webhook'
+                'note': 'No transfers were sent to Paystack because no valid payments were staged.'
             })
 
         except Exception as e:
@@ -2264,6 +2368,74 @@ class PaymentViewSet(viewsets.ModelViewSet):
                 {'error': 'Failed to initiate bulk payments', 'detail': str(e)},
                 status=status.HTTP_400_BAD_REQUEST
             )
+
+    @action(detail=False, methods=['post'], permission_classes=[IsAuthenticated, IsPayrollAdmin])
+    def verify_payment(self, request):
+        """
+        Verify the internal OTP sent to the authorized payroll user, then call Paystack.
+        If Paystack transfer OTP is enabled, Paystack can still return an OTP-required status.
+        """
+        reference = request.data.get('reference')
+        otp_code = request.data.get('otp')
+
+        if not reference or not otp_code:
+            return Response({'error': 'Reference and internal OTP are required'}, status=status.HTTP_400_BAD_REQUEST)
+
+        otp_valid, otp_error = self._verify_internal_payment_otp(request.user, reference, otp_code)
+        if not otp_valid:
+            return Response({'error': otp_error}, status=status.HTTP_400_BAD_REQUEST)
+
+        payment_ids = self._payment_ids_for_internal_otp_reference(reference)
+        if not payment_ids:
+            return Response({'error': 'No pending payment found for this OTP reference'}, status=status.HTTP_404_NOT_FOUND)
+
+        payments = list(
+            Payment.objects.filter(
+                id__in=payment_ids,
+                processed_by=request.user,
+                status='pending',
+            ).select_related('employee')
+        )
+        if not payments:
+            return Response({'error': 'Payment is not pending internal OTP verification'}, status=status.HTTP_400_BAD_REQUEST)
+
+        if len(payments) > 1:
+            result = self._execute_bulk_paystack_transfer(payments)
+            response_status = status.HTTP_200_OK if result.get('status') != 'failed' else status.HTTP_400_BAD_REQUEST
+            return Response(result, status=response_status)
+
+        payment = payments[0]
+        employee = payment.employee
+        bank_code = get_employee_bank_code(employee)
+        if not bank_code:
+            payment.status = 'failed'
+            payment.save(update_fields=['status', 'updated_at'])
+            return Response({'error': 'Employee bank_code is missing. Update employee record first.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        success, result = self._execute_paystack_transfer(payment, employee, bank_code)
+        if not success and isinstance(result, dict) and result.get('type') in {'paystack_rate_limited', 'paystack_rate_limit', 'paystack_rate'}:
+            retry_after = result.get('retry_after')
+            return Response(
+                {
+                    'error': result.get('message') or 'Paystack is rate limiting account verification',
+                    'detail': result.get('message') or 'Please retry later',
+                    'retry_after': retry_after,
+                    'error_code': 'rate_limited',
+                },
+                status=status.HTTP_429_TOO_MANY_REQUESTS,
+            )
+        if not success:
+            return Response({'error': result, 'status': payment.status}, status=status.HTTP_400_BAD_REQUEST)
+
+        return Response({
+            'message': result['message'],
+            'reference': payment.transaction_reference,
+            'status': result['status'],
+            'paystack_otp_required': result.get('paystack_otp_required', False),
+            'paystack_transfer_code': payment.paystack_transfer_code,
+            'payment_completed': payment.status == 'completed',
+            'payment_processing': payment.status == 'processing',
+        })
 
     @action(detail=False, methods=['post'], permission_classes=[IsAuthenticated, IsPayrollAdmin])
     def submit_paystack_otp(self, request): # Renamed action for clarity
@@ -2366,34 +2538,25 @@ class PaymentViewSet(viewsets.ModelViewSet):
             return Response({'error': 'Reference required'}, status=status.HTTP_400_BAD_REQUEST)
 
         try:
-            payment = Payment.objects.get(transaction_reference=reference)
-
-            # OTP is sent to the admin who initiated the payment
-            if not request.user.email:
-                return Response({'error': 'Your user account has no email configured to send OTPs.'}, status=status.HTTP_400_BAD_REQUEST)
-
-            otp_code = ''.join(random.choices(string.digits, k=6))
-            OTP.objects.create(
-                email=request.user.email,
-                code=otp_code,
-                reference=reference,
-                expires_at=timezone.now() + timezone.timedelta(minutes=5)
+            payment_ids = self._payment_ids_for_internal_otp_reference(reference)
+            payments = list(
+                Payment.objects.filter(
+                    id__in=payment_ids,
+                    processed_by=request.user,
+                    status='pending',
+                ).select_related('employee')
             )
-            try:
-                send_mail(
-                    'Internal Payment Verification OTP - Resent',
-                    f'Your new OTP for payment verification is: {otp_code}\n\nExpires in 5 minutes.',
-                    settings.DEFAULT_FROM_EMAIL,
-                    [request.user.email],
-                    fail_silently=False,
-                )
-                return Response({'message': 'OTP sent successfully'})
-            except Exception as e:
-                logger.error(f"Failed to send OTP email: {e}")
-                return Response({'error': 'Failed to send OTP'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+            if not payments:
+                return Response({'error': 'Payment not found or no longer awaiting internal OTP'}, status=status.HTTP_404_NOT_FOUND)
 
-        except Payment.DoesNotExist:
-            return Response({'error': 'Payment not found'}, status=status.HTTP_404_NOT_FOUND)
+            self._stage_internal_payment_otp(request.user, payments, reference=reference)
+            return Response({'message': 'OTP sent successfully'})
+
+        except ValueError as e:
+            return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
+        except Exception as e:
+            logger.error(f"Failed to resend OTP email: {e}")
+            return Response({'error': 'Failed to send OTP'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
     
 
     @action(detail=False, methods=['post'], permission_classes=[IsAuthenticated])
@@ -3257,6 +3420,23 @@ class EmployeeSalaryAdjustmentViewSet(viewsets.ModelViewSet):
         if user.is_superuser or user.role == 'admin' or getattr(user, 'is_payment_admin', False) or getattr(user, 'is_hr_admin', False):
             return super().get_queryset()
         return EmployeeSalaryAdjustment.objects.filter(employee__user=user)
+
+    def create(self, request, *args, **kwargs):
+        serializer = self.get_serializer(data=request.data)
+        if not serializer.is_valid():
+            logger.warning(
+                "Salary adjustment create validation failed user_id=%s errors=%s payload=%s",
+                getattr(request.user, 'id', None),
+                serializer.errors,
+                {
+                    key: request.data.get(key)
+                    for key in ['employee', 'type', 'amount', 'date_added', 'reason']
+                },
+            )
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+        self.perform_create(serializer)
+        headers = self.get_success_headers(serializer.data)
+        return Response(serializer.data, status=status.HTTP_201_CREATED, headers=headers)
 
     def perform_create(self, serializer):
         serializer.save(added_by=self.request.user)
