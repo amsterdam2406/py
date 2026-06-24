@@ -9,6 +9,7 @@ import os
 import random
 import re
 import secrets
+import socket
 import string
 import uuid
 import zipfile
@@ -1769,19 +1770,53 @@ class PaymentViewSet(viewsets.ModelViewSet):
         if len(payments) > 5:
             employee_names += f", and {len(payments) - 5} more"
 
-        send_mail(
-            subject,
-            (
-                f'Your internal OTP for payment authorization is: {otp_code}\n\n'
-                f'Reference: {reference}\n'
-                f'Employees: {employee_names}\n'
-                f'Total amount: NGN {total_amount:,.2f}\n\n'
-                'Expires in 5 minutes.'
-            ),
-            settings.DEFAULT_FROM_EMAIL,
-            [user.email],
-            fail_silently=False,
-        )
+        try:
+            send_mail(
+                subject,
+                (
+                    f'Your internal OTP for payment authorization is: {otp_code}\n\n'
+                    f'Reference: {reference}\n'
+                    f'Employees: {employee_names}\n'
+                    f'Total amount: NGN {total_amount:,.2f}\n\n'
+                    'Expires in 5 minutes.'
+                ),
+                settings.DEFAULT_FROM_EMAIL,
+                [user.email],
+                fail_silently=False,
+            )
+        except socket.gaierror as exc:
+            logger.error(
+                "Internal payment OTP email DNS failure email_host=%s recipient=%s error=%s",
+                getattr(settings, 'EMAIL_HOST', None),
+                user.email,
+                exc,
+            )
+            raise ValueError(
+                "OTP email could not be sent because the SMTP host cannot be resolved. "
+                "Check EMAIL_HOST in the deployment environment."
+            ) from exc
+        except OSError as exc:
+            logger.error(
+                "Internal payment OTP email connection failure email_host=%s email_port=%s recipient=%s error=%s",
+                getattr(settings, 'EMAIL_HOST', None),
+                getattr(settings, 'EMAIL_PORT', None),
+                user.email,
+                exc,
+            )
+            raise ValueError(
+                "OTP email could not be sent because the mail server is unreachable. "
+                "Check EMAIL_HOST, EMAIL_PORT, and EMAIL_USE_TLS."
+            ) from exc
+        except Exception as exc:
+            logger.error(
+                "Internal payment OTP email failed email_host=%s recipient=%s error=%s",
+                getattr(settings, 'EMAIL_HOST', None),
+                user.email,
+                exc,
+            )
+            raise ValueError(
+                "OTP email could not be sent. Check EMAIL_HOST_USER, EMAIL_HOST_PASSWORD, and DEFAULT_FROM_EMAIL."
+            ) from exc
 
     def _stage_internal_payment_otp(self, user, payments, reference=None):
         reference = reference or str(uuid.uuid4())
@@ -2113,11 +2148,14 @@ class PaymentViewSet(viewsets.ModelViewSet):
                     )
 
                 if initial_status == 'pending':
-                    otp_reference = self._stage_internal_payment_otp(
-                        request.user,
-                        [payment],
-                        reference=payment.transaction_reference,
-                    )
+                    try:
+                        otp_reference = self._stage_internal_payment_otp(
+                            request.user,
+                            [payment],
+                            reference=payment.transaction_reference,
+                        )
+                    except ValueError as exc:
+                        return Response({'error': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
                     return Response(
                         {
                             'message': 'Internal OTP sent to your email. Verify it to authorize this payment.',
@@ -2340,7 +2378,10 @@ class PaymentViewSet(viewsets.ModelViewSet):
                     errors.append(f"Error for employee ID {emp_id}: {str(e)}")
 
             if local_payments:
-                otp_reference = self._stage_internal_payment_otp(request.user, local_payments)
+                try:
+                    otp_reference = self._stage_internal_payment_otp(request.user, local_payments)
+                except ValueError as exc:
+                    return Response({'error': str(exc), 'errors': errors}, status=status.HTTP_400_BAD_REQUEST)
                 return Response({
                     'message': 'Internal OTP sent to your email. Verify it to authorize this bulk payment.',
                     'reference': otp_reference,
