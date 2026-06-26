@@ -97,3 +97,5 @@ Thumbs.db
 *.pyc
 payroll/test_paystack_account_resolution.py
 .payroll/test_paystack_account_resolution.py
+render.yaml
+.render.yaml
