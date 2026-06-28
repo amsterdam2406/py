@@ -12,10 +12,10 @@ import dj_database_url
 import socket
 
 # Force IPv4 for Supabase (Render has IPv6 issues)
-_original_getaddrinfo = socket.getaddrinfo
-def _getaddrinfo_ipv4(host, port, family=0, socktype=0, proto=0, flags=0):
-    return _original_getaddrinfo(host, port, socket.AF_INET, socktype, proto, flags)
-socket.getaddrinfo = _getaddrinfo_ipv4
+# _original_getaddrinfo = socket.getaddrinfo
+# def _getaddrinfo_ipv4(host, port, family=0, socktype=0, proto=0, flags=0):
+#     return _original_getaddrinfo(host, port, socket.AF_INET, socktype, proto, flags)
+# socket.getaddrinfo = _getaddrinfo_ipv4
 
 import psycopg2
 
