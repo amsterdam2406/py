@@ -250,6 +250,12 @@ def login_view(request):
             path="/",
             max_age=604800
         )
+        log_audit(
+            user,
+            "User Logged In",
+            request,
+            extra={'username': username, 'ip': get_client_ip(request)}
+        )
         return response
 
     except Exception as e:
@@ -489,6 +495,8 @@ def register_view(request):
 @permission_classes([AllowAny])
 def logout_view(request):
     try:
+        if getattr(request, 'user', None) and request.user.is_authenticated:
+            log_audit(request.user, "User Logged Out", request)
         refresh_token = request.COOKIES.get('refresh_token') or request.data.get('refresh')
         if refresh_token:
             token = RefreshToken(refresh_token)
@@ -652,6 +660,12 @@ def self_register_employee(request):
             )
 
         send_registration_notifications(employee, request)
+        log_audit(
+            user,
+            "Self signup submitted",
+            request,
+            extra={'employee_id': employee.employee_id, 'employee_pk': str(employee.id)}
+        )
 
         logger.info(f"Self-signup {role_type} successful: {user.username} (ID: {employee.employee_id})")
         return Response({
@@ -691,42 +705,63 @@ def send_registration_notifications(employee, request):
     """Utility to send HTML emails to admin and employee"""
     user = employee.user
     role = employee.type
-    
-    # Admin Alert
-    admins = User.objects.filter(Q(is_superuser=True) | Q(role='admin'))
-    admin_emails = [a.email for a in admins if a.email]
-    
-    if admin_emails:
-        admin_subject = f"New Registration: {employee.name} ({role.upper()})"
-        context = {
-            'name': employee.name,
-            'username': user.username,
-            'role': role.title(),
-            'email': user.email,
-            'location': employee.location,
-            'site_url': request.build_absolute_uri('/')
-        }
-        html_message = render_to_string('emails/admin_registration_alert.html', context)
-        send_mail(
-            admin_subject, strip_tags(html_message),
-            settings.DEFAULT_FROM_EMAIL, admin_emails,
-            html_message=html_message, fail_silently=True
-        )
 
-    # Employee Confirmation
-    site_url = request.build_absolute_uri('/')
-    user_subject = "Registration Received - Fotasco Payroll"
-    user_context = {
-        'name': employee.name,
-        'site_url': site_url,
-        'reset_link': f"{site_url}#/password-reset"
-    }
-    user_html = render_to_string('emails/user_registration_confirmation.html', user_context)
-    send_mail(
-        user_subject, strip_tags(user_html),
-        settings.DEFAULT_FROM_EMAIL, [user.email],
-        html_message=user_html, fail_silently=True
-    )
+    try:
+        # Admin Alert
+        admins = User.objects.filter(Q(is_superuser=True) | Q(role='admin'))
+        admin_emails = [a.email for a in admins if a.email]
+        site_url = request.build_absolute_uri('/')
+
+        if admin_emails:
+            admin_subject = f"New Registration: {employee.name} ({role.upper()})"
+            context = {
+                'name': employee.name,
+                'username': user.username,
+                'role': role.title(),
+                'email': user.email,
+                'location': employee.location,
+                'site_url': site_url
+            }
+            html_message = (
+                f"<p>A new employee has registered and is awaiting approval.</p>"
+                f"<p><strong>Name:</strong> {employee.name}</p>"
+                f"<p><strong>Role:</strong> {role.title()}</p>"
+                f"<p><strong>Email:</strong> {user.email}</p>"
+                f"<p><strong>Location:</strong> {employee.location}</p>"
+            )
+            try:
+                html_message = render_to_string('admin_registration_alert.html', context)
+            except Exception:
+                logger.warning("Admin registration email template not available; using fallback HTML.")
+            send_mail(
+                admin_subject, strip_tags(html_message),
+                settings.DEFAULT_FROM_EMAIL, admin_emails,
+                html_message=html_message, fail_silently=True
+            )
+
+        # Employee Confirmation
+        user_subject = "Registration Received - Fotasco Payroll"
+        user_context = {
+            'name': employee.name,
+            'site_url': site_url,
+            'reset_link': f"{site_url}#/password-reset"
+        }
+        user_html = (
+            f"<p>Dear {employee.name},</p>"
+            "<p>Your registration has been received and is pending admin approval.</p>"
+            "<p>You will be able to log in after approval.</p>"
+        )
+        try:
+            user_html = render_to_string('user_registration_confirmation.html', user_context)
+        except Exception:
+            logger.warning("User registration email template not available; using fallback HTML.")
+        send_mail(
+            user_subject, strip_tags(user_html),
+            settings.DEFAULT_FROM_EMAIL, [user.email],
+            html_message=user_html, fail_silently=True
+        )
+    except Exception as exc:
+        logger.error("Registration notification delivery failed for employee=%s: %s", employee.id, exc)
 
 @api_view(['POST'])
 @permission_classes([AllowAny])

@@ -17,6 +17,51 @@
     modal.classList.remove('active');
   }
 
+  function notify(message, type = 'info') {
+    if (typeof window.showToast === 'function') {
+      window.showToast(message, type);
+      return;
+    }
+    console[type === 'error' ? 'error' : 'log'](message);
+  }
+
+  function formatSignupError(data, fallback) {
+    if (!data || typeof data !== 'object') return fallback;
+    if (typeof window.formatApiError === 'function') {
+      return window.formatApiError(data, fallback);
+    }
+
+    const labels = {
+      username: 'Username',
+      password: 'Password',
+      full_name: 'Full name',
+      role: 'Role',
+      email: 'Email address',
+      phone: 'Phone number',
+      salary: 'Salary',
+      bank_name: 'Bank name',
+      bank_code: 'Bank code',
+      account_number: 'Account number',
+      account_holder: 'Account holder'
+    };
+    const direct = data.detail || data.error || data.message;
+    if (typeof direct === 'string') return direct;
+    if (direct && typeof direct === 'object') return formatSignupError(direct, fallback);
+
+    const message = Object.entries(data)
+      .map(([field, value]) => {
+        const label = labels[field] || field.replace(/_/g, ' ');
+        const text = Array.isArray(value) ? value.join(', ') : String(value || '');
+        const lower = text.toLowerCase();
+        if (lower.includes('required') || lower.includes('missing')) return `${label} is required.`;
+        if (lower.includes('invalid')) return `${label} is invalid.`;
+        if (lower.includes('already') || lower.includes('exists')) return `${label} already exists.`;
+        return `${label}: ${text}`;
+      })
+      .join('; ');
+    return message || fallback;
+  }
+
   // Wire up the static modal's close button and backdrop click
   function initSelfSignupModal() {
     const modal = document.getElementById('selfSignupModal');
@@ -84,13 +129,13 @@
       const requiredBank = ['bank_name', 'bank_code', 'account_number', 'account_holder'];
       const missingBank = requiredBank.filter((k) => !payload[k]);
       if (missingBank.length) {
-        alert(`Missing required bank/account fields: ${missingBank.join(', ')}`);
+        notify(`Missing required bank/account fields: ${missingBank.join(', ')}`, 'warning');
         return;
       }
 
       // Block submission if account holder was not verified/finalized
       if ((payload.account_holder || '').trim().length < 2) {
-        alert('Account holder name is required and must be verified. Please verify the account first.');
+        notify('Account holder name is required and must be verified. Please verify the account first.', 'warning');
         return;
       }
 
@@ -107,17 +152,17 @@
         const data = await res.json().catch(() => ({}));
 
         if (!res.ok) {
-          alert(data?.error || 'Self-registration failed. Please try again.');
+          notify(formatSignupError(data, 'Self-registration failed. Please try again.'), 'error');
           return;
         }
 
-        alert(data?.message || 'Account created! Your registration is pending admin approval.');
+        notify(data?.message || 'Account created! Your registration is pending admin approval.', 'success');
         closeSelfSignupModal();
         // Reset form to avoid resubmission with old bank values
         form.reset();
       } catch (err) {
         console.error(err);
-        alert('Self-registration failed due to a network/server error.');
+        notify('Self-registration failed due to a network/server error.', 'error');
       }
     });
   }

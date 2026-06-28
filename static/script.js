@@ -501,6 +501,82 @@ function closeToast(toast) {
   setTimeout(() => toast?.remove(), 300);
 }
 
+function ensureDialogModal() {
+  let modal = document.getElementById("appDialogModal");
+  if (modal) return modal;
+
+  modal = document.createElement("div");
+  modal.id = "appDialogModal";
+  modal.className = "modal";
+  modal.style.display = "none";
+  modal.innerHTML = `
+    <div class="modal-content" style="max-width: 420px;">
+      <div class="modal-header">
+        <h3 id="appDialogTitle">Confirm Action</h3>
+        <button type="button" class="modal-close" id="appDialogClose" aria-label="Close">&times;</button>
+      </div>
+      <div class="modal-body">
+        <p id="appDialogMessage" style="margin-bottom: 12px;"></p>
+        <input id="appDialogInput" class="form-control" style="display:none;" />
+      </div>
+      <div class="modal-footer" style="display:flex; gap:10px; justify-content:flex-end;">
+        <button type="button" class="btn btn-secondary" id="appDialogCancel">Cancel</button>
+        <button type="button" class="btn btn-primary" id="appDialogOk">Continue</button>
+      </div>
+    </div>
+  `;
+  document.body.appendChild(modal);
+  return modal;
+}
+
+function appDialog({ title = "Confirm Action", message = "", input = false, defaultValue = "" } = {}) {
+  const modal = ensureDialogModal();
+  const titleEl = modal.querySelector("#appDialogTitle");
+  const messageEl = modal.querySelector("#appDialogMessage");
+  const inputEl = modal.querySelector("#appDialogInput");
+  const okBtn = modal.querySelector("#appDialogOk");
+  const cancelBtn = modal.querySelector("#appDialogCancel");
+  const closeBtn = modal.querySelector("#appDialogClose");
+
+  titleEl.textContent = title;
+  messageEl.textContent = message;
+  inputEl.style.display = input ? "block" : "none";
+  inputEl.value = defaultValue || "";
+
+  return new Promise((resolve) => {
+    const cleanup = (value) => {
+      okBtn.removeEventListener("click", onOk);
+      cancelBtn.removeEventListener("click", onCancel);
+      closeBtn.removeEventListener("click", onCancel);
+      modal.removeEventListener("click", onBackdrop);
+      modal.style.display = "none";
+      modal.classList.remove("active");
+      resolve(value);
+    };
+    const onOk = () => cleanup(input ? inputEl.value : true);
+    const onCancel = () => cleanup(input ? null : false);
+    const onBackdrop = (event) => {
+      if (event.target === modal) onCancel();
+    };
+
+    okBtn.addEventListener("click", onOk);
+    cancelBtn.addEventListener("click", onCancel);
+    closeBtn.addEventListener("click", onCancel);
+    modal.addEventListener("click", onBackdrop);
+    modal.style.display = "flex";
+    modal.classList.add("active");
+    if (input) inputEl.focus();
+  });
+}
+
+function appConfirm(message, title = "Confirm Action") {
+  return appDialog({ title, message });
+}
+
+function appPrompt(message, defaultValue = "", title = "Input Required") {
+  return appDialog({ title, message, input: true, defaultValue });
+}
+
 /**
  * Toggle the user Account dropdown menu
  */
@@ -809,20 +885,55 @@ function showImagePreview(src) {
 function formatApiError(data, fallback) {
   if (!data || typeof data !== "object") return fallback;
 
+  const labels = {
+    username: "Username",
+    password: "Password",
+    full_name: "Full name",
+    role: "Role",
+    type: "Role",
+    email: "Email address",
+    phone: "Phone number",
+    salary: "Salary",
+    bank_name: "Bank name",
+    bank_code: "Bank code",
+    account_number: "Account number",
+    account_holder: "Account holder",
+    employee_id: "Employee",
+    partial_amount: "Payment amount",
+    otp: "OTP",
+    reference: "Reference",
+  };
+
+  const cleanText = (value) => {
+    if (Array.isArray(value)) return value.map(cleanText).filter(Boolean).join(", ");
+    if (value && typeof value === "object") return formatApiError(value, "");
+    return String(value || "").replace(/[\[\]{}"]/g, "").trim();
+  };
+
+  const fieldMessage = (field, value) => {
+    const label = labels[field] || String(field).replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
+    const text = cleanText(value);
+    if (!text) return "";
+    const lower = text.toLowerCase();
+    if (lower.includes("required") || lower.includes("blank") || lower.includes("missing")) return `${label} is required.`;
+    if (lower.includes("invalid")) return `${label} is invalid.`;
+    if (lower.includes("already") || lower.includes("exists") || lower.includes("unique")) return `${label} already exists.`;
+    return `${label}: ${text}`;
+  };
+
   const direct = data.detail || data.error || data.message;
   if (direct) {
-    return typeof direct === "object" ? JSON.stringify(direct) : String(direct);
+    return cleanText(direct) || fallback;
   }
 
   const fieldErrors = Object.entries(data)
-    .map(([field, value]) => {
-      const text = Array.isArray(value) ? value.join(", ") : String(value);
-      return `${field}: ${text}`;
-    })
+    .map(([field, value]) => fieldMessage(field, value))
+    .filter(Boolean)
     .join("; ");
 
   return fieldErrors || fallback;
 }
+window.formatApiError = formatApiError;
 
 async function apiRequest(url, options = {}) {
   // FIXED: Ensure proper URL construction
@@ -1428,9 +1539,9 @@ async function verifyNewEmployeeBankManual() {
 
 async function clearBankCache() {
   if (
-    !confirm(
+    !(await appConfirm(
       "Clear all cached bank verification details? This will force new lookups for all employees.",
-    )
+    ))
   )
     return;
 
@@ -1672,7 +1783,7 @@ async function logout(silent = false) {
 }
 async function handleForgotPassword(e) {
   if (e) e.preventDefault();
-  const email = prompt("Please enter your registered email address:");
+  const email = await appPrompt("Please enter your registered email address:", "", "Password Reset");
   if (!email) return;
 
   try {
@@ -1945,7 +2056,7 @@ async function viewEmployeeDetail(employeeId) {
 }
 
 async function resignEmployee(empId) {
-  const reason = prompt("Enter resignation details/reason:");
+  const reason = await appPrompt("Enter resignation details/reason:", "", "Employee Resignation");
   if (reason === null) return;
 
   try {
@@ -1974,7 +2085,7 @@ async function resignEmployee(empId) {
 }
 
 async function approveEmployee(empId) {
-  if (!confirm("Are you sure you want to approve this employee registration?"))
+  if (!(await appConfirm("Are you sure you want to approve this employee registration?")))
     return;
 
   try {
@@ -1996,7 +2107,7 @@ async function approveEmployee(empId) {
 }
 
 async function bulkUpdateBankCodes() {
-  if (!confirm("Are you sure you want to attempt resolving missing bank codes for all employees? This will look up Paystack codes based on existing bank names.")) return;
+  if (!(await appConfirm("Are you sure you want to attempt resolving missing bank codes for all employees? This will look up Paystack codes based on existing bank names."))) return;
   
   try {
     showLoading();
@@ -2025,7 +2136,7 @@ async function bulkApproveEmployees() {
     return;
   }
 
-  if (!confirm(`Are you sure you want to approve ${ids.length} employees?`))
+  if (!(await appConfirm(`Are you sure you want to approve ${ids.length} employees?`)))
     return;
 
   try {
@@ -2095,7 +2206,9 @@ function renderEmployees(list = []) {
                     </button>
                 `
                     : `
-                <button type="button" class="btn btn-sm btn-success" onclick="initiateIndividualPayment('${emp.id}')">Pay</button>
+                <button type="button" class="btn btn-sm btn-outline-success" onclick="goToPaymentsForEmployee('${emp.id}')">
+                    <i class="fas fa-money-bill-wave"></i> Go to Payments
+                </button>
                 `
                 }
                 <button type="button" class="btn btn-sm btn-info" onclick="resignEmployee('${emp.id}')">Resign</button>
@@ -2209,7 +2322,7 @@ async function handleCreateEmployee(e) {
 }
 
 async function handleDelete(id) {
-  if (!confirm("Are you sure you want to delete this employee?")) return;
+  if (!(await appConfirm("Are you sure you want to delete this employee?"))) return;
 
   try {
     const res = await apiRequest(`/api/employees/${id}/`, { method: "DELETE" });
@@ -2518,7 +2631,7 @@ async function handleCreateCompany(e) {
 }
 
 async function deleteCompany(companyId) {
-  const reason = prompt("Enter reason for marking this company as Not Active:");
+  const reason = await appPrompt("Enter reason for marking this company as Not Active:", "", "Company Status");
   if (reason === null) return;
   showLoading(); // Global spinner
   try {
@@ -2577,7 +2690,7 @@ function editCompany(companyId) {
 }
 
 async function renewCompanyContract(companyId) {
-  if (!confirm("Renew this contract for another year?")) return;
+  if (!(await appConfirm("Renew this contract for another year?"))) return;
   const res = await apiRequest(`/api/companies/${companyId}/renew_contract/`, {
     method: "POST",
   });
@@ -2588,7 +2701,7 @@ async function renewCompanyContract(companyId) {
 }
 
 async function terminateCompanyContract(companyId) {
-  if (!confirm("Terminate this contract immediately?")) return;
+  if (!(await appConfirm("Terminate this contract immediately?"))) return;
   const res = await apiRequest(
     `/api/companies/${companyId}/terminate_contract/`,
     { method: "POST" },
@@ -2759,10 +2872,11 @@ async function updateDeduction(e) {
 }
 
 async function bulkApproveDeductions() {
-  const month = prompt(
+  const month = await appPrompt(
     "Enter month to approve (YYYY-MM):",
     new Date().toISOString().slice(0, 7),
-  ); // No spinner for prompt
+    "Approve Deductions"
+  );
   if (!month) return;
   const res = await apiRequest("/api/deductions/bulk_approve/", {
     method: "POST",
@@ -2775,7 +2889,7 @@ async function bulkApproveDeductions() {
 }
 
 async function deleteDeduction(id) {
-  if (!confirm("Are you sure you want to delete this deduction?")) return;
+  if (!(await appConfirm("Are you sure you want to delete this deduction?"))) return;
 
   try {
     showLoading(null, AppState.elements.globalSpinner); // Global spinner
@@ -3452,11 +3566,7 @@ async function initiateIndividualPayment(empId) {
         });
 
         if (!res.success) {
-          // Build a helpful error message from response
-          let detail = res.message || (res.data && (res.data.message || res.data.detail)) || JSON.stringify(res.data || res);
-          if (typeof detail === 'object') {
-            try { detail = JSON.stringify(detail); } catch (e) { detail = String(detail); }
-          }
+          const detail = formatApiError(res.data, res.message || "Failed to initiate payment");
           const err = new Error(detail || "Failed to initiate payment");
           err.raw = res;
           throw err;
@@ -4033,7 +4143,7 @@ async function handleSackEmployee(e) {
 }
 
 async function reinstateEmployee(sackedId) {
-  if (!confirm("Are you sure you want to reinstate this employee?")) return;
+  if (!(await appConfirm("Are you sure you want to reinstate this employee?"))) return;
 
   try {
     const res = await apiRequest(
@@ -4129,6 +4239,16 @@ function showIndividualPaymentModal() {
   populateEmployeeSelect("paymentEmployee");
   document.getElementById("paymentPreview").style.display = "none";
   openModal("individualPaymentModal");
+}
+
+async function goToPaymentsForEmployee(employeeId) {
+  await showSection("payments");
+  showIndividualPaymentModal();
+  const select = document.getElementById("paymentEmployee");
+  if (select && employeeId) {
+    select.value = String(employeeId);
+    await updatePaymentPreview();
+  }
 }
 
 function showBulkPaymentModal() {
@@ -4310,8 +4430,10 @@ function updateHealthStatusUI(data) {
 }
 
 async function initiatePartialPayment(empId) {
-  const amount = prompt(
+  const amount = await appPrompt(
     "Enter available amount to pay (Leave blank for full amount):",
+    "",
+    "Partial Payment"
   );
   if (amount === null) {
     return; // user cancelled
@@ -4618,7 +4740,7 @@ async function loadAdjustments(type, search = "", status = "") {
 }
 
 async function approveAdjustment(id, type) {
-    if (!confirm(`Approve this ${type}?`)) return;
+    if (!(await appConfirm(`Approve this ${type}?`))) return;
     const res = await apiRequest(`/api/salary-adjustments/${id}/approve/`, { method: 'POST' });
     if (res.success) {
         showToast(`${type.toUpperCase()} approved`, "success");
@@ -4628,7 +4750,7 @@ async function approveAdjustment(id, type) {
 }
 
 async function deleteAdjustment(id, type) {
-    if (!confirm(`Delete this ${type}?`)) return;
+    if (!(await appConfirm(`Delete this ${type}?`))) return;
     const res = await apiRequest(`/api/salary-adjustments/${id}/`, { method: 'DELETE' });
     if (res.success) {
         showToast(`${type.toUpperCase()} deleted`, "success");
@@ -4713,7 +4835,7 @@ async function bulkApproveAdjustments(type) {
         return;
     }
 
-    if (!confirm(`Are you sure you want to approve ${ids.length} selected ${type}(s)?`)) return;
+    if (!(await appConfirm(`Are you sure you want to approve ${ids.length} selected ${type}(s)?`))) return;
 
     try {
         showLoading();
@@ -4776,7 +4898,7 @@ async function loadClientPayments() {
 }
 
 async function cancelStuckPayment(paymentId) {
-    if (!confirm("Cancel this stuck payment? You can retry afterwards.")) return;
+    if (!(await appConfirm("Cancel this stuck payment? You can retry afterwards."))) return;
     
     try {
         showLoading();
@@ -5378,7 +5500,7 @@ async function confirmExport(e) {
 
     // Handle 2FA if required
     if (res.data && res.data["2fa_required"]) {
-      const otp = prompt("A verification code has been sent to your email. Enter it to continue:");
+      const otp = await appPrompt("A verification code has been sent to your email. Enter it to continue:", "", "Verification Code");
       if (!otp) return; // User cancelled
 
       const vRes = await apiRequest("/api/employees/verify_2fa/", {
@@ -5452,9 +5574,7 @@ async function confirmExport(e) {
 
 //     // 2FA required only for the token-based employee export flow
 //     if (res.data && res.data["2fa_required"]) {
-//       const otp = prompt(
-//         "A verification code has been sent to your email. Enter it to continue:",
-//       );
+//       const otp = await appPrompt("A verification code has been sent to your email. Enter it to continue:", "", "Verification Code");
 //       if (!otp) return;
 
 //       const vRes = await apiRequest("/api/employees/verify_2fa/", {
@@ -5866,7 +5986,7 @@ async function loadRequests() {
 }
 
 async function downloadRequestAttachments(requestId) {
-  const password = prompt("Enter your login password to download attachments:");
+  const password = await appPrompt("Enter your login password to download attachments:", "", "Download Attachments");
   if (!password) return;
 
   showLoading(); // Global spinner
@@ -5966,7 +6086,7 @@ function clearCapturedPhotos() {
 
 async function handleCreateRequest(e) {
   e.preventDefault();
-  if (!confirm("Are you sure you want to submit this request?")) return;
+  if (!(await appConfirm("Are you sure you want to submit this request?"))) return;
 
   const btn = e.target.querySelector('button[type="submit"]');
   const formData = new FormData();
@@ -6012,7 +6132,7 @@ async function handleCreateRequest(e) {
 }
 
 async function approveRequest(id) {
-  if (!confirm("Approve this request?")) return;
+  if (!(await appConfirm("Approve this request?"))) return;
 
   showLoading(); // Global spinner
   try {
@@ -6337,6 +6457,7 @@ const EXPOSED_FUNCTIONS = {
   // Payments
   loadPaymentHistory,
   initiateIndividualPayment,
+  goToPaymentsForEmployee,
   // updateinitiateIndividualPayment,
   updatePaymentPreview, // Fixed: Ensure updatePaymentPreview is exposed
   // handleIndividualpayment,

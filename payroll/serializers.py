@@ -405,10 +405,11 @@ class AttendanceSerializer(serializers.ModelSerializer):
 class DeductionSerializer(serializers.ModelSerializer):
     employee_id = serializers.CharField(source='employee.employee_id', read_only=True)
     employee_name = serializers.CharField(source='employee.name', read_only=True)
+    display_status = serializers.SerializerMethodField()
     
     class Meta:
         model = Deduction
-        fields = ['id', 'employee', 'employee_id', 'employee_name', 'amount', 'reason', 'status', 'date', 'created_at']
+        fields = ['id', 'employee', 'employee_id', 'employee_name', 'amount', 'reason', 'status', 'display_status', 'date', 'created_at']
         read_only_fields = ['id', 'created_at']
         extra_kwargs = {
             'employee': {'required': True},
@@ -422,6 +423,13 @@ class DeductionSerializer(serializers.ModelSerializer):
         if value <= 0:
             raise serializers.ValidationError("Deduction must be greater than 0")
         return value
+
+    def get_display_status(self, obj):
+        if obj.status == 'applied':
+            return 'settled'
+        if obj.status in ['pending', 'pending_hr']:
+            return 'pending'
+        return obj.status
     
     def validate(self, attrs):
         if attrs['amount'] > attrs['employee'].salary:

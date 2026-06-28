@@ -1,6 +1,8 @@
 import logging
 from decimal import Decimal, InvalidOperation
 import uuid
+import calendar
+from datetime import date
 from django.db import transaction
 from django.db.models import Sum
 from django.utils import timezone
@@ -8,7 +10,9 @@ from .models import (
     Payment,
     Employee,
     Deduction,
+    DeductionStatus,
     Notification,
+    AuditLog,
     EmployeeBalanceLedger,
     EmployeeSalaryAdjustment,
     AdjustmentType,
@@ -52,14 +56,119 @@ def get_employee_bank_code(employee):
 
 
 
-def applied_deductions_for_month(employee, month_key):
+ACTIVE_DEDUCTION_STATUSES = [
+    DeductionStatus.PENDING,
+    DeductionStatus.PARTIAL,
+    DeductionStatus.APPLIED,
+]
+
+
+def _month_end_date(month_key):
     year, month = map(int, month_key.split('-'))
+    return date(year, month, calendar.monthrange(year, month)[1])
+
+
+def applied_deductions_for_month(employee, month_key):
+    """Return active deductions whose remaining balance should affect this payroll month."""
+    year, month = map(int, month_key.split('-'))
+    month_end = _month_end_date(month_key)
     return Deduction.objects.filter(
         employee=employee,
-        status='applied',
-        date__year=year,
-        date__month=month,
+        status__in=ACTIVE_DEDUCTION_STATUSES,
+        date__lte=month_end,
+    ).exclude(
+        status=DeductionStatus.APPLIED,
+        date__lt=date(year, month, 1),
     )
+
+
+def active_deduction_balance_for_month(employee, month_key):
+    total = Decimal('0')
+    for deduction in applied_deductions_for_month(employee, month_key):
+        remaining = deduction.remaining_balance
+        if remaining in [None, 0] and deduction.amount_paid == 0:
+            remaining = deduction.amount
+        total += Decimal(str(remaining or 0))
+    return total
+
+
+def _audit_deduction_payment(user, action, deduction, payment, amount):
+    if not user:
+        return
+    AuditLog.objects.create(
+        user=user,
+        action=action,
+        extra_data={
+            'deduction_id': str(deduction.id),
+            'payment_id': str(payment.id),
+            'employee_id': str(deduction.employee_id),
+            'amount': str(amount),
+            'remaining_balance': str(deduction.remaining_balance),
+        },
+    )
+
+
+def settle_deductions_for_payment(payment):
+    """Apply the deduction portion of a completed payment to active deduction balances."""
+    if not payment or payment.status != 'completed':
+        return []
+    if not payment.total_deductions or payment.total_deductions <= 0:
+        return []
+
+    already_processed = AuditLog.objects.filter(
+        action__in=['Deduction partially paid', 'Deduction settled'],
+        extra_data__payment_id=str(payment.id),
+    ).exists()
+    if already_processed:
+        return []
+
+    deduction_pool = Decimal(str(payment.total_deductions or 0))
+    if payment.is_partial and payment.amount_paid and payment.net_amount and payment.net_amount > 0:
+        ratio = Decimal(str(payment.amount_paid)) / Decimal(str(payment.net_amount))
+        deduction_pool = (deduction_pool * ratio).quantize(Decimal('0.01'))
+
+    if deduction_pool <= 0:
+        return []
+
+    updates = []
+    with transaction.atomic():
+        deductions = Deduction.objects.select_for_update().filter(
+            employee=payment.employee,
+            status__in=ACTIVE_DEDUCTION_STATUSES,
+            remaining_balance__gt=0,
+        ).order_by('date', 'created_at', 'id')
+
+        for deduction in deductions:
+            if deduction_pool <= 0:
+                break
+
+            amount_to_apply = min(Decimal(str(deduction.remaining_balance or 0)), deduction_pool)
+            if amount_to_apply <= 0:
+                continue
+
+            deduction.amount_paid = min(
+                Decimal(str(deduction.amount)),
+                Decimal(str(deduction.amount_paid or 0)) + amount_to_apply,
+            )
+            deduction.remaining_balance = max(
+                Decimal('0'),
+                Decimal(str(deduction.amount)) - Decimal(str(deduction.amount_paid)),
+            )
+
+            if deduction.remaining_balance == 0:
+                deduction.status = DeductionStatus.SETTLED
+                deduction.settled_at = timezone.now()
+                action = 'Deduction settled'
+            else:
+                deduction.status = DeductionStatus.PARTIAL
+                action = 'Deduction partially paid'
+
+            deduction.save(update_fields=['amount_paid', 'remaining_balance', 'status', 'settled_at', 'updated_at'])
+            _audit_deduction_payment(payment.processed_by, action, deduction, payment, amount_to_apply)
+            updates.append((deduction.id, action, amount_to_apply))
+            deduction_pool -= amount_to_apply
+
+    return updates
 
 
 def approved_adjustment_totals_for_month(employee, month_key):
@@ -107,9 +216,7 @@ def compute_total_salary_payable(employee, month_key):
     base_salary = Decimal(str(employee.salary))
 
     # Other Deductions (from Deduction model)
-    other_deductions = applied_deductions_for_month(employee, month_key).aggregate(
-        total=Sum('amount')
-    )['total'] or Decimal('0')
+    other_deductions = active_deduction_balance_for_month(employee, month_key)
 
     # Adjustments (IOU, Bonus, etc.)
     try:

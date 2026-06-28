@@ -17,7 +17,7 @@ from datetime import datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from django.contrib.auth import get_user_model
 from django.conf import settings
-from django.core.mail import EmailMessage, EmailMultiAlternatives
+from django.core.mail import EmailMessage, EmailMultiAlternatives, get_connection
 from django.core.exceptions import ValidationError
 from django.contrib.auth.tokens import default_token_generator
 from django.utils.http import urlsafe_base64_encode, urlsafe_base64_decode
@@ -927,6 +927,15 @@ class EmployeeViewSet(viewsets.ModelViewSet):
         logger.info("Employee create requested by user_id=%s", getattr(request.user, "id", None))
         return super().create(request, *args, **kwargs)
 
+    def perform_update(self, serializer):
+        employee = serializer.save()
+        log_audit(
+            self.request.user,
+            f"Employee updated: {employee.employee_id}",
+            self.request,
+            extra={'employee_id': str(employee.id), 'employee_code': employee.employee_id}
+        )
+
     def get_throttles(self):
         if self.action in ['request_export', 'export_csv']:
             return [ExportThrottle()]
@@ -1037,6 +1046,12 @@ class EmployeeViewSet(viewsets.ModelViewSet):
                 f'<p>Welcome! Your account (ID: <b>{employee.employee_id}</b>) has been approved.</p>'
             )
 
+        log_audit(
+            request.user,
+            f"Approved employee account {employee.employee_id}",
+            request,
+            extra={'employee_id': str(employee.id), 'employee_code': employee.employee_id}
+        )
         logger.info(f"Admin {request.user.username} approved employee {employee.employee_id}")
         return Response({'message': 'Employee approved and account activated successfully'})
 
@@ -1109,6 +1124,12 @@ class EmployeeViewSet(viewsets.ModelViewSet):
         total_staff = active_qs.filter(type='staff').count()
         total_guards = active_qs.filter(type='guard').count()
         total_self_registered = active_qs.filter(is_self_registered=True).count()
+        total_active_employees = active_qs.count()
+        pending_approvals_qs = Employee.objects.filter(status='pending')
+        if location:
+            pending_approvals_qs = pending_approvals_qs.filter(location=location)
+        pending_approvals = pending_approvals_qs.count()
+        approved_users = active_qs.filter(user__is_active=True).count()
 
         # Calculate exact financial totals for the current month
         today = timezone.now().date()
@@ -1123,6 +1144,15 @@ class EmployeeViewSet(viewsets.ModelViewSet):
         # Added safety for aggregation
         deduction_agg = deduction_qs.aggregate(total=Sum('amount'))
         total_deductions = float(deduction_agg['total'] or 0)
+
+        deduction_status_qs = Deduction.objects.all()
+        if location:
+            deduction_status_qs = deduction_status_qs.filter(employee__location=location)
+        deduction_status_counts = {
+            'pending': deduction_status_qs.filter(status__in=['pending', 'pending_hr']).count(),
+            'partial': 0,
+            'settled': deduction_status_qs.filter(status='applied').count(),
+        }
 
         # Attendance today
         attendance_qs = Attendance.objects.filter(date=today)
@@ -1146,6 +1176,7 @@ class EmployeeViewSet(viewsets.ModelViewSet):
         # FIX: Display ONLY actual money paid (Sum of amount_paid)
         payment_agg = payment_qs.aggregate(total=Sum('amount_paid'))
         total_paid_this_month = float(payment_agg['total'] or 0)
+        payment_count_this_month = payment_qs.count()
 
         # Monthly Salary Summary (Last 6 Months)
         salary_summary = []
@@ -1175,8 +1206,13 @@ class EmployeeViewSet(viewsets.ModelViewSet):
             'total_staff': total_staff,
             'total_guards': total_guards,
             'total_self_registered': total_self_registered,
+            'total_active_employees': total_active_employees,
+            'pending_approvals': pending_approvals,
+            'approved_users': approved_users,
             'total_deductions': total_deductions,
+            'deduction_status_counts': deduction_status_counts,
             'total_payments': total_paid_this_month,
+            'payment_count': payment_count_this_month,
             'attendance_today': attendance_stats,
             'salary_summary': salary_summary,
             'recent_employees': EmployeeSerializer(active_qs.order_by('-created_at')[:5], many=True, context={'request': request}).data,
@@ -1607,6 +1643,12 @@ class PaymentViewSet(viewsets.ModelViewSet):
     filterset_fields = ['employee', 'status', 'payment_date']
     throttle_classes = [PaymentThrottle]
 
+    def _internal_otp_expiry_seconds(self):
+        return max(1, int(getattr(settings, 'INTERNAL_PAYMENT_OTP_EXPIRY_SECONDS', 30)))
+
+    def _paystack_otp_enabled(self):
+        return bool(getattr(settings, 'PAYSTACK_TRANSFER_OTP_ENABLED', False))
+
     def get_permissions(self):
         if self.action in [
             "initiate_payment",
@@ -1757,34 +1799,66 @@ class PaymentViewSet(viewsets.ModelViewSet):
             raise ValueError('Your user account has no email configured to send OTPs.')
 
         otp_code = ''.join(random.choices(string.digits, k=6))
+        expiry_seconds = self._internal_otp_expiry_seconds()
         OTP.objects.filter(reference=reference, email=user.email, is_used=False).update(is_used=True)
         OTP.objects.create(
             email=user.email,
             code=otp_code,
             reference=reference,
-            expires_at=timezone.now() + timezone.timedelta(minutes=5),
+            expires_at=timezone.now() + timezone.timedelta(seconds=expiry_seconds),
         )
+
+        def invalidate_generated_otp():
+            OTP.objects.filter(
+                reference=reference,
+                email=user.email,
+                code=otp_code,
+                is_used=False,
+            ).update(is_used=True)
 
         total_amount = sum(Decimal(str(p.amount_paid or p.net_amount or 0)) for p in payments)
         employee_names = ', '.join(p.employee.name for p in payments[:5])
         if len(payments) > 5:
             employee_names += f", and {len(payments) - 5} more"
 
+        text_body = (
+            f'Your internal OTP for payment authorization is: {otp_code}\n\n'
+            f'Reference: {reference}\n'
+            f'Employees: {employee_names}\n'
+            f'Total amount: NGN {total_amount:,.2f}\n\n'
+            f'Expires in {expiry_seconds} seconds.\n'
+            'If you did not request this payment authorization, contact your payroll administrator immediately.'
+        )
+        html_body = f"""
+        <div style="font-family: Arial, sans-serif; color: #1f2937; max-width: 560px; margin: 0 auto;">
+          <div style="background: #0f172a; color: #ffffff; padding: 18px 22px; border-radius: 8px 8px 0 0;">
+            <h2 style="margin: 0; font-size: 20px;">Payroll System</h2>
+          </div>
+          <div style="border: 1px solid #e5e7eb; border-top: 0; padding: 22px; border-radius: 0 0 8px 8px;">
+            <p style="margin-top: 0;">Use this one-time code to authorize the salary payment request:</p>
+            <p style="font-size: 30px; letter-spacing: 6px; font-weight: 700; margin: 18px 0; color: #111827;">{escape(otp_code)}</p>
+            <p><strong>Reference:</strong> {escape(str(reference))}</p>
+            <p><strong>Employees:</strong> {escape(employee_names)}</p>
+            <p><strong>Total amount:</strong> NGN {total_amount:,.2f}</p>
+            <p style="color: #b45309;"><strong>Expires in {expiry_seconds} seconds.</strong></p>
+            <p style="font-size: 13px; color: #6b7280;">If you did not request this payment authorization, contact your payroll administrator immediately.</p>
+          </div>
+        </div>
+        """
+
         try:
-            send_mail(
+            connection = get_connection(timeout=int(getattr(settings, 'INTERNAL_PAYMENT_OTP_EMAIL_TIMEOUT', 5)))
+            message = EmailMultiAlternatives(
                 subject,
-                (
-                    f'Your internal OTP for payment authorization is: {otp_code}\n\n'
-                    f'Reference: {reference}\n'
-                    f'Employees: {employee_names}\n'
-                    f'Total amount: NGN {total_amount:,.2f}\n\n'
-                    'Expires in 5 minutes.'
-                ),
+                text_body,
                 settings.DEFAULT_FROM_EMAIL,
                 [user.email],
-                fail_silently=False,
+                connection=connection,
             )
+            message.attach_alternative(html_body, "text/html")
+            message.send(fail_silently=False)
         except socket.gaierror as exc:
+            invalidate_generated_otp()
             logger.error(
                 "Internal payment OTP email DNS failure email_host=%s recipient=%s error=%s",
                 getattr(settings, 'EMAIL_HOST', None),
@@ -1795,7 +1869,8 @@ class PaymentViewSet(viewsets.ModelViewSet):
                 "OTP email could not be sent because the SMTP host cannot be resolved. "
                 "Check EMAIL_HOST in the deployment environment."
             ) from exc
-        except OSError as exc:
+        except (TimeoutError, socket.timeout, OSError) as exc:
+            invalidate_generated_otp()
             logger.error(
                 "Internal payment OTP email connection failure email_host=%s email_port=%s recipient=%s error=%s",
                 getattr(settings, 'EMAIL_HOST', None),
@@ -1808,11 +1883,11 @@ class PaymentViewSet(viewsets.ModelViewSet):
                 "Check EMAIL_HOST, EMAIL_PORT, and EMAIL_USE_TLS."
             ) from exc
         except Exception as exc:
-            logger.error(
-                "Internal payment OTP email failed email_host=%s recipient=%s error=%s",
+            invalidate_generated_otp()
+            logger.exception(
+                "Internal payment OTP email failed email_host=%s recipient=%s",
                 getattr(settings, 'EMAIL_HOST', None),
                 user.email,
-                exc,
             )
             raise ValueError(
                 "OTP email could not be sent. Check EMAIL_HOST_USER, EMAIL_HOST_PASSWORD, and DEFAULT_FROM_EMAIL."
@@ -1820,12 +1895,12 @@ class PaymentViewSet(viewsets.ModelViewSet):
 
     def _stage_internal_payment_otp(self, user, payments, reference=None):
         reference = reference or str(uuid.uuid4())
+        self._send_internal_payment_otp(user, reference, list(payments))
         cache.set(
             f"payment_internal_otp:{reference}",
             [str(payment.id) for payment in payments],
             60 * 15,
         )
-        self._send_internal_payment_otp(user, reference, list(payments))
         return reference
 
     def _payment_ids_for_internal_otp_reference(self, reference):
@@ -1843,27 +1918,28 @@ class PaymentViewSet(viewsets.ModelViewSet):
         if not user.email:
             return False, 'Your user account has no email configured for OTP verification.'
 
-        otp_obj = OTP.objects.filter(
-            email=user.email,
-            reference=reference,
-            is_used=False,
-        ).order_by('-created_at').first()
+        with transaction.atomic():
+            otp_obj = OTP.objects.select_for_update().filter(
+                email=user.email,
+                reference=reference,
+                is_used=False,
+            ).order_by('-created_at').first()
 
-        if not otp_obj:
-            return False, 'Invalid or expired OTP.'
-        if otp_obj.has_expired():
+            if not otp_obj:
+                return False, 'Invalid or expired OTP.'
+            if otp_obj.has_expired():
+                otp_obj.is_used = True
+                otp_obj.save(update_fields=['is_used', 'updated_at'])
+                return False, 'OTP has expired. Please request a new code.'
+            if otp_obj.attempt_count >= otp_obj.max_attempts:
+                return False, 'Maximum OTP attempts reached. Please request a new OTP.'
+            if otp_obj.code != str(otp_code).strip():
+                otp_obj.increment_attempt()
+                return False, 'Invalid OTP.'
+
             otp_obj.is_used = True
             otp_obj.save(update_fields=['is_used', 'updated_at'])
-            return False, 'OTP has expired. Please request a new one.'
-        if otp_obj.attempt_count >= otp_obj.max_attempts:
-            return False, 'Maximum OTP attempts reached. Please request a new OTP.'
-        if otp_obj.code != str(otp_code).strip():
-            otp_obj.increment_attempt()
-            return False, 'Invalid OTP.'
-
-        otp_obj.is_used = True
-        otp_obj.save(update_fields=['is_used', 'updated_at'])
-        return True, None
+            return True, None
 
     def _execute_bulk_paystack_transfer(self, payments):
         paystack = PaystackAPI()
@@ -1914,13 +1990,27 @@ class PaymentViewSet(viewsets.ModelViewSet):
             }
 
         if data.get('status') == 'otp':
+            if not self._paystack_otp_enabled():
+                Payment.objects.filter(id__in=transfer_payment_ids).update(status='failed')
+                logger.error(
+                    "Paystack returned OTP for bulk transfer while PAYSTACK_TRANSFER_OTP_ENABLED is disabled payment_ids=%s",
+                    transfer_payment_ids,
+                )
+                return {
+                    'message': 'Payment could not continue because Paystack OTP is enabled on the Paystack account. Disable Paystack OTP there or enable PAYSTACK_TRANSFER_OTP_ENABLED.',
+                    'paystack_otp_required': False,
+                    'status': 'failed',
+                    'errors': errors,
+                    'payments': [],
+                }
+
             transfer_code = data.get('transfer_code')
             Payment.objects.filter(id__in=transfer_payment_ids).update(
                 status='pending_paystack_otp',
                 paystack_transfer_code=transfer_code,
             )
             return {
-                'message': 'Internal OTP verified. Paystack requires OTP to authorize this bulk transfer batch.',
+                'message': 'Paystack requires OTP to authorize this bulk transfer batch.',
                 'paystack_otp_required': True,
                 'paystack_transfer_code': transfer_code,
                 'reference': target_payments[0].transaction_reference if target_payments else None,
@@ -1929,7 +2019,7 @@ class PaymentViewSet(viewsets.ModelViewSet):
             }
 
         return {
-            'message': f'Internal OTP verified. Initiated {len(target_payments)} salary transfers.',
+            'message': f'Initiated {len(target_payments)} salary transfers.',
             'paystack_otp_required': False,
             'status': 'processing',
             'errors': errors,
@@ -1979,6 +2069,18 @@ class PaymentViewSet(viewsets.ModelViewSet):
         if transfer_result.get('status'):
             data = transfer_result.get('data', {})
             _apply_paystack_transfer_result(payment, data)
+            if payment.status == 'pending_paystack_otp' and not self._paystack_otp_enabled():
+                logger.error(
+                    "Paystack returned OTP for transfer while PAYSTACK_TRANSFER_OTP_ENABLED is disabled payment_id=%s reference=%s",
+                    payment.id,
+                    payment.transaction_reference,
+                )
+                payment.status = 'failed'
+                payment.save(update_fields=['status', 'updated_at'])
+                return False, (
+                    'Payment could not continue because Paystack OTP is enabled on the Paystack account. '
+                    'Disable Paystack OTP there or enable PAYSTACK_TRANSFER_OTP_ENABLED.'
+                )
             return True, {
                 'message': 'Payment confirmed by Paystack.' if payment.status == 'completed' else 'Payment initiated on Paystack.',
                 'paystack_otp_required': payment.status == 'pending_paystack_otp',
@@ -2038,6 +2140,7 @@ class PaymentViewSet(viewsets.ModelViewSet):
         try:
             with transaction.atomic():
                 payment_month = timezone.now().strftime('%Y-%m')
+                employee = Employee.objects.select_for_update().get(id=employee.id, status='active')
 
                 # Avoid race conditions with existing active transfers
                 if Payment.objects.filter(
@@ -2148,6 +2251,50 @@ class PaymentViewSet(viewsets.ModelViewSet):
                     )
 
                 if initial_status == 'pending':
+                    if self._paystack_otp_enabled():
+                        success, result = self._execute_paystack_transfer(payment, employee, bank_code)
+                        if not success and isinstance(result, dict) and result.get('type') in {'paystack_rate_limited', 'paystack_rate_limit', 'paystack_rate'}:
+                            return Response(
+                                {
+                                    'error': result.get('message') or 'Paystack is rate limiting account verification',
+                                    'detail': result.get('message') or 'Please retry later',
+                                    'retry_after': result.get('retry_after'),
+                                    'error_code': 'rate_limited',
+                                },
+                                status=status.HTTP_429_TOO_MANY_REQUESTS,
+                            )
+                        if not success:
+                            return Response({'error': result, 'status': payment.status}, status=status.HTTP_400_BAD_REQUEST)
+
+                        log_audit(
+                            request.user,
+                            f"Individual payment initiated for {employee.employee_id}",
+                            request,
+                            extra={
+                                'payment_id': str(payment.id),
+                                'employee_id': str(employee.id),
+                                'reference': payment.transaction_reference,
+                                'amount': str(amount_paid),
+                                'status': payment.status,
+                            }
+                        )
+                        return Response(
+                            {
+                                'message': result['message'],
+                                'reference': payment.transaction_reference,
+                                'amount': float(amount_paid),
+                                'status': result['status'],
+                                'internal_otp_required': False,
+                                'paystack_otp_required': result.get('paystack_otp_required', False),
+                                'paystack_transfer_code': payment.paystack_transfer_code,
+                                'payment_completed': payment.status == 'completed',
+                                'payment_processing': payment.status == 'processing',
+                                'employee_name': employee.name,
+                                'outstanding': float(payment.remaining_balance or 0),
+                            },
+                            status=status.HTTP_200_OK,
+                        )
+
                     try:
                         otp_reference = self._stage_internal_payment_otp(
                             request.user,
@@ -2155,7 +2302,25 @@ class PaymentViewSet(viewsets.ModelViewSet):
                             reference=payment.transaction_reference,
                         )
                     except ValueError as exc:
+                        Payment.objects.filter(id=payment.id, status='pending').delete()
+                        logger.warning(
+                            "Deleted staged payment after internal OTP email failure payment_id=%s reference=%s",
+                            payment.id,
+                            payment.transaction_reference,
+                        )
                         return Response({'error': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+                    log_audit(
+                        request.user,
+                        f"Individual payment staged for internal OTP for {employee.employee_id}",
+                        request,
+                        extra={
+                            'payment_id': str(payment.id),
+                            'employee_id': str(employee.id),
+                            'reference': payment.transaction_reference,
+                            'amount': str(amount_paid),
+                            'status': payment.status,
+                        }
+                    )
                     return Response(
                         {
                             'message': 'Internal OTP sent to your email. Verify it to authorize this payment.',
@@ -2179,6 +2344,18 @@ class PaymentViewSet(viewsets.ModelViewSet):
                         type='warning'
                     )
 
+                log_audit(
+                    request.user,
+                    f"Individual payment submitted for HR approval for {employee.employee_id}",
+                    request,
+                    extra={
+                        'payment_id': str(payment.id),
+                        'employee_id': str(employee.id),
+                        'reference': payment.transaction_reference,
+                        'amount': str(amount_paid),
+                        'status': payment.status,
+                    }
+                )
                 return Response(
                     {
                         'message': 'Payment initiated and awaiting HR approval.',
@@ -2301,73 +2478,88 @@ class PaymentViewSet(viewsets.ModelViewSet):
 
             for emp_id in employee_ids:
                 try:
-                    employee = Employee.objects.get(id=emp_id, status='active')
+                    with transaction.atomic():
+                        employee = Employee.objects.select_for_update().get(id=emp_id, status='active')
 
-                    existing_payment = Payment.objects.filter(
-                        employee=employee,
-                        payment_month=current_month
-                    ).first()
-                    if existing_payment:
-                        errors.append(
-                            f"{employee.name}: payment already exists for {current_month} ({existing_payment.status})"
-                        )
-                        continue
+                        active_payment = Payment.objects.filter(
+                            employee=employee,
+                            payment_month=current_month,
+                            status__in=[
+                                PaymentStatus.PENDING,
+                                PaymentStatus.PROCESSING,
+                                PaymentStatus.PENDING_PAYSTACK_OTP,
+                                PaymentStatus.PENDING_HR,
+                            ],
+                        ).first()
+                        if active_payment:
+                            errors.append(
+                                f"{employee.name}: payment already in progress for {current_month} ({active_payment.status})"
+                            )
+                            continue
 
-                    bank_code = get_employee_bank_code(employee)
-                    if not bank_code:
-                        errors.append(f"{employee.name}: missing bank_code")
-                        continue
+                        bank_code = get_employee_bank_code(employee)
+                        if not bank_code:
+                            errors.append(f"{employee.name}: missing bank_code")
+                            continue
 
-                    salary_data = compute_total_salary_payable(employee, current_month)
-                    total_payable = salary_data['final_net_salary']
-                    outstanding = salary_data['outstanding_balance']
+                        salary_data = compute_total_salary_payable(employee, current_month)
+                        total_payable = salary_data['final_net_salary']
+                        outstanding = salary_data['outstanding_balance']
 
-                    if outstanding <= 0:
-                        errors.append(f"{employee.name}: no payable amount (NGN 0.00)")
-                        continue
+                        if outstanding <= 0:
+                            errors.append(f"{employee.name}: Salary for this payroll period has already been fully paid.")
+                            continue
 
-                    part = partials_map.get(str(emp_id))
-                    if part:
-                        try:
-                            part_amt = Decimal(str(part.get('partial_amount') or 0))
-                            if part_amt > 0 and part_amt <= outstanding:
+                        part = partials_map.get(str(emp_id))
+                        if part:
+                            try:
+                                part_amt = Decimal(str(part.get('partial_amount') or 0))
+                                if part_amt <= 0:
+                                    errors.append(f"{employee.name}: partial payment amount must be greater than 0.")
+                                    continue
+                                if part_amt > outstanding:
+                                    errors.append(
+                                        f"{employee.name}: partial payment amount cannot exceed outstanding balance "
+                                        f"(NGN {outstanding:,.2f})."
+                                    )
+                                    continue
                                 amount_to_pay = part_amt
-                            else:
-                                amount_to_pay = outstanding
-                        except Exception:
+                            except Exception:
+                                errors.append(f"{employee.name}: invalid partial payment amount.")
+                                continue
+                        else:
                             amount_to_pay = outstanding
-                    else:
-                        amount_to_pay = outstanding
 
-                    is_partial = (amount_to_pay < total_payable)
+                        is_partial = (amount_to_pay < total_payable)
+
+                        payment = Payment.objects.create(
+                            employee=employee,
+                            base_salary=employee.salary,
+                            total_deductions=salary_data['other_deductions'],
+                            iou_amount=salary_data['iou_deduction'],
+                            bonus_amount=salary_data['bonus'],
+                            net_amount=total_payable,
+                            amount_paid=amount_to_pay,
+                            transaction_reference=str(uuid.uuid4()),
+                            payment_date=timezone.now().date(),
+                            payment_month=current_month,
+                            processed_by=request.user,
+                            status='pending',
+                            payment_method='bank_transfer',
+                            is_partial=is_partial,
+                            remaining_balance=max(Decimal('0'), outstanding - amount_to_pay),
+                            previous_balance=salary_data['previous_balance'],
+                            partial_reason=part.get('partial_reason') if part else None,
+                        )
+
                     total_amount += float(amount_to_pay)
-
-                    payment = Payment.objects.create(
-                        employee=employee,
-                        base_salary=employee.salary,
-                        total_deductions=salary_data['other_deductions'],
-                        iou_amount=salary_data['iou_deduction'],
-                        bonus_amount=salary_data['bonus'],
-                        net_amount=total_payable,
-                        amount_paid=amount_to_pay,
-                        transaction_reference=str(uuid.uuid4()),
-                        payment_date=timezone.now().date(),
-                        payment_month=current_month,
-                        processed_by=request.user,
-                        status='pending',
-                        payment_method='bank_transfer',
-                        is_partial=is_partial,
-                        previous_balance=salary_data['previous_balance'],
-                        partial_reason=part.get('partial_reason') if part else None,
-                    )
-
                     payments_created.append({
                         'employee_id': employee.employee_id,
                         'employee_name': employee.name,
                         'bank': f"{employee.bank_name} - {employee.account_number}",
                         'net_salary': float(amount_to_pay),
                         'is_partial': bool(is_partial),
-                        'remaining_balance': float(total_payable - amount_to_pay),
+                        'remaining_balance': float(max(Decimal('0'), outstanding - amount_to_pay)),
                         'reference': payment.transaction_reference,
                     })
                     local_payments.append(payment)
@@ -2378,10 +2570,52 @@ class PaymentViewSet(viewsets.ModelViewSet):
                     errors.append(f"Error for employee ID {emp_id}: {str(e)}")
 
             if local_payments:
+                if self._paystack_otp_enabled():
+                    result = self._execute_bulk_paystack_transfer(local_payments)
+                    response_status = status.HTTP_200_OK if result.get('status') != 'failed' else status.HTTP_400_BAD_REQUEST
+                    result.update({
+                        'internal_otp_required': False,
+                        'total_amount': total_amount,
+                        'total_employees': len(payments_created),
+                    })
+                    if payments_created and 'payments' not in result:
+                        result['payments'] = payments_created
+                    if errors:
+                        result['errors'] = list(result.get('errors', [])) + errors
+                    log_audit(
+                        request.user,
+                        "Bulk payment initiated",
+                        request,
+                        extra={
+                            'payment_ids': [str(p.id) for p in local_payments],
+                            'references': [p.transaction_reference for p in local_payments],
+                            'total_amount': str(total_amount),
+                            'status': result.get('status'),
+                        }
+                    )
+                    return Response(result, status=response_status)
+
                 try:
                     otp_reference = self._stage_internal_payment_otp(request.user, local_payments)
                 except ValueError as exc:
+                    payment_ids = [p.id for p in local_payments]
+                    Payment.objects.filter(id__in=payment_ids, status='pending').delete()
+                    logger.warning(
+                        "Deleted staged bulk payments after internal OTP email failure payment_ids=%s",
+                        [str(payment_id) for payment_id in payment_ids],
+                    )
                     return Response({'error': str(exc), 'errors': errors}, status=status.HTTP_400_BAD_REQUEST)
+                log_audit(
+                    request.user,
+                    "Bulk payment staged for internal OTP",
+                    request,
+                    extra={
+                        'payment_ids': [str(p.id) for p in local_payments],
+                        'references': [p.transaction_reference for p in local_payments],
+                        'total_amount': str(total_amount),
+                        'otp_reference': otp_reference,
+                    }
+                )
                 return Response({
                     'message': 'Internal OTP sent to your email. Verify it to authorize this bulk payment.',
                     'reference': otp_reference,
@@ -2439,6 +2673,13 @@ class PaymentViewSet(viewsets.ModelViewSet):
         )
         if not payments:
             return Response({'error': 'Payment is not pending internal OTP verification'}, status=status.HTTP_400_BAD_REQUEST)
+
+        log_audit(
+            request.user,
+            "Internal payment OTP verified",
+            request,
+            extra={'reference': reference, 'payment_ids': [str(p.id) for p in payments]}
+        )
 
         if len(payments) > 1:
             result = self._execute_bulk_paystack_transfer(payments)
@@ -2513,7 +2754,9 @@ class PaymentViewSet(viewsets.ModelViewSet):
                             status='pending_paystack_otp'
                         ).select_for_update()
 
+                        completed_payment_ids = []
                         for p in target_payments:
+                            completed_payment_ids.append(str(p.id))
                             p.status = 'completed'
                             p.paystack_reference = paystack_id
                             p.save()
@@ -2526,7 +2769,13 @@ class PaymentViewSet(viewsets.ModelViewSet):
                                 message=f"Payment credited for {p.employee.employee_id}: ₦{p.net_amount:,.2f}",
                                 type='success'
                             )
-                            
+                             
+                    log_audit(
+                        request.user,
+                        "Paystack OTP verified",
+                        request,
+                        extra={'reference': reference, 'payment_ids': completed_payment_ids}
+                    )
                     logger.info(f"Paystack transfer finalized and completed for {payment.employee.name} (Ref: {reference})")
                     return Response({'message': 'Payment finalized and completed successfully', 'payment_completed': True})
 
@@ -3133,6 +3382,14 @@ class DeductionViewSet(viewsets.ModelViewSet):
 
         deduction.status = new_status
         deduction.save()
+
+        if new_status == 'applied':
+            log_audit(
+                request.user,
+                f"Deduction settlement applied for {deduction.employee.employee_id}",
+                request,
+                extra={'deduction_id': str(deduction.id), 'employee_id': str(deduction.employee.id)}
+            )
 
         Notification.objects.create(
             user=deduction.employee.user,

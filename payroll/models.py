@@ -139,6 +139,8 @@ class ClockMethod(models.TextChoices):
 class DeductionStatus(models.TextChoices):
     """Deduction status choices."""
     PENDING = 'pending', _('Pending')
+    PARTIAL = 'partial', _('Partial')
+    SETTLED = 'settled', _('Settled')
     APPLIED = 'applied', _('Applied')
     CANCELLED = 'cancelled', _('Cancelled')
     TERMINATED = 'terminated', _('Terminated')
@@ -750,8 +752,23 @@ class Deduction(TimeStampedModel):
         decimal_places=2,
         validators=[MinValueValidator(0)]
     )
+    amount_paid = models.DecimalField(
+        max_digits=10,
+        decimal_places=2,
+        default=0,
+        validators=[MinValueValidator(0)],
+        help_text="Amount already recovered through payroll"
+    )
+    remaining_balance = models.DecimalField(
+        max_digits=10,
+        decimal_places=2,
+        default=0,
+        validators=[MinValueValidator(0)],
+        help_text="Outstanding deduction balance"
+    )
     reason = models.TextField()
     date = models.DateField()
+    settled_at = models.DateTimeField(null=True, blank=True)
     status = models.CharField(
         max_length=20,
         choices=DeductionStatus.choices,
@@ -785,8 +802,22 @@ class Deduction(TimeStampedModel):
                 name='deduction_amount_positive'
             ),
             models.CheckConstraint(
+                check=models.Q(amount_paid__gte=0),
+                name='deduction_amount_paid_positive'
+            ),
+            models.CheckConstraint(
+                check=models.Q(remaining_balance__gte=0),
+                name='deduction_remaining_balance_positive'
+            ),
+            models.CheckConstraint(
+                check=models.Q(amount_paid__lte=models.F('amount')),
+                name='deduction_amount_paid_not_over_amount'
+            ),
+            models.CheckConstraint(
                 check=models.Q(
                     models.Q(status=DeductionStatus.PENDING) |
+                    models.Q(status=DeductionStatus.PARTIAL) |
+                    models.Q(status=DeductionStatus.SETTLED) |
                     models.Q(status=DeductionStatus.APPLIED) |
                     models.Q(status=DeductionStatus.CANCELLED) |
                     models.Q(status=DeductionStatus.TERMINATED) |
@@ -802,9 +833,28 @@ class Deduction(TimeStampedModel):
     def clean(self):
         """Sync hr_approved with status to maintain single source of truth."""
         super().clean()
+        if self.amount is not None and self.amount_paid is not None:
+            if self.amount_paid > self.amount:
+                raise ValidationError({"amount_paid": _("Amount paid cannot exceed deduction amount.")})
+            self.remaining_balance = max(self.amount - self.amount_paid, 0)
+
+        if self.remaining_balance == 0 and self.amount and self.status in [
+            DeductionStatus.PENDING,
+            DeductionStatus.PARTIAL,
+            DeductionStatus.APPLIED,
+        ]:
+            self.status = DeductionStatus.SETTLED
+            if self.settled_at is None:
+                self.settled_at = timezone.now()
+
         if self.status == DeductionStatus.PENDING_HR:
             self.hr_approved = False
-        elif self.status == DeductionStatus.APPLIED:
+        elif self.status in [
+            DeductionStatus.PENDING,
+            DeductionStatus.PARTIAL,
+            DeductionStatus.SETTLED,
+            DeductionStatus.APPLIED,
+        ]:
             self.hr_approved = True
 
     @transaction.atomic
@@ -812,7 +862,7 @@ class Deduction(TimeStampedModel):
         """Apply the deduction after HR approval."""
         if self.status != DeductionStatus.PENDING_HR:
             raise ValueError(_(f"Cannot apply deduction with status: {self.status}"))
-        self.status = DeductionStatus.APPLIED
+        self.status = DeductionStatus.PENDING
         self.hr_approved = True
         self.hr_approved_by = approved_by
         self.save(update_fields=['status', 'hr_approved', 'hr_approved_by', 'updated_at'])
@@ -826,6 +876,10 @@ class Deduction(TimeStampedModel):
         self.save(update_fields=['status', 'updated_at'])
 
     def save(self, *args, **kwargs):
+        if self.amount is not None and self.amount_paid is None:
+            self.amount_paid = 0
+        if self.amount is not None and (self.remaining_balance in [None, 0]) and not self.pk and not self.amount_paid:
+            self.remaining_balance = self.amount
         self.full_clean()
         super().save(*args, **kwargs)
 
@@ -1630,7 +1684,7 @@ class OTP(TimeStampedModel):
 
     def has_expired(self):
         """Check if OTP has passed expiry time."""
-        return timezone.now() > self.expires_at
+        return timezone.now() >= self.expires_at
 
     def increment_attempt(self):
         """Increment attempt count and check if max reached."""
