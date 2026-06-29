@@ -2559,12 +2559,14 @@ function renderCompanies(list) {
   });
 }
 
-function showCompanyPaymentVerifyModal(companyId) {
+async function showCompanyPaymentVerifyModal(companyId) {
   const company = AppState.companies.find((c) => String(c.id) === String(companyId));
   if (!company) {
     showToast("Company not found", "error");
     return;
   }
+
+  await loadClientPayments();
 
   const currentMonth = new Date().toISOString().slice(0, 7);
   const existingPayment = (AppState.clientPayments || []).find(
@@ -4954,7 +4956,6 @@ async function bulkApproveAdjustments(type) {
 
 async function loadClientPayments() {
     const tbody = document.getElementById("clientPaymentsTableBody");
-    if (!tbody) return;
 
     try {
         const res = await apiRequest("/api/client-payments/");
@@ -4962,6 +4963,7 @@ async function loadClientPayments() {
         
         const list = res.data?.results || res.data || [];
         AppState.clientPayments = list;
+        if (!tbody) return true;
         tbody.innerHTML = "";
 
         list.forEach(cp => {
@@ -4983,9 +4985,11 @@ async function loadClientPayments() {
             `;
             tbody.appendChild(row);
         });
+        return true;
     } catch (err) {
         AppState.clientPayments = [];
         showToast("Failed to load company payments", "error");
+        return false;
     }
 }
 
@@ -6528,6 +6532,9 @@ const EXPOSED_FUNCTIONS = {
   editCompany,
   deleteCompany,
   populateCompanyGuards,
+  showCompanyPaymentVerifyModal,
+  saveCompanyPaymentVerification,
+  loadClientPayments,
 
   // Deductions
   loadDeductions,

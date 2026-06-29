@@ -90,6 +90,7 @@ from .models import (
     EmployeeSalaryAdjustment,
     EmployeeBalanceLedger,
     ClientMonthlyPayment,
+    ClientPaymentStatus,
     Payment,
 )
 
