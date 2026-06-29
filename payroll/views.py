@@ -1798,6 +1798,10 @@ class PaymentViewSet(viewsets.ModelViewSet):
         if not user.email:
             raise ValueError('Your user account has no email configured to send OTPs.')
 
+        user_friendly_email_error = (
+            "We could not send the verification code right now. "
+            "Please try again shortly or contact your payroll administrator."
+        )
         otp_code = ''.join(random.choices(string.digits, k=6))
         expiry_seconds = self._internal_otp_expiry_seconds()
         OTP.objects.filter(reference=reference, email=user.email, is_used=False).update(is_used=True)
@@ -1865,10 +1869,7 @@ class PaymentViewSet(viewsets.ModelViewSet):
                 user.email,
                 exc,
             )
-            raise ValueError(
-                "OTP email could not be sent because the SMTP host cannot be resolved. "
-                "Check EMAIL_HOST in the deployment environment."
-            ) from exc
+            raise ValueError(user_friendly_email_error) from exc
         except (TimeoutError, socket.timeout, OSError) as exc:
             invalidate_generated_otp()
             logger.error(
@@ -1878,10 +1879,7 @@ class PaymentViewSet(viewsets.ModelViewSet):
                 user.email,
                 exc,
             )
-            raise ValueError(
-                "OTP email could not be sent because the mail server is unreachable. "
-                "Check EMAIL_HOST, EMAIL_PORT, and EMAIL_USE_TLS."
-            ) from exc
+            raise ValueError(user_friendly_email_error) from exc
         except Exception as exc:
             invalidate_generated_otp()
             logger.exception(
@@ -1889,9 +1887,7 @@ class PaymentViewSet(viewsets.ModelViewSet):
                 getattr(settings, 'EMAIL_HOST', None),
                 user.email,
             )
-            raise ValueError(
-                "OTP email could not be sent. Check EMAIL_HOST_USER, EMAIL_HOST_PASSWORD, and DEFAULT_FROM_EMAIL."
-            ) from exc
+            raise ValueError(user_friendly_email_error) from exc
 
     def _stage_internal_payment_otp(self, user, payments, reference=None):
         reference = reference or str(uuid.uuid4())
@@ -3776,18 +3772,44 @@ class ClientMonthlyPaymentViewSet(viewsets.ModelViewSet):
     permission_classes = [IsAuthenticated, IsAdmin]
     filterset_fields = ['client', 'status', 'month_key']
 
+    @staticmethod
+    def _payment_status(amount_paid, amount_due):
+        if amount_paid <= 0:
+            return ClientPaymentStatus.UNPAID
+        if amount_paid >= amount_due:
+            return ClientPaymentStatus.PAID
+        return ClientPaymentStatus.PARTIAL
+
+    def create(self, request, *args, **kwargs):
+        client_id = request.data.get('client')
+        month_key = request.data.get('month_key')
+        if client_id and month_key:
+            instance = ClientMonthlyPayment.objects.filter(
+                client_id=client_id,
+                month_key=month_key,
+            ).first()
+            if instance:
+                serializer = self.get_serializer(instance, data=request.data, partial=True)
+                serializer.is_valid(raise_exception=True)
+                self.perform_update(serializer)
+                return Response(serializer.data, status=status.HTTP_200_OK)
+        return super().create(request, *args, **kwargs)
+
     def perform_create(self, serializer):
         client = serializer.validated_data.get('client')
         amount_paid = serializer.validated_data.get('amount_paid', 0)
-        amount_due = client.payment_to_us
+        amount_due = client.payment_to_us + serializer.validated_data.get('increment', 0)
         serializer.save(
-            amount_due=amount_due,
+            status=self._payment_status(amount_paid, amount_due),
             outstanding_balance=max(0, amount_due - amount_paid)
         )
 
     def perform_update(self, serializer):
-        instance = self.get_object()
+        instance = serializer.instance
         amount_paid = serializer.validated_data.get('amount_paid', instance.amount_paid)
+        increment = serializer.validated_data.get('increment', instance.increment)
+        amount_due = instance.client.payment_to_us + increment
         serializer.save(
-            outstanding_balance=max(0, instance.amount_due - amount_paid)
+            status=self._payment_status(amount_paid, amount_due),
+            outstanding_balance=max(0, amount_due - amount_paid)
         )

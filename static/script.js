@@ -26,6 +26,7 @@ const AppState = {
   companies: [],
   deductions: [],
   payments: [],
+  clientPayments: [],
   notifications: [],
   attendance: [],
   downloadLogs: [],
@@ -2550,11 +2551,94 @@ function renderCompanies(list) {
             <td class="${profit >= 0 ? "text-success" : "text-danger"}">${formatCurrency(profit)}</td>
             <td>
                 <button type="button" class="btn btn-sm btn-primary" onclick="editCompany('${company.id}')">Edit</button>
+                <button type="button" class="btn btn-sm btn-info" onclick="showCompanyPaymentVerifyModal('${company.id}')">Verify Payment</button>
                 <button type="button" class="btn btn-sm btn-danger" onclick="deleteCompany('${company.id}')">Delete</button>
             </td>
         `;
     tbody.appendChild(row);
   });
+}
+
+function showCompanyPaymentVerifyModal(companyId) {
+  const company = AppState.companies.find((c) => String(c.id) === String(companyId));
+  if (!company) {
+    showToast("Company not found", "error");
+    return;
+  }
+
+  const currentMonth = new Date().toISOString().slice(0, 7);
+  const existingPayment = (AppState.clientPayments || []).find(
+    (p) => String(p.client) === String(companyId) && p.month_key === currentMonth,
+  );
+  const expectedAmount = Number(company.payment_to_us || 0);
+  const amountPaid = Number(existingPayment?.amount_paid || 0);
+
+  document.getElementById("verifyCompanyId").value = company.id;
+  document.getElementById("verifyCompanyName").value = company.name || "";
+  document.getElementById("verifyCompanyMonth").value = existingPayment?.month_key || currentMonth;
+  document.getElementById("verifyCompanyExpected").value = expectedAmount.toFixed(2);
+  document.getElementById("verifyCompanyAmountPaid").value = amountPaid.toFixed(2);
+  document.getElementById("verifyCompanyStatus").value =
+    existingPayment?.status || (amountPaid >= expectedAmount && expectedAmount > 0 ? "paid" : amountPaid > 0 ? "partial" : "unpaid");
+  document.getElementById("verifyCompanyNotes").value = existingPayment?.notes || "";
+
+  openModal("companyPaymentVerifyModal");
+}
+
+function syncCompanyPaymentStatusFromAmount() {
+  const expected = Number(document.getElementById("verifyCompanyExpected")?.value || 0);
+  const paid = Number(document.getElementById("verifyCompanyAmountPaid")?.value || 0);
+  const statusEl = document.getElementById("verifyCompanyStatus");
+  if (!statusEl) return;
+  if (paid <= 0) statusEl.value = "unpaid";
+  else if (paid >= expected) statusEl.value = "paid";
+  else statusEl.value = "partial";
+}
+
+async function saveCompanyPaymentVerification(e) {
+  e.preventDefault();
+  const btn = document.getElementById("saveCompanyPaymentVerifyBtn");
+  const client = document.getElementById("verifyCompanyId")?.value;
+  const month = document.getElementById("verifyCompanyMonth")?.value;
+  const expected = Number(document.getElementById("verifyCompanyExpected")?.value || 0);
+  const amountPaid = Number(document.getElementById("verifyCompanyAmountPaid")?.value || 0);
+  let statusValue = document.getElementById("verifyCompanyStatus")?.value || "unpaid";
+  const notes = document.getElementById("verifyCompanyNotes")?.value || "";
+
+  if (!client || !month) {
+    showToast("Company and month are required", "warning");
+    return;
+  }
+  if (!Number.isFinite(amountPaid) || amountPaid < 0) {
+    showToast("Enter a valid payment amount", "warning");
+    return;
+  }
+  if (amountPaid <= 0) statusValue = "unpaid";
+  else if (amountPaid >= expected) statusValue = "paid";
+  else statusValue = "partial";
+
+  try {
+    showLoading(btn);
+    const res = await apiRequest("/api/client-payments/", {
+      method: "POST",
+      body: {
+        client,
+        month_key: month,
+        status: statusValue,
+        amount_paid: Math.round(amountPaid * 100) / 100,
+        payment_date: new Date().toISOString().split("T")[0],
+        notes,
+      },
+    });
+    if (!res.success) throw new Error(res.message || "Failed to verify company payment");
+    showToast("Company payment verification saved", "success");
+    closeModal("companyPaymentVerifyModal");
+    await loadClientPayments();
+  } catch (err) {
+    showToast(err.message || "Failed to verify company payment", "error");
+  } finally {
+    hideLoading(btn);
+  }
 }
 
 async function handleCreateCompany(e) {
@@ -2750,10 +2834,16 @@ function renderDeductions(list) {
 
   list.forEach((ded) => {
     const row = document.createElement("tr");
+    const displayStatus = ded.display_status || (ded.status === "applied" ? "settled" : ded.status || "pending");
+    const statusLabel = displayStatus === "settled"
+      ? "Settled"
+      : displayStatus === "pending"
+        ? "Pending"
+        : displayStatus.charAt(0).toUpperCase() + displayStatus.slice(1);
     const statusClass =
-      ded.status === "applied"
+      displayStatus === "settled"
         ? "text-success"
-        : ded.status === "cancelled"
+        : displayStatus === "cancelled" || displayStatus === "terminated"
           ? "text-danger"
           : "text-warning";
 
@@ -2763,7 +2853,7 @@ function renderDeductions(list) {
             <td>${escapeHtml(ded.employee_name || "-")}</td>
             <td>${formatCurrency(ded.amount)}</td>
             <td>${escapeHtml(ded.reason || "-")}</td>
-            <td><span class="${statusClass}">${escapeHtml(ded.status || "Pending")}</span></td>
+            <td><span class="${statusClass}">${escapeHtml(statusLabel)}</span></td>
             <td>
                 <button type="button" onclick="editDeduction('${ded.id}')" class="btn btn-sm btn-warning">Edit</button>
                 <button type="button" onclick="deleteDeduction('${ded.id}')" class="btn btn-sm btn-danger">Delete</button>
@@ -3599,7 +3689,6 @@ async function initiateIndividualPayment(empId) {
         startPaymentStatusPolling(reference);
         
     } catch (err) {
-        console.error("Payment Initiation Detailed Error:", err, err.raw || {});
         let errorMsg = err.message || "Failed to initiate payment";
         
         if (errorMsg.includes("bank_code is missing")) {
@@ -4385,10 +4474,11 @@ async function updateDashboardStats() {
 
   const pendingAlert = document.getElementById("pendingApprovalsAlert");
   if (pendingAlert) {
-    if (stats.total_self_registered > 0) {
+    const pendingApprovals = stats.pending_approvals || 0;
+    if (pendingApprovals > 0) {
       pendingAlert.classList.remove("hidden");
       document.getElementById("pendingCount").textContent =
-        stats.total_self_registered;
+        pendingApprovals;
     } else {
       pendingAlert.classList.add("hidden");
     }
@@ -4871,6 +4961,7 @@ async function loadClientPayments() {
         if (!res.success) throw new Error(res.message);
         
         const list = res.data?.results || res.data || [];
+        AppState.clientPayments = list;
         tbody.innerHTML = "";
 
         list.forEach(cp => {
@@ -4893,6 +4984,7 @@ async function loadClientPayments() {
             tbody.appendChild(row);
         });
     } catch (err) {
+        AppState.clientPayments = [];
         showToast("Failed to load company payments", "error");
     }
 }
@@ -5842,6 +5934,12 @@ function setupEventListeners() {
   document
     .getElementById("otpForm")
     ?.addEventListener("submit", (e) => verifyOTP(e, false)); // Fixed: Add event listener for internal OTP form
+  document
+    .getElementById("companyPaymentVerifyForm")
+    ?.addEventListener("submit", saveCompanyPaymentVerification);
+  document
+    .getElementById("verifyCompanyAmountPaid")
+    ?.addEventListener("input", syncCompanyPaymentStatusFromAmount);
   // Hamburger menu
   const hamburger = document.getElementById("hamburgerBtn");
   const sidebar = document.getElementById("sidebar");

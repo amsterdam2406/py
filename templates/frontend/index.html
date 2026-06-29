@@ -1232,6 +1232,48 @@
             </div>
         </div>
 
+        <!-- Company Payment Verification Modal -->
+        <div id="companyPaymentVerifyModal" class="modal" style="display: none;">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h3>Verify Company Payment</h3>
+                    <span class="close" onclick="closeModal('companyPaymentVerifyModal')">&times;</span>
+                </div>
+                <form id="companyPaymentVerifyForm">
+                    <input type="hidden" id="verifyCompanyId">
+                    <div class="form-group">
+                        <label for="verifyCompanyName">Company</label>
+                        <input type="text" id="verifyCompanyName" class="form-control" readonly>
+                    </div>
+                    <div class="form-group">
+                        <label for="verifyCompanyMonth">Payroll Month</label>
+                        <input type="month" id="verifyCompanyMonth" class="form-control" required>
+                    </div>
+                    <div class="form-group">
+                        <label for="verifyCompanyExpected">Expected Amount (₦)</label>
+                        <input type="number" id="verifyCompanyExpected" class="form-control" readonly>
+                    </div>
+                    <div class="form-group">
+                        <label for="verifyCompanyAmountPaid">Amount Paid (₦)</label>
+                        <input type="number" id="verifyCompanyAmountPaid" class="form-control" min="0" step="0.01" required>
+                    </div>
+                    <div class="form-group">
+                        <label for="verifyCompanyStatus">Payment Status</label>
+                        <select id="verifyCompanyStatus" class="form-control" required>
+                            <option value="unpaid">Pending / Unpaid</option>
+                            <option value="partial">Partial</option>
+                            <option value="paid">Paid</option>
+                        </select>
+                    </div>
+                    <div class="form-group">
+                        <label for="verifyCompanyNotes">Notes</label>
+                        <textarea id="verifyCompanyNotes" class="form-control" rows="3"></textarea>
+                    </div>
+                    <button type="submit" id="saveCompanyPaymentVerifyBtn" class="btn btn-primary btn-block">Save Verification</button>
+                </form>
+            </div>
+        </div>
+
         <!-- Add Adjustment Modal -->
         <div id="addAdjustmentModal" class="modal" style="display: none;">
             <div class="modal-content">

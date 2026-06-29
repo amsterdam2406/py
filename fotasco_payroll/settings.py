@@ -12,10 +12,11 @@ import dj_database_url
 import socket
 
 # Force IPv4 for Supabase (Render has IPv6 issues)
-# _original_getaddrinfo = socket.getaddrinfo
-# def _getaddrinfo_ipv4(host, port, family=0, socktype=0, proto=0, flags=0):
-#     return _original_getaddrinfo(host, port, socket.AF_INET, socktype, proto, flags)
-# socket.getaddrinfo = _getaddrinfo_ipv4
+_original_getaddrinfo = socket.getaddrinfo
+def _getaddrinfo_ipv4(host, port, family=0, socktype=0, proto=0, flags=0):
+    return _original_getaddrinfo(host, port, socket.AF_INET, socktype, proto, flags)
+socket.getaddrinfo = _getaddrinfo_ipv4
+
 
 import psycopg2
 
@@ -173,16 +174,21 @@ if DATABASE_URL:
     DATABASES = {
         'default': dj_database_url.config(
             default=DATABASE_URL,
-            conn_max_age=600,
-            conn_health_checks=False, # Important for pooler 6543
+            conn_max_age=300,
+            conn_health_checks=False,
             ssl_require=True,
-            )
-        }
+        )
+    }
+
+    DATABASES['default']['OPTIONS'] = {
+        'connect_timeout': 10,
+    }
+
 else:
     DATABASES = {
-    'default': {
-        'ENGINE': 'django.db.backends.sqlite3',
-        'NAME': BASE_DIR / 'db.sqlite3',
+        'default': {
+            'ENGINE': 'django.db.backends.sqlite3',
+            'NAME': BASE_DIR / 'db.sqlite3',
         }
     }
 
@@ -336,13 +342,16 @@ EMAIL_BACKEND = 'django.core.mail.backends.smtp.EmailBackend'
 EMAIL_HOST = config('EMAIL_HOST', default='smtp.gmail.com')
 EMAIL_PORT = config('EMAIL_PORT', default=587, cast=int)
 EMAIL_USE_TLS = config('EMAIL_USE_TLS', default=True, cast=bool)
-EMAIL_TIMEOUT = config('EMAIL_TIMEOUT', default=5, cast=int)
-INTERNAL_PAYMENT_OTP_EXPIRY_SECONDS = config('INTERNAL_PAYMENT_OTP_EXPIRY_SECONDS', default=30, cast=int)
-INTERNAL_PAYMENT_OTP_EMAIL_TIMEOUT = config('INTERNAL_PAYMENT_OTP_EMAIL_TIMEOUT', default=5, cast=int)
+EMAIL_TIMEOUT = config('EMAIL_TIMEOUT', default=60, cast=int)
+INTERNAL_PAYMENT_OTP_EXPIRY_SECONDS = config('INTERNAL_PAYMENT_OTP_EXPIRY_SECONDS', default=60, cast=int)
+INTERNAL_PAYMENT_OTP_EMAIL_TIMEOUT = config('INTERNAL_PAYMENT_OTP_EMAIL_TIMEOUT', default=60, cast=int)
 PAYSTACK_TRANSFER_OTP_ENABLED = config('PAYSTACK_TRANSFER_OTP_ENABLED', default=False, cast=bool)
 EMAIL_HOST_USER = config('EMAIL_HOST_USER')
 EMAIL_HOST_PASSWORD = config('EMAIL_HOST_PASSWORD')
-DEFAULT_FROM_EMAIL = config('DEFAULT_FROM_EMAIL', default='NoReply - Payroll System <noreply@fotasco.com>')
+DEFAULT_FROM_EMAIL = f"Payroll System <{EMAIL_HOST_USER}>"
+EMAIL_USE_SSL = False
+# DEFAULT_FROM_EMAIL = config('DEFAULT_FROM_EMAIL')
+
 
 # ============================================
 # INTERNATIONALIZATION
@@ -361,6 +370,12 @@ DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 
 if not DEBUG:
     SECURE_SSL_REDIRECT = True
+
+    # HTTP Strict Transport Security (HSTS)
+    SECURE_HSTS_SECONDS = 31536000          # 1 year
+    SECURE_HSTS_INCLUDE_SUBDOMAINS = True
+    SECURE_HSTS_PRELOAD = True
+
     SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
     SECURE_CONTENT_TYPE_NOSNIFF = True
     X_FRAME_OPTIONS = 'DENY'
@@ -369,7 +384,6 @@ if not DEBUG:
     SESSION_COOKIE_HTTPONLY = True
     SESSION_COOKIE_SECURE = True
     CSRF_COOKIE_SECURE = True
-    SECURE_BROWSER_XSS_FILTER = True
     SESSION_COOKIE_SAMESITE = 'Lax'
     CSRF_COOKIE_SAMESITE = 'Lax'
     SECURE_CROSS_ORIGIN_OPENER_POLICY = "same-origin"
