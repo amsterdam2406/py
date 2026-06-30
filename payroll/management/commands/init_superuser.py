@@ -49,3 +49,5 @@ class Command(BaseCommand):
             self.stdout.write(self.style.WARNING(f'Superuser "{username}" updated successfully'))
 #         else:
 #             self.stdout.write(self.style.NOTICE(f'Superuser "{username}" already exists'))
+
+

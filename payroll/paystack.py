@@ -491,6 +491,7 @@ class PaystackAPI:
             bank_code,
         )
         
+        response = None
         try:
             response = requests.post(url, json=payload, headers=self.headers, timeout=self.request_timeout)
             response.raise_for_status()
@@ -505,6 +506,9 @@ class PaystackAPI:
         except Exception as e:
             logger.error(f"Paystack create recipient error: {e}")
             return {"status": False, "message": str(e)}
+        finally:
+            if response is not None:
+                response.close()
     
     def get_banks(self):
         """Get list of Nigerian banks"""
@@ -513,6 +517,7 @@ class PaystackAPI:
         cached = cache.get(cache_key)
         if cached:
             return cached
+        response = None
         try:
             response = requests.get(url, headers=self.headers, timeout=self.request_timeout)
             response.raise_for_status()
@@ -547,6 +552,9 @@ class PaystackAPI:
         except Exception as e:
             logger.error(f"Paystack balance unexpected error: {e}")
             return {'status': False, 'message': str(e), 'data': []}
+        finally:
+            if response is not None:
+                response.close()
 
     def initiate_transfer(self, amount, recipient_code, reference, reason='Salary payment'):
         """Initiate a single Paystack transfer."""
@@ -565,6 +573,7 @@ class PaystackAPI:
         
         logger.info(f"[Paystack {self.env_label}] Initiating transfer to {recipient_code}. Amount: {amount/100} NGN. Ref: {reference}")
 
+        response = None
         try:
             response = requests.post(url, json=payload, headers=self.headers, timeout=self.transfer_timeout)
             logger.debug(f"[Paystack {self.env_label}] Raw Response: {response.text}")
@@ -577,6 +586,9 @@ class PaystackAPI:
         except Exception as e:
             logger.error(f"Paystack initiate transfer unexpected error: {e}")
             return {'status': False, 'message': str(e), 'data': None}
+        finally:
+            if response is not None:
+                response.close()
 
     def bulk_transfer(self, transfers):
         """Initiate multiple Paystack transfers."""
@@ -586,6 +598,7 @@ class PaystackAPI:
 
         url = f"{self.BASE_URL}/transfer/bulk"
         payload = {"currency": "NGN", "source": "balance", "transfers": transfers}
+        response = None
         try:
             response = requests.post(url, json=payload, headers=self.headers, timeout=self.bulk_transfer_timeout)
             response.raise_for_status()
@@ -597,10 +610,14 @@ class PaystackAPI:
         except Exception as e:
             logger.error(f"Paystack bulk transfer unexpected error: {e}")
             return {'status': False, 'message': str(e), 'data': None}
+        finally:
+            if response is not None:
+                response.close()
 
     def verify_transfer(self, reference):
         """Verify a Paystack transfer by reference."""
         url = f"{self.BASE_URL}/transfer/verify/{reference}"
+        response = None
         try:
             response = requests.get(url, headers=self.headers, timeout=self.request_timeout)
             response.raise_for_status()
@@ -612,6 +629,9 @@ class PaystackAPI:
         except Exception as e:
             logger.error(f"Paystack verify transfer unexpected error: {e}")
             return {'status': False, 'message': str(e), 'data': {'status': 'failed'}}
+        finally:
+            if response is not None:
+                response.close()
         
     def finalize_transfer(self, transfer_code, otp):
         """
@@ -631,6 +651,7 @@ class PaystackAPI:
             "transfer_code": transfer_code,
             "otp": otp
         }
+        response = None
         try:
             response = requests.post(url, headers=headers, json=payload, timeout=self.transfer_timeout)
             response.raise_for_status() # Raise HTTPError for bad responses (4xx or 5xx)
@@ -646,6 +667,9 @@ class PaystackAPI:
                 except ValueError: # Not a JSON response
                     pass
             return {"status": False, "message": error_message, "error_code": "PAYSTACK_API_ERROR"}
+        finally:
+            if response is not None:
+                response.close()
 
         
 # Nigerian Bank Codes for Paystack

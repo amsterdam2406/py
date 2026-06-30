@@ -50,3 +50,6 @@ Django
 python-decouple
 requests
 resend
+redis==6.2.0
+django-redis==6.0.0
+celery==5.5.3

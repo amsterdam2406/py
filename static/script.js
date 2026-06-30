@@ -33,6 +33,7 @@ const AppState = {
   currentUser: null,
   accessToken: null,
   refreshToken: null,
+  refreshAccessTokenPromise: null,
   currentPaymentReference: null,
   currentEditingDeductionId: null,
   currentEditingCompanyId: null,
@@ -1080,57 +1081,71 @@ async function apiRequest(url, options = {}) {
  * Improved to handle session expiry and state cleanup.
  */
 async function refreshAccessToken() {
+  if (AppState.refreshAccessTokenPromise) {
+    return AppState.refreshAccessTokenPromise;
+  }
+
+  const refreshPromise = (async () => {
+    try {
+      // IMPORTANT: refresh_token cookie is HttpOnly, so JS cannot read it.
+      // Rely only on localStorage (and in-memory AppState) for SPA bootstrapping.
+      const refreshToken =
+        AppState.refreshToken || localStorage.getItem("refreshToken");
+
+      if (!refreshToken) return false;
+
+      // Prefer HttpOnly cookie refresh (DRF reads refresh_token cookie server-side).
+      // Send refresh token in body only if we explicitly have it.
+      const refreshBody = refreshToken ? { refresh: refreshToken } : null;
+
+      const fetchOptions = {
+        method: "POST",
+        headers: {},
+      };
+
+      if (refreshBody) {
+        fetchOptions.headers["Content-Type"] = "application/json";
+        fetchOptions.body = JSON.stringify(refreshBody);
+      }
+
+      const response = await fetch("/token/refresh/", {
+        ...fetchOptions,
+        credentials: "same-origin",
+      });
+
+      if (response.status === 401 || response.status === 403) {
+        throw new Error("AUTH_EXPIRED");
+      }
+
+      if (!response.ok) throw new Error("Refresh request failed");
+
+      const data = await response.json();
+      AppState.accessToken = data.access;
+      localStorage.setItem("accessToken", data.access);
+
+      if (data.refresh) {
+        AppState.refreshToken = data.refresh;
+        localStorage.setItem("refreshToken", data.refresh);
+      }
+
+      return true;
+    } catch (err) {
+      if (err.message === "AUTH_EXPIRED") {
+        console.warn("Session expired.");
+      } else {
+        console.error("Token refresh network error:", err);
+      }
+      return false;
+    }
+  })();
+
+  AppState.refreshAccessTokenPromise = refreshPromise;
   try {
-    // IMPORTANT: refresh_token cookie is HttpOnly, so JS cannot read it.
-    // Rely only on localStorage (and in-memory AppState) for SPA bootstrapping.
-    const refreshToken =
-      AppState.refreshToken || localStorage.getItem("refreshToken");
-
-    if (!refreshToken) return false;
-
-    // Prefer HttpOnly cookie refresh (DRF reads refresh_token cookie server-side).
-    // Send refresh token in body only if we explicitly have it.
-    const refreshBody = refreshToken ? { refresh: refreshToken } : null;
-
-    const fetchOptions = {
-      method: "POST",
-      headers: {},
-    };
-
-    if (refreshBody) {
-      fetchOptions.headers["Content-Type"] = "application/json";
-      fetchOptions.body = JSON.stringify(refreshBody);
+    return await refreshPromise;
+  } finally {
+    if (AppState.refreshAccessTokenPromise === refreshPromise) {
+      AppState.refreshAccessTokenPromise = null;
     }
-
-    const response = await fetch("/token/refresh/", {
-      ...fetchOptions,
-      credentials: "same-origin",
-    });
-
-    if (response.status === 401 || response.status === 403) {
-      throw new Error("AUTH_EXPIRED");
-    }
-
-    if (!response.ok) throw new Error("Refresh request failed");
-
-    const data = await response.json();
-    AppState.accessToken = data.access;
-    localStorage.setItem("accessToken", data.access);
-
-    if (data.refresh) {
-      AppState.refreshToken = data.refresh;
-      localStorage.setItem("refreshToken", data.refresh);
-    }
-
-    return true;
-  } catch (err) {
-    if (err.message === "AUTH_EXPIRED") {
-      console.warn("Session expired. Cleaning up...");
-      logout();
-    } else {
-      console.error("Token refresh network error:", err);
-    }
-    return false;
   }
 }
 
@@ -1760,6 +1775,7 @@ async function logout(silent = false) {
   } finally {
     AppState.accessToken = null;
     AppState.refreshToken = null;
+    AppState.refreshAccessTokenPromise = null;
     AppState.currentUser = null;
     if (AppState.autoRefreshTimer) {
       clearInterval(AppState.autoRefreshTimer);

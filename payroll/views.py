@@ -342,6 +342,20 @@ def _friendly_payment_error(result, default='Payment could not be completed. Ple
     if 'network' in message or 'connection' in message:
         return 'Payment service is temporarily unavailable. Please try again.'
     return default
+
+
+class InternalPaymentOtpVerifySerializer(serializers.Serializer):
+    reference = serializers.CharField(max_length=128, trim_whitespace=True)
+    otp = serializers.CharField(max_length=12, trim_whitespace=True)
+
+
+class PaystackOtpFinalizeSerializer(serializers.Serializer):
+    reference = serializers.CharField(max_length=128, trim_whitespace=True)
+    paystack_otp = serializers.CharField(max_length=12, trim_whitespace=True)
+
+
+class PaymentOtpResendSerializer(serializers.Serializer):
+    reference = serializers.CharField(max_length=128, trim_whitespace=True)
     
 @api_view(['GET'])
 @permission_classes([AllowAny])
@@ -2264,68 +2278,25 @@ class PaymentViewSet(viewsets.ModelViewSet):
                         payment_method='bank_transfer',
                     )
 
-                if initial_status == 'pending':
-                    if self._paystack_otp_enabled():
-                        success, result = self._execute_paystack_transfer(payment, employee, bank_code)
-                        if not success and isinstance(result, dict) and result.get('type') in {'paystack_rate_limited', 'paystack_rate_limit', 'paystack_rate'}:
-                            return Response(
-                                {
-                                    'error': _friendly_payment_error(result),
-                                    'detail': 'Please retry later',
-                                    'retry_after': result.get('retry_after'),
-                                    'error_code': 'rate_limited',
-                                },
-                                status=status.HTTP_429_TOO_MANY_REQUESTS,
-                            )
-                        if not success:
-                            return Response({'error': _friendly_payment_error(result), 'status': payment.status}, status=status.HTTP_400_BAD_REQUEST)
-
-                        log_audit(
-                            request.user,
-                            f"Individual payment initiated for {employee.employee_id}",
-                            request,
-                            extra={
-                                'payment_id': str(payment.id),
-                                'employee_id': str(employee.id),
-                                'reference': payment.transaction_reference,
-                                'amount': str(amount_paid),
-                                'status': payment.status,
-                            }
-                        )
+            if initial_status == 'pending':
+                if self._paystack_otp_enabled():
+                    success, result = self._execute_paystack_transfer(payment, employee, bank_code)
+                    if not success and isinstance(result, dict) and result.get('type') in {'paystack_rate_limited', 'paystack_rate_limit', 'paystack_rate'}:
                         return Response(
                             {
-                                'message': result['message'],
-                                'reference': payment.transaction_reference,
-                                'amount': float(amount_paid),
-                                'status': result['status'],
-                                'internal_otp_required': False,
-                                'paystack_otp_required': result.get('paystack_otp_required', False),
-                                'paystack_transfer_code': payment.paystack_transfer_code,
-                                'payment_completed': payment.status == 'completed',
-                                'payment_processing': payment.status == 'processing',
-                                'employee_name': employee.name,
-                                'outstanding': float(payment.remaining_balance or 0),
+                                'error': _friendly_payment_error(result),
+                                'detail': 'Please retry later',
+                                'retry_after': result.get('retry_after'),
+                                'error_code': 'rate_limited',
                             },
-                            status=status.HTTP_200_OK,
+                            status=status.HTTP_429_TOO_MANY_REQUESTS,
                         )
+                    if not success:
+                        return Response({'error': _friendly_payment_error(result), 'status': payment.status}, status=status.HTTP_400_BAD_REQUEST)
 
-                    try:
-                        otp_reference = self._stage_internal_payment_otp(
-                            request.user,
-                            [payment],
-                            reference=payment.transaction_reference,
-                        )
-                    except ValueError as exc:
-                        Payment.objects.filter(id=payment.id, status='pending').delete()
-                        logger.warning(
-                            "Deleted staged payment after internal OTP email failure payment_id=%s reference=%s",
-                            payment.id,
-                            payment.transaction_reference,
-                        )
-                        return Response({'error': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
                     log_audit(
                         request.user,
-                        f"Individual payment staged for internal OTP for {employee.employee_id}",
+                        f"Individual payment initiated for {employee.employee_id}",
                         request,
                         extra={
                             'payment_id': str(payment.id),
@@ -2337,30 +2308,38 @@ class PaymentViewSet(viewsets.ModelViewSet):
                     )
                     return Response(
                         {
-                            'message': 'Internal OTP sent to your email. Verify it to authorize this payment.',
-                            'reference': otp_reference,
+                            'message': result['message'],
+                            'reference': payment.transaction_reference,
                             'amount': float(amount_paid),
-                            'status': payment.status,
-                            'internal_otp_required': True,
-                            'paystack_otp_required': False,
+                            'status': result['status'],
+                            'internal_otp_required': False,
+                            'paystack_otp_required': result.get('paystack_otp_required', False),
+                            'paystack_transfer_code': payment.paystack_transfer_code,
+                            'payment_completed': payment.status == 'completed',
+                            'payment_processing': payment.status == 'processing',
                             'employee_name': employee.name,
-                            'outstanding': float(remaining_balance),
+                            'outstanding': float(payment.remaining_balance or 0),
                         },
                         status=status.HTTP_200_OK,
                     )
 
-
-                hr_users = User.objects.filter(Q(is_superuser=True) | Q(is_hr_admin=True) | Q(role='admin'))
-                for hr in hr_users:
-                    Notification.objects.create(
-                        user=hr,
-                        message=f"Payment for {employee.name} requires HR approval. Amount: ₦{amount_paid:,.2f}",
-                        type='warning'
+                try:
+                    otp_reference = self._stage_internal_payment_otp(
+                        request.user,
+                        [payment],
+                        reference=payment.transaction_reference,
                     )
-
+                except ValueError as exc:
+                    Payment.objects.filter(id=payment.id, status='pending').delete()
+                    logger.warning(
+                        "Deleted staged payment after internal OTP email failure payment_id=%s reference=%s",
+                        payment.id,
+                        payment.transaction_reference,
+                    )
+                    return Response({'error': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
                 log_audit(
                     request.user,
-                    f"Individual payment submitted for HR approval for {employee.employee_id}",
+                    f"Individual payment staged for internal OTP for {employee.employee_id}",
                     request,
                     extra={
                         'payment_id': str(payment.id),
@@ -2372,16 +2351,51 @@ class PaymentViewSet(viewsets.ModelViewSet):
                 )
                 return Response(
                     {
-                        'message': 'Payment initiated and awaiting HR approval.',
-                        'reference': payment.transaction_reference,
+                        'message': 'Internal OTP sent to your email. Verify it to authorize this payment.',
+                        'reference': otp_reference,
                         'amount': float(amount_paid),
-                        'employee': employee.name,
-                        'outstanding': float(total_payable - amount_paid),
-                        'bank': employee.bank_name,
-                        'account': employee.account_number,
+                        'status': payment.status,
+                        'internal_otp_required': True,
+                        'paystack_otp_required': False,
+                        'employee_name': employee.name,
+                        'outstanding': float(remaining_balance),
                     },
-                    status=status.HTTP_200_OK
+                    status=status.HTTP_200_OK,
                 )
+
+
+            hr_users = User.objects.filter(Q(is_superuser=True) | Q(is_hr_admin=True) | Q(role='admin'))
+            for hr in hr_users:
+                Notification.objects.create(
+                    user=hr,
+                    message=f"Payment for {employee.name} requires HR approval. Amount: ₦{amount_paid:,.2f}",
+                    type='warning'
+                )
+
+            log_audit(
+                request.user,
+                f"Individual payment submitted for HR approval for {employee.employee_id}",
+                request,
+                extra={
+                    'payment_id': str(payment.id),
+                    'employee_id': str(employee.id),
+                    'reference': payment.transaction_reference,
+                    'amount': str(amount_paid),
+                    'status': payment.status,
+                }
+            )
+            return Response(
+                {
+                    'message': 'Payment initiated and awaiting HR approval.',
+                    'reference': payment.transaction_reference,
+                    'amount': float(amount_paid),
+                    'employee': employee.name,
+                    'outstanding': float(total_payable - amount_paid),
+                    'bank': employee.bank_name,
+                    'account': employee.account_number,
+                },
+                status=status.HTTP_200_OK
+            )
 
         except Exception as e:
             logger.exception("initiate_payment failed")
@@ -2664,11 +2678,11 @@ class PaymentViewSet(viewsets.ModelViewSet):
         Verify the internal OTP sent to the authorized payroll user, then call Paystack.
         If Paystack transfer OTP is enabled, Paystack can still return an OTP-required status.
         """
-        reference = request.data.get('reference')
-        otp_code = request.data.get('otp')
-
-        if not reference or not otp_code:
+        serializer = InternalPaymentOtpVerifySerializer(data=request.data)
+        if not serializer.is_valid():
             return Response({'error': 'Reference and internal OTP are required'}, status=status.HTTP_400_BAD_REQUEST)
+        reference = serializer.validated_data['reference']
+        otp_code = serializer.validated_data['otp']
 
         otp_valid, otp_error = self._verify_internal_payment_otp(request.user, reference, otp_code)
         if not otp_valid:
@@ -2739,11 +2753,11 @@ class PaymentViewSet(viewsets.ModelViewSet):
         Finalize a Paystack transfer that is pending an OTP from Paystack.
         This is called after the admin enters the OTP received from Paystack.
         """
-        reference = request.data.get('reference')
-        paystack_otp = request.data.get('paystack_otp')
-
-        if not reference or not paystack_otp:
+        serializer = PaystackOtpFinalizeSerializer(data=request.data)
+        if not serializer.is_valid():
             return Response({'error': 'Reference and Paystack OTP are required'}, status=status.HTTP_400_BAD_REQUEST)
+        reference = serializer.validated_data['reference']
+        paystack_otp = serializer.validated_data['paystack_otp']
 
         try:
             payment = Payment.objects.get(transaction_reference=reference, status='pending_paystack_otp')
@@ -2837,9 +2851,10 @@ class PaymentViewSet(viewsets.ModelViewSet):
 
     @action(detail=False, methods=['post'], permission_classes=[IsAuthenticated])
     def resend_otp(self, request):
-        reference = request.data.get('reference')
-        if not reference:
+        serializer = PaymentOtpResendSerializer(data=request.data)
+        if not serializer.is_valid():
             return Response({'error': 'Reference required'}, status=status.HTTP_400_BAD_REQUEST)
+        reference = serializer.validated_data['reference']
 
         try:
             payment_ids = self._payment_ids_for_internal_otp_reference(reference)
