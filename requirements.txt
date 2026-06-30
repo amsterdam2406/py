@@ -46,3 +46,7 @@ psycopg2-binary==2.9.9
 django-simple-history==3.11.0
 cloudinary
 django-cloudinary-storage
+Django
+python-decouple
+requests
+resend

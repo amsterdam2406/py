@@ -54,6 +54,8 @@ class PaystackAccountResolutionService:
 
     def __init__(self):
         self.secret_key = getattr(settings, 'PAYSTACK_SECRET_KEY', '')
+        self.request_timeout = max(1, int(getattr(settings, 'PAYSTACK_ACCOUNT_RESOLVE_TIMEOUT_SECONDS', self.REQUEST_TIMEOUT_SECONDS)))
+        self.max_network_attempts = max(1, int(getattr(settings, 'PAYSTACK_ACCOUNT_RESOLVE_ATTEMPTS', self.MAX_NETWORK_ATTEMPTS)))
         self.headers = {
             'Authorization': f'Bearer {self.secret_key}',
             'Content-Type': 'application/json',
@@ -233,13 +235,13 @@ class PaystackAccountResolutionService:
         params = {'account_number': account_number, 'bank_code': bank_code}
         last_error = None
 
-        for attempt in range(1, self.MAX_NETWORK_ATTEMPTS + 1):
+        for attempt in range(1, self.max_network_attempts + 1):
             try:
                 response = self._session.get(
                     url,
                     headers=self.headers,
                     params=params,
-                    timeout=self.REQUEST_TIMEOUT_SECONDS,
+                    timeout=self.request_timeout,
                 )
                 response_payload = self._response_json(response)
                 logger.info(
@@ -309,8 +311,8 @@ class PaystackAccountResolutionService:
                     masked_account,
                     exc,
                 )
-                if attempt < self.MAX_NETWORK_ATTEMPTS:
-                    time.sleep(self.NETWORK_RETRY_BACKOFF_SECONDS[attempt - 1])
+                if attempt < self.max_network_attempts:
+                    time.sleep(min(2, 0.25 * (2 ** (attempt - 1))))
                     continue
                 break
             except requests.exceptions.RequestException as exc:
@@ -391,6 +393,9 @@ class PaystackAPI:
             'Authorization': f'Bearer {self.secret_key}',
             'Content-Type': 'application/json'
         }
+        self.request_timeout = max(1, int(getattr(settings, 'PAYSTACK_REQUEST_TIMEOUT_SECONDS', 8)))
+        self.transfer_timeout = max(1, int(getattr(settings, 'PAYSTACK_TRANSFER_TIMEOUT_SECONDS', 10)))
+        self.bulk_transfer_timeout = max(1, int(getattr(settings, 'PAYSTACK_BULK_TRANSFER_TIMEOUT_SECONDS', 12)))
 
     def _require_live_mode(self, operation):
         if _is_live_secret_key(self.secret_key):
@@ -433,7 +438,7 @@ class PaystackAPI:
             payload['metadata'] = metadata
         
         try:
-            response = requests.post(url, json=payload, headers=self.headers, timeout=30)
+            response = requests.post(url, json=payload, headers=self.headers, timeout=self.request_timeout)
             response.raise_for_status()
             return response.json()
         except requests.exceptions.RequestException as e:
@@ -447,7 +452,7 @@ class PaystackAPI:
         """Verify a payment transaction - NEVER returns None"""
         url = f"{self.BASE_URL}/transaction/verify/{reference}"
         try:
-            response = requests.get(url, headers=self.headers, timeout=30)
+            response = requests.get(url, headers=self.headers, timeout=self.request_timeout)
             response.raise_for_status()
             result = response.json()
             if not isinstance(result, dict):
@@ -487,7 +492,7 @@ class PaystackAPI:
         )
         
         try:
-            response = requests.post(url, json=payload, headers=self.headers, timeout=20)
+            response = requests.post(url, json=payload, headers=self.headers, timeout=self.request_timeout)
             response.raise_for_status()
             data = response.json()
             if data.get("status"):
@@ -509,7 +514,7 @@ class PaystackAPI:
         if cached:
             return cached
         try:
-            response = requests.get(url, headers=self.headers, timeout=10)
+            response = requests.get(url, headers=self.headers, timeout=self.request_timeout)
             response.raise_for_status()
             result = response.json()
             cache.set(cache_key, result, 60 * 60 * 12)
@@ -531,7 +536,7 @@ class PaystackAPI:
         if cached:
             return cached
         try:
-            response = requests.get(url, headers=self.headers, timeout=20)
+            response = requests.get(url, headers=self.headers, timeout=self.request_timeout)
             response.raise_for_status()
             result = response.json()
             cache.set(cache_key, result, 60)  # Cache for 60 seconds
@@ -561,7 +566,7 @@ class PaystackAPI:
         logger.info(f"[Paystack {self.env_label}] Initiating transfer to {recipient_code}. Amount: {amount/100} NGN. Ref: {reference}")
 
         try:
-            response = requests.post(url, json=payload, headers=self.headers, timeout=30)
+            response = requests.post(url, json=payload, headers=self.headers, timeout=self.transfer_timeout)
             logger.debug(f"[Paystack {self.env_label}] Raw Response: {response.text}")
             response.raise_for_status()
             return response.json()
@@ -582,7 +587,7 @@ class PaystackAPI:
         url = f"{self.BASE_URL}/transfer/bulk"
         payload = {"currency": "NGN", "source": "balance", "transfers": transfers}
         try:
-            response = requests.post(url, json=payload, headers=self.headers, timeout=45)
+            response = requests.post(url, json=payload, headers=self.headers, timeout=self.bulk_transfer_timeout)
             response.raise_for_status()
             return response.json()
         except requests.exceptions.RequestException as e:
@@ -597,7 +602,7 @@ class PaystackAPI:
         """Verify a Paystack transfer by reference."""
         url = f"{self.BASE_URL}/transfer/verify/{reference}"
         try:
-            response = requests.get(url, headers=self.headers, timeout=30)
+            response = requests.get(url, headers=self.headers, timeout=self.request_timeout)
             response.raise_for_status()
             return response.json()
         except requests.exceptions.RequestException as e:
@@ -627,7 +632,7 @@ class PaystackAPI:
             "otp": otp
         }
         try:
-            response = requests.post(url, headers=headers, json=payload, timeout=30)
+            response = requests.post(url, headers=headers, json=payload, timeout=self.transfer_timeout)
             response.raise_for_status() # Raise HTTPError for bad responses (4xx or 5xx)
             return response.json()
         except requests.exceptions.RequestException as e:

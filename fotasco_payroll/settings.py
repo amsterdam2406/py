@@ -10,6 +10,7 @@ from datetime import timedelta
 import importlib
 import dj_database_url
 import socket
+from django.core.exceptions import ImproperlyConfigured
 
 # Force IPv4 for Supabase (Render has IPv6 issues)
 _original_getaddrinfo = socket.getaddrinfo
@@ -336,21 +337,41 @@ PAYSTACK_SECRET_KEY = config('PAYSTACK_SECRET_KEY', default='')
 PAYSTACK_PUBLIC_KEY = config('PAYSTACK_PUBLIC_KEY', default='')
 PAYSTACK_CALLBACK_URL = config('PAYSTACK_CALLBACK_URL', default='https://fot-pyroll.onrender.com/api/payments/callback/')
 PAYSTACK_BASE_URL = 'https://api.paystack.co'
+PAYSTACK_REQUEST_TIMEOUT_SECONDS = config('PAYSTACK_REQUEST_TIMEOUT_SECONDS', default=8, cast=int)
+PAYSTACK_TRANSFER_TIMEOUT_SECONDS = config('PAYSTACK_TRANSFER_TIMEOUT_SECONDS', default=10, cast=int)
+PAYSTACK_BULK_TRANSFER_TIMEOUT_SECONDS = config('PAYSTACK_BULK_TRANSFER_TIMEOUT_SECONDS', default=12, cast=int)
+PAYSTACK_ACCOUNT_RESOLVE_TIMEOUT_SECONDS = config('PAYSTACK_ACCOUNT_RESOLVE_TIMEOUT_SECONDS', default=4, cast=int)
+PAYSTACK_ACCOUNT_RESOLVE_ATTEMPTS = config('PAYSTACK_ACCOUNT_RESOLVE_ATTEMPTS', default=2, cast=int)
 
 # Email
-EMAIL_BACKEND = 'django.core.mail.backends.smtp.EmailBackend'
-EMAIL_HOST = config('EMAIL_HOST', default='smtp.gmail.com')
-EMAIL_PORT = config('EMAIL_PORT', default=587, cast=int)
-EMAIL_USE_TLS = config('EMAIL_USE_TLS', default=True, cast=bool)
-EMAIL_TIMEOUT = config('EMAIL_TIMEOUT', default=60, cast=int)
+EMAIL_BACKEND = 'payroll.email_backend.ResendEmailBackend'
+RESEND_API_KEY = config('RESEND_API_KEY', default='')
+RESEND_API_URL = config('RESEND_API_URL', default='https://api.resend.com/emails')
+RESEND_SENDER_EMAIL = config('RESEND_SENDER_EMAIL', default='')
+RESEND_SENDER_NAME = config('RESEND_SENDER_NAME', default='FOTASCO Payroll NoReply')
+RESEND_REPLY_TO = config('RESEND_REPLY_TO', default='')
+RESEND_EMAIL_CONNECT_TIMEOUT_SECONDS = config('RESEND_EMAIL_CONNECT_TIMEOUT_SECONDS', default=2, cast=int)
+RESEND_EMAIL_READ_TIMEOUT_SECONDS = config('RESEND_EMAIL_READ_TIMEOUT_SECONDS', default=5, cast=int)
+RESEND_EMAIL_RETRIES = config('RESEND_EMAIL_RETRIES', default=1, cast=int)
+RESEND_EMAIL_WORKERS = config('RESEND_EMAIL_WORKERS', default=2, cast=int)
+RESEND_EMAIL_MAX_QUEUED_TASKS = config('RESEND_EMAIL_MAX_QUEUED_TASKS', default=100, cast=int)
+DEFAULT_FROM_EMAIL = f"{RESEND_SENDER_NAME} <{RESEND_SENDER_EMAIL}>"
 INTERNAL_PAYMENT_OTP_EXPIRY_SECONDS = config('INTERNAL_PAYMENT_OTP_EXPIRY_SECONDS', default=60, cast=int)
-INTERNAL_PAYMENT_OTP_EMAIL_TIMEOUT = config('INTERNAL_PAYMENT_OTP_EMAIL_TIMEOUT', default=60, cast=int)
 PAYSTACK_TRANSFER_OTP_ENABLED = config('PAYSTACK_TRANSFER_OTP_ENABLED', default=False, cast=bool)
-EMAIL_HOST_USER = config('EMAIL_HOST_USER')
-EMAIL_HOST_PASSWORD = config('EMAIL_HOST_PASSWORD')
-DEFAULT_FROM_EMAIL = f"Payroll System <{EMAIL_HOST_USER}>"
-EMAIL_USE_SSL = False
-# DEFAULT_FROM_EMAIL = config('DEFAULT_FROM_EMAIL')
+
+if EMAIL_BACKEND == 'payroll.email_backend.ResendEmailBackend':
+    missing_resend_settings = [
+        name for name, value in {
+            'RESEND_API_KEY': RESEND_API_KEY,
+            'RESEND_SENDER_EMAIL': RESEND_SENDER_EMAIL,
+        }.items()
+        if not str(value or '').strip()
+    ]
+    if missing_resend_settings:
+        raise ImproperlyConfigured(
+            "Resend email configuration is incomplete. Missing required environment variable(s): "
+            + ", ".join(missing_resend_settings)
+        )
 
 
 # ============================================

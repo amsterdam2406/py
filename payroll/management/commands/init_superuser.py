@@ -10,7 +10,7 @@ class Command(BaseCommand):
 
     def handle(self, *args, **options):
         username = os.environ.get('DJANGO_SUPERUSER_USERNAME', 'admin')
-        email = os.environ.get('DJANGO_SUPERUSER_EMAIL', 'amsatlolade@gmail.com')
+        email = os.environ.get('DJANGO_SUPERUSER_EMAIL', 'admin@example.com')
         password = os.environ.get('DJANGO_SUPERUSER_PASSWORD')
         if not password and not User.objects.filter(username=username).exists():
             self.stdout.write(self.style.WARNING(

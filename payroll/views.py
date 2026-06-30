@@ -9,7 +9,6 @@ import os
 import random
 import re
 import secrets
-import socket
 import string
 import uuid
 import zipfile
@@ -17,12 +16,10 @@ from datetime import datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from django.contrib.auth import get_user_model
 from django.conf import settings
-from django.core.mail import EmailMessage, EmailMultiAlternatives, get_connection
 from django.core.exceptions import ValidationError
 from django.contrib.auth.tokens import default_token_generator
 from django.utils.http import urlsafe_base64_encode, urlsafe_base64_decode
 from django.utils.encoding import force_bytes, force_str
-from django.core.mail import send_mail
 from django.db import transaction
 from django.db.models import Q, Sum
 from django.core.cache import cache
@@ -41,7 +38,6 @@ from rest_framework.response import Response
 from rest_framework.throttling import ScopedRateThrottle
 from rest_framework.views import APIView
 import json
-from django.core.mail import send_mail
 from django.conf import settings
 from rest_framework_simplejwt.authentication import JWTAuthentication
 
@@ -84,6 +80,12 @@ from .services import (
     compute_total_salary_payable,
     outstanding_previous_balance_for_month,
     approved_adjustment_totals_for_month,
+)
+from .email_service import (
+    EmailConfigurationError,
+    build_resend_attachment,
+    enqueue_internal_payment_otp_email,
+    enqueue_transactional_email,
 )
 
 from .models import (
@@ -307,12 +309,39 @@ def send_email_notification(user, subject, message, html_message=None):
     if not user or not user.email:
         return False
     try:
-        send_mail(subject=subject, message=message, from_email=settings.DEFAULT_FROM_EMAIL,
-                  recipient_list=[user.email], html_message=html_message, fail_silently=True)
+        enqueue_transactional_email(
+            recipient=user.email,
+            subject=subject,
+            text=message,
+            html=html_message,
+        )
         return True
     except Exception as e:
-        logger.error(f"Email failed: {e}")
+        logger.warning("Failed to queue transactional email recipient=%s subject=%s error=%s", user.email, subject, e)
         return False
+
+
+def _friendly_payment_error(result, default='Payment could not be completed. Please try again.'):
+    if isinstance(result, dict):
+        error_code = str(result.get('error_code') or result.get('code') or '').lower()
+        message = str(result.get('message') or '').lower()
+    else:
+        error_code = ''
+        message = str(result or '').lower()
+
+    if 'insufficient' in message and 'balance' in message:
+        return 'Insufficient Paystack balance. Fund the transfer balance and try again.'
+    if error_code in {'rate_limited', 'paystack_rate_limited'} or 'rate limit' in message:
+        return 'Paystack is temporarily rate limiting requests. Please try again shortly.'
+    if error_code == 'paystack_live_key_required':
+        return 'Payment service is not configured for live transfers.'
+    if 'otp' in message and ('invalid' in message or 'incorrect' in message):
+        return 'Invalid OTP. Please check the code and try again.'
+    if 'timeout' in message or 'timed out' in message:
+        return 'Payment service timed out. Please try again.'
+    if 'network' in message or 'connection' in message:
+        return 'Payment service is temporarily unavailable. Please try again.'
+    return default
     
 @api_view(['GET'])
 @permission_classes([AllowAny])
@@ -480,20 +509,33 @@ def send_payment_receipt_email(payment):
         buffer = generate_receipt_pdf_buffer(payment)
         subject = f"Payment Receipt: {payment.payment_month or 'Salary Payment'}"
         
-        email = EmailMessage(
-            subject=subject,
-            body=f"Dear {employee.name},\n\nYour salary payment has been processed successfully. Please find your official receipt attached.\n\nTransaction Ref: {payment.transaction_reference}\n\nThank you,\nFotasco Security Services",
-            from_email=settings.DEFAULT_FROM_EMAIL,
-            to=[employee.email],
-        )
-        
-        # Attach PDF
         filename = f"receipt_{payment.transaction_reference[:8]}.pdf"
-        email.attach(filename, buffer.getvalue(), 'application/pdf')
-        
-        # Send
-        email.send(fail_silently=True)
-        logger.info(f"Receipt email sent to {employee.email} for payment {payment.transaction_reference}")
+        text_body = (
+            f"Dear {employee.name},\n\n"
+            "Your salary payment has been processed successfully. Please find your official receipt attached.\n\n"
+            f"Transaction Ref: {payment.transaction_reference}\n\n"
+            "Thank you,\nFotasco Security Services"
+        )
+        html_body = (
+            f"<p>Dear {escape(employee.name)},</p>"
+            "<p>Your salary payment has been processed successfully. Please find your official receipt attached.</p>"
+            f"<p><strong>Transaction Ref:</strong> {escape(payment.transaction_reference)}</p>"
+            "<p>Thank you,<br>Fotasco Security Services</p>"
+        )
+        enqueue_transactional_email(
+            recipient=employee.email,
+            subject=subject,
+            text=text_body,
+            html=html_body,
+            attachments=[
+                build_resend_attachment(
+                    filename=filename,
+                    content=buffer.getvalue(),
+                    content_type='application/pdf',
+                )
+            ],
+        )
+        logger.info(f"Receipt email queued to {employee.email} for payment {payment.transaction_reference}")
     except Exception as e:
         logger.error(f"Error sending receipt email: {e}")
 
@@ -1255,16 +1297,17 @@ class EmployeeViewSet(viewsets.ModelViewSet):
         )
 
         try:
-            send_mail(
-                'Export Verification Code',
-                f'Your 2FA code for employee data export is: {otp}. Valid for 10 minutes.',
-                settings.DEFAULT_FROM_EMAIL,
-                [user.email],
-                fail_silently=False,
+            enqueue_transactional_email(
+                recipient=user.email,
+                subject='Export Verification Code',
+                text=f'Your 2FA code for employee data export is: {otp}. Valid for 10 minutes.',
+                html=(
+                    '<p>Your 2FA code for employee data export is: '
+                    f'<strong>{escape(otp)}</strong>. Valid for 10 minutes.</p>'
+                ),
             )
         except Exception as e:
-            # Avoid failing the request if email backend is not configured in dev
-            logger.warning(f"Failed to send export 2FA email to {user.email}: {e}")
+            logger.warning("Failed to queue export 2FA email recipient=%s error=%s", user.email, e)
 
         logger.info(f"Export token created and 2FA sent (or skipped) for {user.username}")
         return Response({'token': token, '2fa_required': True})
@@ -1826,67 +1869,27 @@ class PaymentViewSet(viewsets.ModelViewSet):
         if len(payments) > 5:
             employee_names += f", and {len(payments) - 5} more"
 
-        text_body = (
-            f'Your internal OTP for payment authorization is: {otp_code}\n\n'
-            f'Reference: {reference}\n'
-            f'Employees: {employee_names}\n'
-            f'Total amount: NGN {total_amount:,.2f}\n\n'
-            f'Expires in {expiry_seconds} seconds.\n'
-            'If you did not request this payment authorization, contact your payroll administrator immediately.'
-        )
-        html_body = f"""
-        <div style="font-family: Arial, sans-serif; color: #1f2937; max-width: 560px; margin: 0 auto;">
-          <div style="background: #0f172a; color: #ffffff; padding: 18px 22px; border-radius: 8px 8px 0 0;">
-            <h2 style="margin: 0; font-size: 20px;">Payroll System</h2>
-          </div>
-          <div style="border: 1px solid #e5e7eb; border-top: 0; padding: 22px; border-radius: 0 0 8px 8px;">
-            <p style="margin-top: 0;">Use this one-time code to authorize the salary payment request:</p>
-            <p style="font-size: 30px; letter-spacing: 6px; font-weight: 700; margin: 18px 0; color: #111827;">{escape(otp_code)}</p>
-            <p><strong>Reference:</strong> {escape(str(reference))}</p>
-            <p><strong>Employees:</strong> {escape(employee_names)}</p>
-            <p><strong>Total amount:</strong> NGN {total_amount:,.2f}</p>
-            <p style="color: #b45309;"><strong>Expires in {expiry_seconds} seconds.</strong></p>
-            <p style="font-size: 13px; color: #6b7280;">If you did not request this payment authorization, contact your payroll administrator immediately.</p>
-          </div>
-        </div>
-        """
-
         try:
-            connection = get_connection(timeout=int(getattr(settings, 'INTERNAL_PAYMENT_OTP_EMAIL_TIMEOUT', 5)))
-            message = EmailMultiAlternatives(
-                subject,
-                text_body,
-                settings.DEFAULT_FROM_EMAIL,
-                [user.email],
-                connection=connection,
+            enqueue_internal_payment_otp_email(
+                recipient=user.email,
+                subject=subject,
+                otp_code=otp_code,
+                reference=reference,
+                employee_names=employee_names,
+                total_amount=total_amount,
+                expiry_seconds=expiry_seconds,
+                failure_callback=invalidate_generated_otp,
             )
-            message.attach_alternative(html_body, "text/html")
-            message.send(fail_silently=False)
-        except socket.gaierror as exc:
+        except EmailConfigurationError as exc:
             invalidate_generated_otp()
-            logger.error(
-                "Internal payment OTP email DNS failure email_host=%s recipient=%s error=%s",
-                getattr(settings, 'EMAIL_HOST', None),
-                user.email,
-                exc,
-            )
-            raise ValueError(user_friendly_email_error) from exc
-        except (TimeoutError, socket.timeout, OSError) as exc:
-            invalidate_generated_otp()
-            logger.error(
-                "Internal payment OTP email connection failure email_host=%s email_port=%s recipient=%s error=%s",
-                getattr(settings, 'EMAIL_HOST', None),
-                getattr(settings, 'EMAIL_PORT', None),
-                user.email,
-                exc,
-            )
+            logger.error("Internal payment OTP email configuration failure recipient=%s error=%s", user.email, exc)
             raise ValueError(user_friendly_email_error) from exc
         except Exception as exc:
             invalidate_generated_otp()
             logger.exception(
-                "Internal payment OTP email failed email_host=%s recipient=%s",
-                getattr(settings, 'EMAIL_HOST', None),
+                "Internal payment OTP email enqueue failed recipient=%s reference=%s",
                 user.email,
+                reference,
             )
             raise ValueError(user_friendly_email_error) from exc
 
@@ -1951,7 +1954,13 @@ class PaymentViewSet(viewsets.ModelViewSet):
             except ValueError as e:
                 payment.status = 'failed'
                 payment.save(update_fields=['status', 'updated_at'])
-                errors.append(f"{employee.name}: {str(e)}")
+                logger.warning(
+                    "Skipping bulk payment after Paystack recipient setup failure payment_id=%s employee_id=%s error=%s",
+                    payment.id,
+                    employee.id,
+                    e,
+                )
+                errors.append(f"{employee.name}: Payment recipient could not be verified.")
                 continue
 
             amount_to_pay = payment.amount_paid if payment.amount_paid is not None else payment.net_amount
@@ -1978,7 +1987,12 @@ class PaymentViewSet(viewsets.ModelViewSet):
 
         if not bulk_result.get('status'):
             Payment.objects.filter(id__in=transfer_payment_ids, status='processing').update(status='failed')
-            errors.append(f"Bulk transfer error: {bulk_result.get('message')}")
+            logger.error(
+                "Paystack bulk transfer failed payment_ids=%s result=%s",
+                [str(payment_id) for payment_id in transfer_payment_ids],
+                bulk_result,
+            )
+            errors.append(_friendly_payment_error(bulk_result, default='Bulk transfer could not be completed. Please try again.'))
             return {
                 'message': 'Bulk transfer failed.',
                 'errors': errors,
@@ -1994,7 +2008,7 @@ class PaymentViewSet(viewsets.ModelViewSet):
                     transfer_payment_ids,
                 )
                 return {
-                    'message': 'Payment could not continue because Paystack OTP is enabled on the Paystack account. Disable Paystack OTP there or enable PAYSTACK_TRANSFER_OTP_ENABLED.',
+                    'message': 'Payment could not continue because Paystack requires an OTP for this transfer.',
                     'paystack_otp_required': False,
                     'status': 'failed',
                     'errors': errors,
@@ -2074,10 +2088,7 @@ class PaymentViewSet(viewsets.ModelViewSet):
                 )
                 payment.status = 'failed'
                 payment.save(update_fields=['status', 'updated_at'])
-                return False, (
-                    'Payment could not continue because Paystack OTP is enabled on the Paystack account. '
-                    'Disable Paystack OTP there or enable PAYSTACK_TRANSFER_OTP_ENABLED.'
-                )
+                return False, 'Payment could not continue because Paystack requires an OTP for this transfer.'
             return True, {
                 'message': 'Payment confirmed by Paystack.' if payment.status == 'completed' else 'Payment initiated on Paystack.',
                 'paystack_otp_required': payment.status == 'pending_paystack_otp',
@@ -2086,7 +2097,13 @@ class PaymentViewSet(viewsets.ModelViewSet):
         else:
             payment.status = 'failed'
             payment.save(update_fields=['status', 'updated_at'])
-            return False, f"Paystack API error: {transfer_result.get('message')}"
+            logger.error(
+                "Paystack transfer initiation failed payment_id=%s reference=%s result=%s",
+                payment.id,
+                payment.transaction_reference,
+                transfer_result,
+            )
+            return False, _friendly_payment_error(transfer_result)
 
 
     @action(detail=False, methods=['post'], permission_classes=[IsAuthenticated, IsPayrollAdmin, IsAdmin])
@@ -2122,7 +2139,7 @@ class PaymentViewSet(viewsets.ModelViewSet):
         except Exception as e:
             logger.exception("initiate_payment employee lookup/validation failed")
             return Response(
-                {'error': 'Failed to validate employee payment details', 'detail': str(e)},
+                {'error': 'Failed to validate employee payment details'},
                 status=status.HTTP_400_BAD_REQUEST
             )
 
@@ -2253,15 +2270,15 @@ class PaymentViewSet(viewsets.ModelViewSet):
                         if not success and isinstance(result, dict) and result.get('type') in {'paystack_rate_limited', 'paystack_rate_limit', 'paystack_rate'}:
                             return Response(
                                 {
-                                    'error': result.get('message') or 'Paystack is rate limiting account verification',
-                                    'detail': result.get('message') or 'Please retry later',
+                                    'error': _friendly_payment_error(result),
+                                    'detail': 'Please retry later',
                                     'retry_after': result.get('retry_after'),
                                     'error_code': 'rate_limited',
                                 },
                                 status=status.HTTP_429_TOO_MANY_REQUESTS,
                             )
                         if not success:
-                            return Response({'error': result, 'status': payment.status}, status=status.HTTP_400_BAD_REQUEST)
+                            return Response({'error': _friendly_payment_error(result), 'status': payment.status}, status=status.HTTP_400_BAD_REQUEST)
 
                         log_audit(
                             request.user,
@@ -2369,7 +2386,7 @@ class PaymentViewSet(viewsets.ModelViewSet):
         except Exception as e:
             logger.exception("initiate_payment failed")
             return Response(
-                {'error': 'Failed to initiate payment', 'detail': str(e)},
+                {'error': 'Failed to initiate payment'},
                 status=status.HTTP_400_BAD_REQUEST
             )
 
@@ -2408,7 +2425,7 @@ class PaymentViewSet(viewsets.ModelViewSet):
                 'paystack_otp_required': result['paystack_otp_required']
             })
         return Response({
-            'error': result,
+            'error': _friendly_payment_error(result),
             'status': payment.status,
             'reference': payment.transaction_reference,
         }, status=status.HTTP_400_BAD_REQUEST)
@@ -2637,7 +2654,7 @@ class PaymentViewSet(viewsets.ModelViewSet):
         except Exception as e:
             logger.exception("bulk_payment failed")
             return Response(
-                {'error': 'Failed to initiate bulk payments', 'detail': str(e)},
+                {'error': 'Failed to initiate bulk payments'},
                 status=status.HTTP_400_BAD_REQUEST
             )
 
@@ -2696,15 +2713,15 @@ class PaymentViewSet(viewsets.ModelViewSet):
             retry_after = result.get('retry_after')
             return Response(
                 {
-                    'error': result.get('message') or 'Paystack is rate limiting account verification',
-                    'detail': result.get('message') or 'Please retry later',
+                    'error': _friendly_payment_error(result),
+                    'detail': 'Please retry later',
                     'retry_after': retry_after,
                     'error_code': 'rate_limited',
                 },
                 status=status.HTTP_429_TOO_MANY_REQUESTS,
             )
         if not success:
-            return Response({'error': result, 'status': payment.status}, status=status.HTTP_400_BAD_REQUEST)
+            return Response({'error': _friendly_payment_error(result), 'status': payment.status}, status=status.HTTP_400_BAD_REQUEST)
 
         return Response({
             'message': result['message'],
@@ -2794,7 +2811,7 @@ class PaymentViewSet(viewsets.ModelViewSet):
                     # DON'T mark as failed - let user retry with correct OTP
                     logger.warning(f"Invalid OTP attempt for {payment.employee.name} (Ref: {reference}): {finalize_result.get('message')}")
                     return Response({
-                        'error': f"Invalid OTP: {finalize_result.get('message')}",
+                        'error': _friendly_payment_error(finalize_result, default='Invalid OTP. Please check the code and try again.'),
                         'paystack_otp_required': True,
                         'paystack_transfer_code': payment.paystack_transfer_code,
                         'reference': reference,
@@ -2805,13 +2822,13 @@ class PaymentViewSet(viewsets.ModelViewSet):
                     payment.status = 'failed'
                     payment.save()
                     logger.error(f"Paystack finalization failed permanently for {payment.employee.name} (Ref: {reference}): {finalize_result.get('message')}")
-                    return Response({'error': f"Paystack finalization failed: {finalize_result.get('message')}"}, status=status.HTTP_400_BAD_REQUEST)
+                    return Response({'error': _friendly_payment_error(finalize_result, default='Payment finalization failed. Please try again.')}, status=status.HTTP_400_BAD_REQUEST)
 
         except Payment.DoesNotExist:
             return Response({'error': 'Payment not found or not in pending_paystack_otp status'}, status=status.HTTP_404_NOT_FOUND)
         except Exception as e:
-            logger.error(f"Error finalizing Paystack transfer: {e}")
-            return Response({'error': 'An error occurred during Paystack transfer finalization'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+            logger.exception("Error finalizing Paystack transfer")
+            return Response({'error': 'Payment finalization failed. Please try again.'}, status=status.HTTP_400_BAD_REQUEST)
 
     @action(detail=False, methods=['post'], permission_classes=[IsAuthenticated, IsPayrollAdmin])
     def finalize_paystack_transfer(self, request):
@@ -2842,8 +2859,8 @@ class PaymentViewSet(viewsets.ModelViewSet):
         except ValueError as e:
             return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
         except Exception as e:
-            logger.error(f"Failed to resend OTP email: {e}")
-            return Response({'error': 'Failed to send OTP'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+            logger.exception("Failed to resend OTP email")
+            return Response({'error': 'Failed to send OTP'}, status=status.HTTP_400_BAD_REQUEST)
     
 
     @action(detail=False, methods=['post'], permission_classes=[IsAuthenticated])
