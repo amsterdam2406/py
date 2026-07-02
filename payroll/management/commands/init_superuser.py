@@ -9,8 +9,8 @@ class Command(BaseCommand):
     help = 'Create or update superuser'
 
     def handle(self, *args, **options):
-        username = os.environ.get('DJANGO_SUPERUSER_USERNAME', 'admin')
-        email = os.environ.get('DJANGO_SUPERUSER_EMAIL', 'admin@example.com')
+        username = os.environ.get('DJANGO_SUPERUSER_USERNAME')
+        email = os.environ.get('DJANGO_SUPERUSER_EMAIL')
         password = os.environ.get('DJANGO_SUPERUSER_PASSWORD')
         if not password and not User.objects.filter(username=username).exists():
             self.stdout.write(self.style.WARNING(
@@ -51,3 +51,5 @@ class Command(BaseCommand):
 #             self.stdout.write(self.style.NOTICE(f'Superuser "{username}" already exists'))
 
 
+# ('DJANGO_SUPERUSER_USERNAME', 'admin')
+        # email = os.environ.get('DJANGO_SUPERUSER_EMAIL', 'admin@example.com')

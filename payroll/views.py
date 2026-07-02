@@ -73,7 +73,7 @@ from .serializers import (
     PaystackResolveAccountSerializer,
 )
 
-from .paystack import PaystackAPI, PaystackAccountResolutionService, is_invalid_recipient_error
+from .paystack import PaystackAPI, PaystackAccountResolutionService, is_invalid_recipient_error, _paystack_error_text
 from .services import (
     applied_deductions_for_month,
     get_employee_bank_code,
@@ -332,23 +332,27 @@ def _friendly_payment_error(result, default='Payment could not be completed. Ple
     if isinstance(result, dict):
         error_code = str(result.get('error_code') or result.get('code') or '').lower()
         message = str(result.get('message') or '').lower()
+        nested = _paystack_error_text(result).lower()
     else:
         error_code = ''
         message = str(result or '').lower()
+        nested = message
 
     if is_invalid_recipient_error(result):
-        return "The employee's payment account needs to be refreshed before payment can continue. Please try again or contact your administrator."
-    if 'insufficient' in message and 'balance' in message:
+        return 'The payment recipient has been refreshed automatically. Please try again.'
+    if 'insufficient' in nested and 'balance' in nested:
         return 'Insufficient Paystack balance. Fund the transfer balance and try again.'
-    if error_code in {'rate_limited', 'paystack_rate_limited'} or 'rate limit' in message:
+    if error_code in {'rate_limited', 'paystack_rate_limited'} or 'rate limit' in nested:
         return 'Paystack is temporarily rate limiting requests. Please try again shortly.'
     if error_code == 'paystack_live_key_required':
         return 'Payment service is not configured for live transfers.'
-    if 'otp' in message and ('invalid' in message or 'incorrect' in message):
+    if 'account' in nested and ('resolve' in nested or 'invalid account' in nested or 'could not validate' in nested):
+        return "The employee's bank details could not be verified."
+    if 'otp' in nested and ('invalid' in nested or 'incorrect' in nested):
         return 'Invalid OTP. Please check the code and try again.'
-    if 'timeout' in message or 'timed out' in message:
+    if 'timeout' in nested or 'timed out' in nested:
         return 'Payment service timed out. Please try again.'
-    if 'network' in message or 'connection' in message:
+    if 'network' in nested or 'connection' in nested or 'temporarily unavailable' in nested:
         return 'Payment service is temporarily unavailable. Please try again.'
     return default
 
@@ -1877,11 +1881,25 @@ class PaymentViewSet(viewsets.ModelViewSet):
             bank_code=bank_code_str,
         )
         if not recipient_result.get('status'):
-            raise ValueError(f"Paystack recipient creation failed: {recipient_result.get('message')}")
+            logger.warning(
+                "Paystack recipient creation failed employee_id=%s bank_code=%s account=%s response=%s",
+                employee.id,
+                bank_code_str,
+                masked_account,
+                recipient_result,
+            )
+            raise ValueError("The employee's payment account could not be verified.")
 
         recipient_code = recipient_result.get('data', {}).get('recipient_code') or recipient_result.get('recipient_code')
         if not recipient_code:
-            raise ValueError('Paystack recipient creation failed: missing recipient code')
+            logger.error(
+                "Paystack recipient creation returned no recipient code employee_id=%s bank_code=%s account=%s response=%s",
+                employee.id,
+                bank_code_str,
+                masked_account,
+                recipient_result,
+            )
+            raise ValueError("The employee's payment account could not be verified.")
 
         employee.paystack_recipient_code = recipient_code
         employee.save(update_fields=['paystack_recipient_code'])
@@ -2065,10 +2083,12 @@ class PaymentViewSet(viewsets.ModelViewSet):
         Payment.objects.filter(id__in=transfer_payment_ids, status='pending').update(status='processing')
         bulk_result = paystack.bulk_transfer(transfers_payload)
         target_payments = list(Payment.objects.filter(id__in=transfer_payment_ids).select_related('employee'))
+        payments_by_id = {payment.id: payment for payment in target_payments}
+        target_payments = [payments_by_id[payment_id] for payment_id in transfer_payment_ids if payment_id in payments_by_id]
 
-        if not bulk_result.get('status') and is_invalid_recipient_error(bulk_result):
+        if is_invalid_recipient_error(bulk_result):
             logger.warning(
-                "Paystack bulk transfer rejected recipient; retrying once payment_ids=%s result=%s",
+                "Paystack bulk transfer rejected recipient; clearing stored recipients and retrying once payment_ids=%s result=%s",
                 [str(payment_id) for payment_id in transfer_payment_ids],
                 bulk_result,
             )
@@ -2102,6 +2122,78 @@ class PaymentViewSet(viewsets.ModelViewSet):
             bulk_result = paystack.bulk_transfer(refreshed_payload)
 
         data = bulk_result.get('data', {}) if isinstance(bulk_result.get('data'), dict) else {}
+
+        if isinstance(data, dict):
+            transfers = data.get('transfers')
+            if isinstance(transfers, list):
+                transfer_errors = []
+                any_failed = False
+                all_completed = True
+
+                for transfer in transfers:
+                    reference = transfer.get('reference')
+                    if not reference:
+                        continue
+
+                    payment = next(
+                        (p for p in target_payments if p.transaction_reference == reference),
+                        None,
+                    )
+                    if not payment:
+                        continue
+
+                    transfer_status = str(transfer.get('status') or '').lower()
+                    if transfer_status == 'success':
+                        payment.status = 'completed'
+                    elif transfer_status in ['failed', 'reversed']:
+                        payment.status = 'failed'
+                        any_failed = True
+                    elif transfer_status == 'otp':
+                        if self._paystack_otp_enabled():
+                            payment.status = 'pending_paystack_otp'
+                            all_completed = False
+                        else:
+                            payment.status = 'failed'
+                            any_failed = True
+                    elif transfer_status in ['pending', 'processing', 'queued', 'received']:
+                        payment.status = 'processing'
+                        all_completed = False
+                    else:
+                        payment.status = 'processing'
+                        all_completed = False
+
+                    payment.save(update_fields=['status', 'updated_at'])
+
+                    if payment.status == 'failed':
+                        reason = transfer.get('reason') or transfer.get('message') or 'Bulk transfer failed for this payment.'
+                        transfer_errors.append(_friendly_payment_error({'message': reason}, default=reason))
+
+                    if payment.status != 'completed':
+                        all_completed = False
+
+                if any_failed or all_completed:
+                    errors.extend(transfer_errors)
+                    response_status = 'failed' if any_failed else 'completed'
+                    response_message = (
+                        'Bulk transfer completed with some failed payments.'
+                        if any_failed
+                        else 'Bulk transfer completed successfully.'
+                    )
+                    return {
+                        'message': response_message,
+                        'paystack_otp_required': False,
+                        'status': response_status,
+                        'errors': errors,
+                        'payments': [
+                            {
+                                'employee_id': p.employee.employee_id,
+                                'employee_name': p.employee.name,
+                                'reference': p.transaction_reference,
+                                'status': p.status,
+                            }
+                            for p in target_payments
+                        ],
+                    }
 
         if not bulk_result.get('status'):
             Payment.objects.filter(id__in=transfer_payment_ids, status='processing').update(status='failed')
@@ -2197,7 +2289,7 @@ class PaymentViewSet(viewsets.ModelViewSet):
 
         if not transfer_result.get('status') and is_invalid_recipient_error(transfer_result):
             logger.warning(
-                "Paystack transfer rejected recipient; retrying once payment_id=%s employee_id=%s recipient_code=%s result=%s",
+                "Paystack transfer rejected recipient; clearing stored recipient and retrying once payment_id=%s employee_id=%s recipient_code=%s result=%s",
                 payment.id,
                 employee.id,
                 recipient_code,
@@ -2216,6 +2308,12 @@ class PaymentViewSet(viewsets.ModelViewSet):
                     exc,
                 )
                 return False, str(exc)
+            logger.info(
+                "Created a refreshed Paystack recipient for retry payment_id=%s employee_id=%s new_recipient_code=%s",
+                payment.id,
+                employee.id,
+                recipient_code,
+            )
             logger.info(
                 "Retrying Paystack transfer with refreshed recipient payment_id=%s employee_id=%s recipient_code=%s",
                 payment.id,
@@ -2242,7 +2340,7 @@ class PaymentViewSet(viewsets.ModelViewSet):
                 payment.save(update_fields=['status', 'updated_at'])
                 return False, 'Payment could not continue because Paystack requires an OTP for this transfer.'
             return True, {
-                'message': 'Payment confirmed by Paystack.' if payment.status == 'completed' else 'Payment initiated on Paystack.',
+                'message': 'Payment completed successfully.' if payment.status == 'completed' else 'Payment initiated on Paystack.',
                 'paystack_otp_required': payment.status == 'pending_paystack_otp',
                 'status': payment.status
             }

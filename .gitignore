@@ -105,4 +105,6 @@ temp_inspect.py
 temp_test.py
 payroll/tests_dashboard.py
 payroll/tests_client_payments.py
-  payroll/tests_paystack_recipients.py
+payroll/tests_paystack_recipients.py
+payroll/tests_paystack_recipients.py
+payroll/tests_salary_carry_forward.py

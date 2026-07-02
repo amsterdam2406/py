@@ -32,25 +32,39 @@ def _is_live_secret_key(secret_key):
     return str(secret_key or '').startswith('sk_live_')
 
 
-def is_invalid_recipient_error(result):
+def _flatten_paystack_error_text(value):
+    if isinstance(value, dict):
+        return ' '.join(_flatten_paystack_error_text(v) for v in value.values() if v is not None)
+    if isinstance(value, list):
+        return ' '.join(_flatten_paystack_error_text(v) for v in value)
+    return str(value or '')
+
+
+def _paystack_error_text(result):
     if not isinstance(result, dict):
-        message = str(result or '')
-    else:
-        data = result.get('data')
-        parts = [
-            result.get('message'),
-            result.get('error_code'),
-            result.get('code'),
-        ]
-        if isinstance(data, dict):
-            parts.extend([
-                data.get('message'),
-                data.get('error'),
-                data.get('code'),
-                data.get('type'),
-            ])
-        message = ' '.join(str(part or '') for part in parts)
-    normalized = message.lower()
+        return str(result or '')
+
+    data = result.get('data')
+    parts = [
+        result.get('message'),
+        result.get('error_code'),
+        result.get('code'),
+    ]
+    if data is not None:
+        parts.append(data)
+    parts.append(result.get('meta'))
+    return _flatten_paystack_error_text(parts)
+
+
+def is_invalid_recipient_error(result):
+    if isinstance(result, dict):
+        meta = result.get('meta')
+        if isinstance(meta, dict):
+            blacklisted = meta.get('blacklistedRecipients')
+            if isinstance(blacklisted, (list, tuple)) and len(blacklisted) > 0:
+                return True
+
+    normalized = _paystack_error_text(result).lower()
     return any(phrase in normalized for phrase in INVALID_RECIPIENT_ERROR_PHRASES)
 
 
