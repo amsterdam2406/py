@@ -2,6 +2,7 @@ from celery import shared_task
 from django.utils import timezone
 from datetime import timedelta
 from django.db import transaction
+from django.db.models import Q
 from .models import Payment
 from .paystack import PaystackAPI
 from django.core.cache import cache
@@ -18,11 +19,12 @@ def verify_processing_payments():
     Task to automatically verify Paystack-backed payments stuck in non-terminal status
     that haven't received a webhook update within 30 minutes.
     """
-    threshold = timezone.now() - timedelta(minutes=30)
+    otp_threshold = timezone.now() - timedelta(minutes=getattr(settings, 'PAYSTACK_OTP_EXPIRY_MINUTES', 30))
+    stale_threshold = timezone.now() - timedelta(minutes=getattr(settings, 'PAYSTACK_STALE_MINUTES', 60))
     stale_payments = Payment.objects.filter(
         payment_method='bank_transfer',
         status__in=['pending', 'processing', 'pending_paystack_otp'],
-        updated_at__lt=threshold
+        updated_at__lt=stale_threshold
     )
     
     if not stale_payments.exists():

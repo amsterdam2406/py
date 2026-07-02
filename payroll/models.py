@@ -1122,6 +1122,38 @@ class Payment(TimeStampedModel):
         """Return list of allowed next statuses from current state."""
         return self.STATUS_TRANSITIONS.get(self.status, [])
 
+    def is_paystack_otp_expired(self):
+        if self.payment_method != PaymentMethod.BANK_TRANSFER:
+            return False
+        if self.status != PaymentStatus.PENDING_PAYSTACK_OTP:
+            return False
+        expiry_minutes = getattr(settings, 'PAYSTACK_OTP_EXPIRY_MINUTES', 30)
+        return self.updated_at + timedelta(minutes=expiry_minutes) <= timezone.now()
+
+    def is_paystack_status_stale(self):
+        if self.payment_method != PaymentMethod.BANK_TRANSFER:
+            return False
+        if self.status not in [
+            PaymentStatus.PENDING,
+            PaymentStatus.PROCESSING,
+            PaymentStatus.PENDING_PAYSTACK_OTP,
+        ]:
+            return False
+        stale_minutes = getattr(settings, 'PAYSTACK_STALE_MINUTES', 60)
+        return self.updated_at + timedelta(minutes=stale_minutes) <= timezone.now()
+
+    def fail_due_to_expiry(self, reason):
+        if self.status not in [
+            PaymentStatus.PENDING,
+            PaymentStatus.PROCESSING,
+            PaymentStatus.PENDING_PAYSTACK_OTP,
+        ]:
+            return False
+        self.status = PaymentStatus.FAILED
+        self.termination_reason = reason
+        self.save(update_fields=['status', 'termination_reason', 'updated_at'])
+        return True
+
     @transaction.atomic
     def mark_as_paid(self, amount=None):
         """Mark payment as completed with optional amount tracking."""

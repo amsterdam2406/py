@@ -165,6 +165,9 @@ TEMPLATES = [
 
 WSGI_APPLICATION = 'fotasco_payroll.wsgi.application'
 
+# Custom CSRF failure handler
+CSRF_FAILURE_VIEW = 'payroll.views.csrf_failure'
+
 # ============================================
 # DATABASE (Supabase PostgreSQL)
 # ============================================
@@ -412,6 +415,9 @@ if not DEBUG:
     SESSION_ENGINE = 'django.contrib.sessions.backends.db'
     SESSION_COOKIE_AGE = 1209600
     SESSION_SAVE_EVERY_REQUEST = True
+
+PAYSTACK_OTP_EXPIRY_MINUTES = 30
+PAYSTACK_STALE_MINUTES = 60
 
 # ============================================
 # CONTENT SECURITY POLICY

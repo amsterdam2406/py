@@ -925,13 +925,21 @@ function formatApiError(data, fallback) {
 
   const direct = data.detail || data.error || data.message;
   if (direct) {
-    return cleanText(direct) || fallback;
+    const directText = cleanText(direct);
+    if (/csrf|forbidden|permission denied|authentication failed/i.test(directText)) {
+      return "Permission denied or session invalid. Please refresh the page and try again.";
+    }
+    return directText || fallback;
   }
 
   const fieldErrors = Object.entries(data)
     .map(([field, value]) => fieldMessage(field, value))
     .filter(Boolean)
     .join("; ");
+
+  if (/csrf|forbidden|permission denied/i.test(fieldErrors)) {
+    return "Permission denied or session invalid. Please refresh the page and try again.";
+  }
 
   return fieldErrors || fallback;
 }
@@ -1024,6 +1032,19 @@ async function apiRequest(url, options = {}) {
       };
     }
 
+    if (response.status === 403) {
+      const errorData = await response.json().catch(() => ({}));
+      const serverMessage = errorData.detail || errorData.error || errorData.message;
+      return {
+        success: false,
+        status: response.status,
+        data: errorData,
+        message:
+          serverMessage ||
+          "Permission denied. Please refresh the page and try again. If the problem persists, contact your administrator.",
+      };
+    }
+
     if (response.status === 429) {
       const errorData = await response.json().catch(() => ({}));
       const retryAfter = Number(errorData.retry_after || errorData.data?.retry_after);
@@ -1052,6 +1073,12 @@ async function apiRequest(url, options = {}) {
           message = JSON.stringify(message);
         } catch (err) {
           message = String(message);
+        }
+      }
+      if (response.status >= 500) {
+        const hasServerMessage = data && (data.detail || data.error || data.message);
+        if (!hasServerMessage) {
+          message = 'Server error. Please try again later.';
         }
       }
       return {
@@ -3552,71 +3579,85 @@ async function startBulkPaymentPolling(
   let attempts = 0;
   let currentDelay = interval;
   const total = payments.length;
-  if (AppState.bulkPollInterval) clearTimeout(AppState.bulkPollInterval);
+  if (AppState.bulkPollInterval) {
+    clearTimeout(AppState.bulkPollInterval);
+    AppState.bulkPollInterval = null;
+  }
 
-  // Ensure global spinner is visible and showing initial progress
   AppState.isPolling = true;
   showLoading(null, AppState.elements.globalSpinner);
   updateLoadingProgress(`Processing Bulk Payments: 0% (0/${total})`);
+
+  const stopPolling = async () => {
+    AppState.isPolling = false;
+    if (AppState.bulkPollInterval) {
+      clearTimeout(AppState.bulkPollInterval);
+      AppState.bulkPollInterval = null;
+    }
+    updateLoadingProgress("Loading...");
+    hideLoading(null, AppState.elements.globalSpinner);
+    await loadDashboard();
+  };
 
   const poll = async () => {
     attempts++;
     const pending = payments.filter((p) => !p.done);
 
-    for (const p of pending) {
-      const res = await apiRequest(`/api/payments/verify-payment/${p.reference}/`);
-      if (
-        res.success &&
-        (res.data.is_completed || ["failed", "pending_paystack_otp"].includes(res.data.payment_status))
-      ) {
-        p.done = true;
-        if (res.data.payment_status === "pending_paystack_otp") {
-          showPaystackOtpModal(p.reference, res.data.paystack_transfer_code || "");
-          showToast(`${p.employee_name}: Paystack OTP required`, "warning");
-        } else {
-          showToast(
-            `${p.employee_name}: ${res.data.payment_status}`,
-            res.data.is_completed ? "success" : "error",
-          );
+    try {
+      for (const p of pending) {
+        const res = await apiRequest(`/api/payments/verify-payment/${p.reference}/`);
+        if (
+          res.success &&
+          (res.data.is_completed || ["failed", "pending_paystack_otp"].includes(res.data.payment_status))
+        ) {
+          p.done = true;
+          if (res.data.payment_status === "pending_paystack_otp") {
+            showPaystackOtpModal(p.reference, res.data.paystack_transfer_code || "");
+            showToast(`${p.employee_name}: Paystack OTP required`, "warning");
+          } else {
+            showToast(
+              `${p.employee_name}: ${res.data.payment_status}`,
+              res.data.is_completed ? "success" : "error",
+            );
+          }
         }
       }
+
+      const completedCount = payments.filter((p) => p.done).length;
+      const percentage = Math.round((completedCount / total) * 100);
+      updateLoadingProgress(
+        `Processing Bulk Payments: ${percentage}% (${completedCount}/${total})`,
+      );
+
+      if (payments.every((p) => p.done) || attempts >= maxAttempts) {
+        await stopPolling();
+        return;
+      }
+
+      currentDelay = Math.min(currentDelay * 1.5, 30000);
+      AppState.bulkPollInterval = setTimeout(poll, currentDelay);
+    } catch (err) {
+      console.error('Bulk payment polling error:', err);
+      showToast('Bulk payment status polling failed. Please sync manually.', 'error');
+      await stopPolling();
     }
-
-    const completedCount = payments.filter((p) => p.done).length;
-    const percentage = Math.round((completedCount / total) * 100);
-    updateLoadingProgress(
-      `Processing Bulk Payments: ${percentage}% (${completedCount}/${total})`,
-    );
-
-    if (payments.every((p) => p.done) || attempts >= maxAttempts) {
-      AppState.isPolling = false;
-      updateLoadingProgress("Loading..."); // Reset for next use
-      hideLoading(null, AppState.elements.globalSpinner);
-      await loadDashboard(); // Reloading dashboard updates stats automatically
-      return;
-    }
-
-    // Optimized Polling: Increase delay by 50% each time (Exponential Backoff) to save mobile data
-    currentDelay = Math.min(currentDelay * 1.5, 30000);
-    AppState.bulkPollInterval = setTimeout(poll, currentDelay);
   };
+
   AppState.bulkPollInterval = setTimeout(poll, currentDelay);
 }
 
 async function initiateIndividualPayment(empId) {
-    // PRE-CHECK: Prevent calling API if already paid this month
     const currentMonth = new Date().toISOString().slice(0, 7);
-    const employee = AppState.employees.find(e => String(e.id) === String(empId));
+    const employee = AppState.employees.find((e) => String(e.id) === String(empId));
     const outstanding = employee?.salary_breakdown?.outstanding_balance || 0;
-    
-    const existingPayment = AppState.payments?.find(p => 
-        String(p.employee) === String(empId) && p.payment_month === currentMonth
+
+    const existingPayment = AppState.payments?.find(
+        (p) => String(p.employee) === String(empId) && p.payment_month === currentMonth,
     );
-    
+
     if (existingPayment) {
         const status = existingPayment.status;
-        // Only block if the status is completed AND there is no remaining balance to pay
-        if (outstanding <= 0) { // If outstanding is 0 or less, it's fully paid
+        if (outstanding <= 0) {
             showToast("Salary already paid for this month", "info");
             return;
         }
@@ -3625,46 +3666,46 @@ async function initiateIndividualPayment(empId) {
             startPaymentStatusPolling(existingPayment.transaction_reference);
             return;
         }
-        // Only allow retry if failed
         if (status !== 'failed') {
             showToast(`Payment already initiated (${status}). Cannot re-initiate.`, "warning");
-            // If it's pending_paystack_otp, show the modal
             if (status === 'pending_paystack_otp') {
                 showPaystackOtpModal(
-                    existingPayment.transaction_reference, existingPayment.paystack_transfer_code || ''
+                    existingPayment.transaction_reference,
+                    existingPayment.paystack_transfer_code || '',
                 );
             }
             return;
         }
     }
+
+    const btn = document.querySelector(
+        `button[onclick="initiateIndividualPayment('${empId}')"]`,
+    );
+
     try {
-        const btn = document.querySelector(
-            `button[onclick="initiateIndividualPayment('${empId}')"]`,
-        );
         showLoading(btn);
 
-        // If individual modal is open, read partial payment fields
         const isPartial = document.getElementById('isPartialPaymentIndividual')?.checked;
-        let body = { employee_id: empId };
+        const body = { employee_id: empId };
         if (isPartial) {
-          const amt = parseFloat(document.getElementById('partialAmountIndividual')?.value || 0);
-          const reason = document.getElementById('partialReasonIndividual')?.value || '';
-          if (!amt || amt <= 0) {
-            hideLoading(btn);
-            showToast('Enter a valid partial amount', 'error');
-            return;
-          }
-          body.partial = true;
-          body.partial_amount = Math.round(amt * 100) / 100; // two decimals
-          body.partial_reason = reason;
+            const amt = parseFloat(document.getElementById('partialAmountIndividual')?.value || 0);
+            const reason = document.getElementById('partialReasonIndividual')?.value || '';
+            if (!amt || amt <= 0) {
+                showToast('Enter a valid partial amount', 'error');
+                return;
+            }
+            body.partial = true;
+            body.partial_amount = Math.round(amt * 100) / 100;
+            body.partial_reason = reason;
         }
 
-        // Pre-check: ensure employee has bank details locally before sending API request
-        const employee = AppState.employees.find(e => String(e.id) === String(empId));
         if (employee && (!employee.bank_code || !employee.account_number)) {
-            hideLoading(btn);
             showToast('Employee bank details incomplete. Please update account before initiating payment.', 'warning', 8000);
-            try { editEmployee(empId); } catch (e) { /* fallback */ }
+            try {
+                editEmployee(empId);
+            } catch (e) {
+                console.warn('Could not open employee edit modal', e);
+            }
             return;
         }
 
@@ -3674,10 +3715,10 @@ async function initiateIndividualPayment(empId) {
         });
 
         if (!res.success) {
-          const detail = formatApiError(res.data, res.message || "Failed to initiate payment");
-          const err = new Error(detail || "Failed to initiate payment");
-          err.raw = res;
-          throw err;
+            const detail = formatApiError(res.data, res.message || "Failed to initiate payment");
+            const err = new Error(detail || "Failed to initiate payment");
+            err.raw = res;
+            throw err;
         }
 
         const reference = res.data.reference;
@@ -3689,14 +3730,11 @@ async function initiateIndividualPayment(empId) {
               "A security verification code has been sent to your email. Enter it to authorize this payment."
             );
             showToast(res.data.message || "Internal OTP sent", "info");
-            hideLoading(btn);
             return;
         }
 
-        // Check if Paystack OTP is required immediately
         if (res.data.paystack_otp_required) {
             showPaystackOtpModal(reference, res.data.paystack_transfer_code);
-            hideLoading(btn);
             return;
         }
 
@@ -3705,26 +3743,21 @@ async function initiateIndividualPayment(empId) {
         await loadEmployees();
         await updateDashboardStats();
         startPaymentStatusPolling(reference);
-        
     } catch (err) {
         let errorMsg = err.message || "Failed to initiate payment";
-        
+
         if (errorMsg.includes("bank_code is missing")) {
             showToast("Bank Code missing. Redirecting to edit employee record...", "warning", 5000);
-            // Auto-open edit modal to let user fix the data
             setTimeout(() => editEmployee(empId), 1500);
             return;
         }
 
         showToast(errorMsg, "error", 8000);
     } finally {
-        hideLoading(
-            document.querySelector(
-                `button[onclick="initiateIndividualPayment('${empId}')"]`,
-            ),
-        );
+        hideLoading(btn);
     }
 }
+
 
 // NEW: Show Paystack OTP modal
 function showPaystackOtpModal(reference, transferCode) {
@@ -3942,8 +3975,10 @@ async function startPaymentStatusPolling(
   let attempts = 0;
   let currentDelay = interval;
 
-  // Keep a handle to allow clean polling stop
-  AppState.paymentPollTimeout = null;
+  if (AppState.paymentPollTimeout) {
+    clearTimeout(AppState.paymentPollTimeout);
+    AppState.paymentPollTimeout = null;
+  }
 
   const updatePaymentPreviewFromPolling = (data) => {
     const preview = document.getElementById('paymentPreview');
@@ -4043,7 +4078,12 @@ async function syncPaymentsWithPaystack() {
       showToast(res.data.message, "success");
       await loadPaymentHistory();
       await updateDashboardStats();
+    } else {
+      showToast(res.message || "Failed to sync payments. Please try again.", "error");
     }
+  } catch (err) {
+    console.error('Sync payments error:', err);
+    showToast(err.message || "Failed to sync payments. Please try again.", "error");
   } finally {
     hideLoading(btn);
   }
@@ -5053,30 +5093,29 @@ function populatePaymentsTable() {
     let statusBadge = '';
     let actionBtn = '';
 
-    if (isPaidFully) {
-        statusBadge = '<span class="badge bg-success">PAID</span>';
-        actionBtn = '<span class="text-success"><i class="fas fa-check-circle"></i> Settled</span>';
-    } else {
-        const monthlyPayment = (AppState.payments || []).find(
-            (p) => idsMatch(p.employee, emp.id) && p.payment_month === currentMonth && p.status !== 'failed'
-        );
-        
-        if (monthlyPayment && (monthlyPayment.status === 'pending' || monthlyPayment.status === 'processing')) {
-            statusBadge = `<span class="badge bg-info">${escapeHtml(formatPaymentStatus(monthlyPayment.status))}</span>`;
-            actionBtn = `<button type="button" class="btn btn-sm btn-info" onclick="retryPayment('${monthlyPayment.transaction_reference}')">Sync</button>`;
-        } else if (monthlyPayment && monthlyPayment.status === 'pending_paystack_otp' && monthlyPayment.paystack_otp_required) {
+    const monthlyPayment = (AppState.payments || []).find(
+        (p) => idsMatch(p.employee, emp.id) && p.payment_month === currentMonth,
+    );
+
+    if (monthlyPayment && ['pending', 'processing', 'pending_paystack_otp', 'pending_hr'].includes(monthlyPayment.status)) {
+        if (monthlyPayment.status === 'pending_paystack_otp' && monthlyPayment.paystack_otp_required) {
             statusBadge = '<span class="badge bg-warning">AWAITING OTP</span>';
             actionBtn = `
                 <button type="button" class="btn btn-sm btn-warning" onclick="showPaystackOtpModal('${monthlyPayment.transaction_reference}', '${monthlyPayment.paystack_transfer_code || ''}')">OTP</button>
                 <button type="button" class="btn btn-sm btn-danger" onclick="cancelStuckPayment('${monthlyPayment.id}')">×</button>`;
-        } else if (monthlyPayment && monthlyPayment.status === 'pending_hr') {
+        } else if (monthlyPayment.status === 'pending_hr') {
             statusBadge = '<span class="badge bg-warning">AWAITING HR</span>';
             actionBtn = '<span class="text-warning">HR approval required</span>';
         } else {
-
-            statusBadge = d.total_paid > 0 ? '<span class="badge bg-info">PARTIAL</span>' : '<span class="badge bg-secondary">UNPAID</span>';
-            actionBtn = `<button type="button" class="btn btn-sm btn-success" onclick="initiateIndividualPayment('${emp.id}')">Pay ${d.total_paid > 0 ? 'Bal' : ''}</button>`;
+            statusBadge = `<span class="badge bg-info">${escapeHtml(formatPaymentStatus(monthlyPayment.status))}</span>`;
+            actionBtn = `<button type="button" class="btn btn-sm btn-info" onclick="retryPayment('${monthlyPayment.transaction_reference}')">Sync</button>`;
         }
+    } else if (isPaidFully) {
+        statusBadge = '<span class="badge bg-success">PAID</span>';
+        actionBtn = '<span class="text-success"><i class="fas fa-check-circle"></i> Settled</span>';
+    } else {
+        statusBadge = d.total_paid > 0 ? '<span class="badge bg-info">PARTIAL</span>' : '<span class="badge bg-secondary">UNPAID</span>';
+        actionBtn = `<button type="button" class="btn btn-sm btn-success" onclick="initiateIndividualPayment('${emp.id}')">Pay ${d.total_paid > 0 ? 'Bal' : ''}</button>`;
     }
 
     const row = document.createElement("tr");
@@ -6731,34 +6770,34 @@ async function retryPayment(transactionReferenceOrId) {
           showToast("Missing payment reference for retry", "error");
           return;
       }
-      
-      // Use the GET polling endpoint (verify_payment_status)
+
       const res = await apiRequest(`/api/payments/verify-payment/${transactionReferenceOrId}/`);
-      
-      if (res.success && res.data?.payment_status) {
-          const status = res.data.payment_status;
-          
-          // Check for pending_paystack_otp status
-          if (status === "pending_paystack_otp") {
-              // Need to get transfer_code - call the POST verify_payment to get full details
-              // OR use the payment data we already have in AppState.payments
-              const payment = AppState.payments.find(p => 
-                  p.transaction_reference === transactionReferenceOrId
-              );
-              const transferCode = payment?.paystack_transfer_code || '';
-              
-              showPaystackOtpModal(transactionReferenceOrId, transferCode);
-              showToast("Paystack OTP required. Please enter the OTP.", "warning");
-              return;
-          }
-          
-          await loadPaymentHistory();
-          populatePaymentsTable();
-          updateDashboardStats();
-          showToast(`Payment status: ${status}`, status === "completed" ? "success" : "info", 4000);
+      if (!res.success) {
+          showToast(res.message || "Retry not available yet. Please try again later.", "warning");
           return;
       }
-      showToast("Retry not available yet. Please try again later.", "warning");
+
+      const status = res.data?.payment_status;
+      if (!status) {
+          showToast("Payment status could not be determined. Please try again later.", "warning");
+          return;
+      }
+
+      if (status === "pending_paystack_otp") {
+          const payment = AppState.payments.find(
+              (p) => p.transaction_reference === transactionReferenceOrId || String(p.id) === String(transactionReferenceOrId),
+          );
+          const transferCode = res.data.paystack_transfer_code || payment?.paystack_transfer_code || '';
+          showPaystackOtpModal(transactionReferenceOrId, transferCode);
+          showToast("Paystack OTP required. Please enter the OTP.", "warning");
+          return;
+      }
+
+      await loadPaymentHistory();
+      populatePaymentsTable();
+      updateDashboardStats();
+      showToast(`Payment status: ${status}`, status === "completed" ? "success" : "info", 4000);
+      return;
   } catch (err) {
       console.error("retryPayment error:", err);
       showToast(err.message || "Retry failed", "error");

@@ -1,0 +1,24 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Session Expired</title>
+  <style>
+    body { font-family: Arial, sans-serif; background: #f7f8fb; color: #202020; margin: 0; }
+    .container { max-width: 640px; margin: 80px auto; padding: 24px; background: white; border-radius: 12px; box-shadow: 0 10px 30px rgba(0,0,0,0.08); }
+    h1 { margin-top: 0; color: #111827; }
+    p { line-height: 1.7; }
+    .button { display: inline-block; margin-top: 18px; padding: 12px 20px; background: #2563eb; color: white; text-decoration: none; border-radius: 8px; }
+    .button:hover { background: #1d4ed8; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>Session Expired</h1>
+    <p>{{ message }}</p>
+    <p>{{ detail }}</p>
+    <a class="button" href="/">Refresh page</a>
+  </div>
+</body>
+</html>

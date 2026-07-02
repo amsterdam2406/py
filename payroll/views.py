@@ -29,6 +29,8 @@ from django.template.loader import render_to_string
 from django.utils.html import escape
 from django.utils import timezone
 from django.views.decorators.csrf import csrf_exempt
+from django.views.decorators.http import require_http_methods
+from django.core.exceptions import PermissionDenied
 import requests
 from rest_framework import serializers, status, viewsets
 from rest_framework.authentication import BasicAuthentication, SessionAuthentication
@@ -300,6 +302,49 @@ def _is_paystack_otp_still_valid(payment):
     return transfer_data.get('status') == 'otp'
 
 
+def _is_api_request(request):
+    accept = request.headers.get('Accept', '').lower()
+    if 'application/json' in accept or 'text/json' in accept:
+        return True
+    if request.headers.get('X-Requested-With', '').lower() == 'xmlhttprequest':
+        return True
+    if request.path.startswith('/api/'):
+        return True
+    return False
+
+
+def csrf_failure(request, reason="", template_name=None):
+    message = "Your session has expired. Please refresh the page and try again."
+    detail = "For security reasons, your request could not be completed. Please sign in again if necessary."
+    if _is_api_request(request):
+        return JsonResponse({'error': message, 'detail': detail}, status=403)
+    return render(request, '403_csrf.html', {'message': message, 'detail': detail}, status=403)
+
+
+def _expire_stale_payment(payment):
+    if payment.status == 'pending_paystack_otp' and payment.is_paystack_otp_expired():
+        reason = 'Payment OTP expired. Please retry the payment.'
+        payment.fail_due_to_expiry(reason)
+        logger.warning(
+            'Expired Paystack OTP payment %s after %s minutes',
+            payment.transaction_reference,
+            getattr(settings, 'PAYSTACK_OTP_EXPIRY_MINUTES', 30)
+        )
+        return True
+
+    if payment.is_paystack_status_stale():
+        reason = 'Payment request timed out while waiting for authorization. Please retry.'
+        payment.fail_due_to_expiry(reason)
+        logger.warning(
+            'Expired stale payment %s after %s minutes',
+            payment.transaction_reference,
+            getattr(settings, 'PAYSTACK_STALE_MINUTES', 60)
+        )
+        return True
+
+    return False
+
+
 class DownloadLogSerializer(serializers.ModelSerializer):
     employee_name = serializers.ReadOnlyField(source='employee.name')
     employee_id = serializers.ReadOnlyField(source='employee.employee_id')
@@ -339,7 +384,7 @@ def _friendly_payment_error(result, default='Payment could not be completed. Ple
         nested = message
 
     if is_invalid_recipient_error(result):
-        return 'The payment recipient has been refreshed automatically. Please try again.'
+        return "The employee's payment account needs to be refreshed before payment can continue. Please try again or contact your administrator."
     if 'insufficient' in nested and 'balance' in nested:
         return 'Insufficient Paystack balance. Fund the transfer balance and try again.'
     if error_code in {'rate_limited', 'paystack_rate_limited'} or 'rate limit' in nested:
@@ -868,11 +913,13 @@ def verify_payment_status(request, reference):
         payment = Payment.objects.filter(payment_lookup).order_by('-created_at').first()
 
     if payment.status in ['pending', 'processing', 'pending_paystack_otp'] and payment.payment_method == 'bank_transfer':
-        try:
-            payment = _sync_payment_with_paystack(payment)
-        except Exception as exc:
-            logger.error(f"Payment status polling failed for {reference}: {exc}")
-
+            if _expire_stale_payment(payment):
+                logger.info('Expired stale payment during polling %s', reference)
+            else:
+                try:
+                    payment = _sync_payment_with_paystack(payment)
+                except Exception as exc:
+                    logger.error(f"Payment status polling failed for {reference}: {exc}")
     return Response({
         'status': True,
         'payment_status': payment.status,
@@ -1720,6 +1767,9 @@ class PaymentViewSet(viewsets.ModelViewSet):
     def _paystack_otp_enabled(self):
         return bool(getattr(settings, 'PAYSTACK_TRANSFER_OTP_ENABLED', False))
 
+    def _expire_stale_payment(self, payment):
+        return _expire_stale_payment(payment)
+
     def get_permissions(self):
         if self.action in [
             "initiate_payment",
@@ -1755,6 +1805,9 @@ class PaymentViewSet(viewsets.ModelViewSet):
 
         for payment in syncable_payments:
             try:
+                if _expire_stale_payment(payment):
+                    updated_count += 1
+                    continue
                 before = payment.status
                 synced = _sync_payment_with_paystack(payment)
                 if synced.status != before:
@@ -2997,6 +3050,12 @@ class PaymentViewSet(viewsets.ModelViewSet):
 
         try:
             payment = Payment.objects.get(transaction_reference=reference, status='pending_paystack_otp')
+            if payment.is_paystack_otp_expired():
+                payment.fail_due_to_expiry('Payment OTP expired before it could be completed. Please retry.')
+                return Response(
+                    {'error': 'Payment OTP has expired. Please retry the payment.'},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
             if not payment.paystack_transfer_code:
                 payment.status = 'failed'
                 payment.save()
