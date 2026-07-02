@@ -1,4 +1,4 @@
-from django.test import TestCase
+from django.test import TestCase, override_settings
 from django.utils import timezone
 from django.contrib.auth import get_user_model
 from rest_framework.test import APIClient
@@ -9,6 +9,7 @@ import uuid
 
 User = get_user_model()
 
+@override_settings(SECURE_SSL_REDIRECT=False)
 class DashboardStatsTests(TestCase):
     def setUp(self):
         self.client = APIClient()
@@ -19,21 +20,33 @@ class DashboardStatsTests(TestCase):
         
         # Create sample employees
         self.staff = Employee.objects.create(
-            user=User.objects.create_user(username='staff1', role='staff'),
+            user=User.objects.create_user(username='staff1', email='staff1@test.com', role='staff'),
             name='Staff One',
             type='staff',
             location='Lagos',
             salary=Decimal('50000.00'),
+            phone='08011111111',
+            email='staff1@test.com',
+            bank_name='Access Bank',
+            bank_code='044',
+            account_number='0123456789',
+            account_holder='Staff One',
             status='active',
             join_date=timezone.now().date()
         )
         
         self.guard = Employee.objects.create(
-            user=User.objects.create_user(username='guard1', role='guard'),
+            user=User.objects.create_user(username='guard1', email='guard1@test.com', role='guard'),
             name='Guard One',
             type='guard',
             location='Abuja',
             salary=Decimal('30000.00'),
+            phone='08022222222',
+            email='guard1@test.com',
+            bank_name='Access Bank',
+            bank_code='044',
+            account_number='0123456790',
+            account_holder='Guard One',
             status='active',
             join_date=timezone.now().date()
         )
@@ -58,7 +71,10 @@ class DashboardStatsTests(TestCase):
             payment_month=current_month_key,
             payment_date=today.date(),
             status='completed',
-            transaction_reference=str(uuid.uuid4())
+            transaction_reference=str(uuid.uuid4()),
+            payment_method='bank_transfer',
+            processed_by=self.admin_user,
+            amount_paid=Decimal('45000.00'),
         )
         
         response = self.client.get('/api/employees/dashboard_stats/')
@@ -94,22 +110,22 @@ class DashboardStatsTests(TestCase):
 
     def test_dashboard_stats_deduction_location_filter(self):
         """Verify that deductions are correctly filtered by location"""
-        # Create a pending deduction for Lagos staff
+        # Create an applied deduction for Lagos staff
         Deduction.objects.create(
             employee=self.staff,
             amount=Decimal('500.00'),
             reason='Lagos Deduction',
             date=timezone.now().date(),
-            status='pending'
+            status='applied'
         )
         
-        # Create a pending deduction for Abuja guard
+        # Create an applied deduction for Abuja guard
         Deduction.objects.create(
             employee=self.guard,
             amount=Decimal('200.00'),
             reason='Abuja Deduction',
             date=timezone.now().date(),
-            status='pending'
+            status='applied'
         )
 
         # Statistics for Lagos (should only show Lagos deduction)

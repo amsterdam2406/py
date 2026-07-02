@@ -16,6 +16,7 @@ router.register(r'requests', views.EmployeeRequestViewSet)
 router.register(r'download-logs', views.DownloadLogViewSet, basename='download-logs')
 router.register(r'salary-adjustments', views.EmployeeSalaryAdjustmentViewSet)
 router.register(r'client-payments', views.ClientMonthlyPaymentViewSet)
+router.register(r'employee-balances', views.EmployeeBalanceLedgerViewSet, basename='employee-balances')
 
 urlpatterns = [
     path('', views.frontend, name='frontend'),

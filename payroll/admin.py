@@ -9,8 +9,10 @@ from .models import (
     User, Employee, Attendance, Deduction, 
     Payment, Company, SackedEmployee, Notification, 
     OTP, ExportToken, EmployeeRequest, EmployeeRequestAttachment,
-    DownloadLog, AuditLog
+    DownloadLog, AuditLog, EmployeeBalanceLedger
 )
+from .paystack import PaystackAccountResolutionService
+from .services import paystack_recipient_fingerprint_key
 from django.utils.html import format_html
 
 # ─────────────────────────────────────────────
@@ -186,17 +188,43 @@ class EmployeeAdmin(admin.ModelAdmin):
     search_fields = ['employee_id', 'name', 'email', 'phone']
     date_hierarchy = 'join_date'
     readonly_fields = ['employee_id', 'id_sequence', 'created_at', 'updated_at', 'user']
-    actions = ['clear_verification_cache']
+    actions = ['clear_verification_cache', 'reset_paystack_recipient_codes']
 
     @admin.action(description='Clear Paystack verification cache for selected employees')
     def clear_verification_cache(self, request, queryset):
         count = 0
         for emp in queryset:
             bank_code = emp.bank_code or ""
-            key = f"paystack:resolve:{bank_code}:{emp.account_number}"
-            if cache.delete(key):
-                count += 1
+            account_number = emp.account_number or ""
+            cache.delete_many([
+                PaystackAccountResolutionService.cache_key(bank_code, account_number),
+                PaystackAccountResolutionService.legacy_cache_key(bank_code, account_number),
+            ])
+            count += 1
         self.message_user(request, f"Cleared verification cache for {count} employees.")
+
+    @admin.action(description='Reset Paystack recipient codes for selected employees')
+    def reset_paystack_recipient_codes(self, request, queryset):
+        count = 0
+        for emp in queryset:
+            account_number = str(emp.account_number or "").strip()
+            bank_code = str(emp.bank_code or "").strip()
+            keys = [
+                f"paystack:recipient:{emp.id}",
+                f"paystack_recipient_{emp.id}",
+                paystack_recipient_fingerprint_key(emp),
+            ]
+            if account_number and bank_code:
+                keys.extend([
+                    PaystackAccountResolutionService.cache_key(bank_code, account_number),
+                    PaystackAccountResolutionService.legacy_cache_key(bank_code, account_number),
+                ])
+            cache.delete_many(keys)
+            if emp.paystack_recipient_code:
+                emp.paystack_recipient_code = None
+                emp.save(update_fields=['paystack_recipient_code'])
+                count += 1
+        self.message_user(request, f"Reset Paystack recipient codes for {count} employees.")
 
 
 # ─────────────────────────────────────────────
@@ -260,6 +288,14 @@ class PaymentAdmin(admin.ModelAdmin):
 # ─────────────────────────────────────────────
 # COMPANY ADMIN
 # ─────────────────────────────────────────────
+@admin.register(EmployeeBalanceLedger)
+class EmployeeBalanceLedgerAdmin(admin.ModelAdmin):
+    list_display = ['employee', 'month_key', 'outstanding_balance', 'created_at', 'updated_at']
+    list_filter = ['month_key']
+    search_fields = ['employee__employee_id', 'employee__name', 'employee__email']
+    readonly_fields = ['created_at', 'updated_at']
+
+
 @admin.register(Company)
 class CompanyAdmin(admin.ModelAdmin):
     list_display = ['name', 'location', 'status', 'guards_count', 'payment_to_us', 'profit']

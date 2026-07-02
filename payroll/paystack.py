@@ -9,6 +9,16 @@ from django.core.cache import cache
 logger = logging.getLogger(__name__)
 PAYSTACK_RESOLVE_GLOBAL_COOLDOWN_KEY = "paystack:resolve:global_temporary_unavailable"
 PAYSTACK_ACCOUNT_RESOLVE_TTL_SECONDS = 60 * 60 * 24
+INVALID_RECIPIENT_ERROR_PHRASES = (
+    "recipient is blacklisted",
+    "recipient_not_found",
+    "invalid recipient",
+    "invalid recipient code",
+    "transfer recipient disabled",
+    "recipient unavailable",
+    "recipient does not exist",
+    "recipient not found",
+)
 
 
 def _mask_account_number(account_number):
@@ -20,6 +30,51 @@ def _mask_account_number(account_number):
 
 def _is_live_secret_key(secret_key):
     return str(secret_key or '').startswith('sk_live_')
+
+
+def is_invalid_recipient_error(result):
+    if not isinstance(result, dict):
+        message = str(result or '')
+    else:
+        data = result.get('data')
+        parts = [
+            result.get('message'),
+            result.get('error_code'),
+            result.get('code'),
+        ]
+        if isinstance(data, dict):
+            parts.extend([
+                data.get('message'),
+                data.get('error'),
+                data.get('code'),
+                data.get('type'),
+            ])
+        message = ' '.join(str(part or '') for part in parts)
+    normalized = message.lower()
+    return any(phrase in normalized for phrase in INVALID_RECIPIENT_ERROR_PHRASES)
+
+
+def classify_account_resolution_failure(account_number, bank_code, response_payload=None, secret_key=None):
+    account_number = str(account_number or '').strip()
+    bank_code = str(bank_code or '').strip()
+    message = ''
+    if isinstance(response_payload, dict):
+        message = str(response_payload.get('message') or '').lower()
+
+    if not re.fullmatch(r'\d{10}', account_number):
+        return 'invalid_account_number'
+    if not re.fullmatch(r'\d{3}', bank_code):
+        return 'invalid_bank_code'
+    if bank_code not in globals().get('NIGERIAN_BANKS', {}):
+        return 'unsupported_bank'
+    if secret_key is not None and not _is_live_secret_key(secret_key):
+        return 'configuration_issue'
+    if 'account' in message and ('resolve' in message or 'name' in message):
+        return 'paystack_account_validation_error'
+    if 'bank' in message:
+        return 'paystack_bank_validation_error'
+    return 'paystack_validation_error'
+
 
 def _paystack_error_response(exc, fallback_status='failed'):
     error_payload = None
@@ -157,16 +212,39 @@ class PaystackAccountResolutionService:
         bank_code = str(bank_code or '').strip()
         masked_account = _mask_account_number(account_number)
 
-        if not re.fullmatch(r'\d{10}', account_number) or not re.fullmatch(r'\d{3,6}', bank_code):
+        if not re.fullmatch(r'\d{10}', account_number) or not re.fullmatch(r'\d{3}', bank_code):
+            cause = classify_account_resolution_failure(account_number, bank_code)
+            if cause == 'invalid_bank_code':
+                message = 'We could not validate the selected bank. Please choose a supported bank and try again.'
+            elif cause == 'invalid_account_number':
+                message = 'A valid 10-digit account number is required.'
+            else:
+                message = 'A valid 10-digit account number and Paystack bank code are required.'
             logger.info(
-                "Paystack account resolve rejected invalid input bank_code=%s account=%s",
+                "Paystack account resolve rejected invalid input bank_code=%s account=%s cause=%s",
                 bank_code,
                 masked_account,
+                cause,
             )
             return self._invalid_payload(
                 account_number,
                 bank_code,
-                'A valid 10-digit account number and Paystack bank code are required.',
+                message,
+            )
+
+        known_banks = globals().get('NIGERIAN_BANKS', {})
+        if known_banks and bank_code not in known_banks:
+            cause = classify_account_resolution_failure(account_number, bank_code)
+            logger.warning(
+                "Paystack account resolve rejected unsupported bank_code=%s account=%s cause=%s",
+                bank_code,
+                masked_account,
+                cause,
+            )
+            return self._invalid_payload(
+                account_number,
+                bank_code,
+                'We could not validate the selected bank. Please choose a supported bank and try again.',
             )
 
         if not _is_live_secret_key(self.secret_key):
@@ -236,6 +314,7 @@ class PaystackAccountResolutionService:
         last_error = None
 
         for attempt in range(1, self.max_network_attempts + 1):
+            response = None
             try:
                 response = self._session.get(
                     url,
@@ -278,6 +357,25 @@ class PaystackAccountResolutionService:
                         account_number,
                         bank_code,
                         'Account verification service is temporarily unavailable.',
+                    )
+
+                if response.status_code == 422:
+                    cause = classify_account_resolution_failure(
+                        account_number,
+                        bank_code,
+                        response_payload=response_payload,
+                        secret_key=self.secret_key,
+                    )
+                    logger.warning(
+                        "Paystack account resolve validation failed status_code=422 cause=%s payload=%s response=%s",
+                        cause,
+                        {'account_number': masked_account, 'bank_code': bank_code},
+                        response_payload,
+                    )
+                    return self._invalid_payload(
+                        account_number,
+                        bank_code,
+                        "We couldn't validate the bank account information. Please review the bank details and try again.",
                     )
 
                 if response.status_code >= 400:
@@ -327,6 +425,12 @@ class PaystackAccountResolutionService:
                     bank_code,
                     'Account verification failed due to a temporary network error.',
                 )
+            finally:
+                if response is not None:
+                    try:
+                        response.close()
+                    except Exception:
+                        pass
 
         logger.error(
             "Paystack account resolve network exhausted bank_code=%s account=%s error=%s",
@@ -484,11 +588,11 @@ class PaystackAPI:
             "currency": "NGN"
         }
         logger.info(
-            "[Paystack %s] Creating recipient: %s, Acc: %s, Bank: %s",
+            "Paystack recipient creation request env=%s account=%s bank_code=%s bank_name=%s",
             self.env_label,
-            name,
             _mask_account_number(account_number),
             bank_code,
+            globals().get('NIGERIAN_BANKS', {}).get(str(bank_code), ''),
         )
         
         response = None
@@ -496,9 +600,18 @@ class PaystackAPI:
             response = requests.post(url, json=payload, headers=self.headers, timeout=self.request_timeout)
             response.raise_for_status()
             data = response.json()
+            data = data if isinstance(data, dict) else {}
+            response_data = data.get('data') if isinstance(data.get('data'), dict) else {}
+            logger.info(
+                "Paystack recipient creation response status_code=%s paystack_status=%s recipient_code=%s message=%s",
+                response.status_code,
+                data.get('status'),
+                response_data.get('recipient_code'),
+                data.get('message') or '',
+            )
             if data.get("status"):
-                recipient_code = data.get("data", {}).get("recipient_code")
-                return {"status": True, "recipient_code": recipient_code, "data": data.get("data", {})}
+                recipient_code = response_data.get("recipient_code")
+                return {"status": True, "recipient_code": recipient_code, "data": response_data}
             return {"status": False, "message": data.get("message")}
         except requests.exceptions.RequestException as e:
             logger.error(f"Paystack create recipient error: {e}")
@@ -527,6 +640,9 @@ class PaystackAPI:
         except Exception as e:
             logger.error(f"Paystack get banks error: {e}")
             return {'status': False, 'message': str(e), 'data': []}
+        finally:
+            if response is not None:
+                response.close()
     
     def verify_account(self, account_number, bank_code):
         payload = PaystackAccountResolutionService().resolve(account_number, bank_code)
@@ -540,6 +656,7 @@ class PaystackAPI:
         cached = cache.get(cache_key)
         if cached:
             return cached
+        response = None
         try:
             response = requests.get(url, headers=self.headers, timeout=self.request_timeout)
             response.raise_for_status()
@@ -571,14 +688,30 @@ class PaystackAPI:
             "reason": reason,
         }
         
-        logger.info(f"[Paystack {self.env_label}] Initiating transfer to {recipient_code}. Amount: {amount/100} NGN. Ref: {reference}")
+        logger.info(
+            "Paystack transfer request env=%s recipient_code=%s amount_kobo=%s reference=%s",
+            self.env_label,
+            recipient_code,
+            int(amount),
+            reference,
+        )
 
         response = None
         try:
             response = requests.post(url, json=payload, headers=self.headers, timeout=self.transfer_timeout)
-            logger.debug(f"[Paystack {self.env_label}] Raw Response: {response.text}")
             response.raise_for_status()
-            return response.json()
+            result = response.json()
+            data = result.get('data') if isinstance(result.get('data'), dict) else {}
+            logger.info(
+                "Paystack transfer response status_code=%s paystack_status=%s transfer_status=%s recipient_code=%s reference=%s message=%s",
+                response.status_code,
+                result.get('status') if isinstance(result, dict) else None,
+                data.get('status'),
+                recipient_code,
+                reference,
+                result.get('message') if isinstance(result, dict) else '',
+            )
+            return result
         except requests.exceptions.RequestException as e:
             result = _paystack_error_response(e)
             logger.error(f"Paystack initiate transfer error: {result.get('message')} data={result.get('data')}")

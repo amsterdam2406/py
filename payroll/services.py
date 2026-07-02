@@ -1,10 +1,12 @@
 import logging
+import hashlib
 from decimal import Decimal, InvalidOperation
 import uuid
 import calendar
 from datetime import date
 from django.db import transaction
 from django.db.models import Sum
+from django.core.cache import cache
 from django.utils import timezone
 from .models import (
     Payment,
@@ -17,10 +19,56 @@ from .models import (
     EmployeeSalaryAdjustment,
     AdjustmentType,
 )
-from .paystack import PaystackAPI, NIGERIAN_BANKS
+from .paystack import PaystackAPI, NIGERIAN_BANKS, is_invalid_recipient_error
 
 # l
 logger = logging.getLogger(__name__)
+
+
+def paystack_recipient_fingerprint_key(employee):
+    return f"paystack:recipient:fingerprint:{employee.id}"
+
+
+def paystack_recipient_fingerprint(bank_code, account_number):
+    value = f"{str(bank_code or '').strip()}:{str(account_number or '').strip()}"
+    return hashlib.sha256(value.encode('utf-8')).hexdigest()
+
+
+def is_valid_paystack_bank_code(bank_code):
+    bank_code = str(bank_code or '').strip()
+    return bank_code in NIGERIAN_BANKS
+
+
+def paystack_bank_name(bank_code):
+    return NIGERIAN_BANKS.get(str(bank_code or '').strip(), '')
+
+
+def paystack_bank_code_for_name(bank_name):
+    normalized_name = (bank_name or '').strip().lower()
+    if not normalized_name:
+        return None
+    for code, name in NIGERIAN_BANKS.items():
+        target_name = (name or '').strip().lower()
+        if normalized_name == target_name or normalized_name in target_name or target_name in normalized_name:
+            return code
+    return None
+
+
+def employee_recipient_matches_current_bank_details(employee, bank_code=None):
+    bank_code = str(bank_code or getattr(employee, 'bank_code', '') or '').strip()
+    account_number = str(getattr(employee, 'account_number', '') or '').strip()
+    expected = paystack_recipient_fingerprint(bank_code, account_number)
+    return cache.get(paystack_recipient_fingerprint_key(employee)) == expected
+
+
+def remember_employee_recipient_bank_details(employee, bank_code=None):
+    bank_code = str(bank_code or getattr(employee, 'bank_code', '') or '').strip()
+    account_number = str(getattr(employee, 'account_number', '') or '').strip()
+    cache.set(
+        paystack_recipient_fingerprint_key(employee),
+        paystack_recipient_fingerprint(bank_code, account_number),
+        None,
+    )
 
 def get_employee_bank_code(employee):
     """Return a valid Paystack bank_code for an employee.
@@ -30,27 +78,36 @@ def get_employee_bank_code(employee):
       2) derive from employee.bank_name
     """
 
-    # 1) Prefer stored bank_code, but normalize + validate it
     stored_code = (getattr(employee, 'bank_code', None) or '').strip()
-    if stored_code:
-        # Ensure it's a known Paystack code key
-        if stored_code in NIGERIAN_BANKS:
-            return stored_code
+    derived_code = paystack_bank_code_for_name(getattr(employee, 'bank_name', ''))
 
-    # 2) Derive from bank_name
-    normalized_name = (getattr(employee, 'bank_name', '') or '').strip().lower()
-    for code, name in NIGERIAN_BANKS.items():
-        target_name = (name or '').strip().lower()
-        # Match exact or if the stored name is a substring of the official name (e.g. "GTB" -> "Guaranty Trust Bank")
-        if normalized_name == target_name or normalized_name in target_name or target_name in normalized_name:
+    if derived_code:
+        if stored_code != derived_code:
+            logger.info(
+                "Refreshing employee Paystack bank_code from bank_name employee_id=%s bank_name=%s old_bank_code=%s new_bank_code=%s",
+                getattr(employee, 'id', None),
+                getattr(employee, 'bank_name', ''),
+                stored_code,
+                derived_code,
+            )
             try:
                 if hasattr(employee, 'bank_code'):
-                    employee.bank_code = code
+                    employee.bank_code = derived_code
                     employee.save(update_fields=['bank_code'])
             except Exception:
-                # Keep going even if saving bank_code fails
                 pass
-            return code
+        return derived_code
+
+    if stored_code and stored_code in NIGERIAN_BANKS:
+        return stored_code
+
+    if stored_code:
+        logger.warning(
+            "Rejected invalid stored bank_code employee_id=%s bank_name=%s bank_code=%s",
+            getattr(employee, 'id', None),
+            getattr(employee, 'bank_name', ''),
+            stored_code,
+        )
 
     return None
 
@@ -66,6 +123,13 @@ ACTIVE_DEDUCTION_STATUSES = [
 def _month_end_date(month_key):
     year, month = map(int, month_key.split('-'))
     return date(year, month, calendar.monthrange(year, month)[1])
+
+
+def _next_month_key(month_key):
+    year, month = map(int, month_key.split('-'))
+    if month == 12:
+        return f"{year + 1:04d}-01"
+    return f"{year:04d}-{month + 1:02d}"
 
 
 def applied_deductions_for_month(employee, month_key):
@@ -193,35 +257,13 @@ def approved_adjustment_totals_for_month(employee, month_key):
     return additions, subtractions
 
 
-def outstanding_previous_balance_for_month(employee, month_key):
-    """Return the outstanding balance that should be carried into this month."""
-    # Ledger stores month_key for the ledgered balance of that month.
-    # Carry into current month from previous month ledger row.
-    year, month = map(int, month_key.split('-'))
-    if month == 1:
-        prev_year, prev_month = year - 1, 12
-    else:
-        prev_year, prev_month = year, month - 1
-
-    prev_month_key = f"{prev_year:04d}-{prev_month:02d}"
-    row = EmployeeBalanceLedger.objects.filter(
-        employee=employee,
-        month_key=prev_month_key,
-    ).first()
-    return row.outstanding_balance if row else Decimal('0')
-
-
-def compute_total_salary_payable(employee, month_key):
-    """Compute detailed breakdown and net payable for the month."""
+def _monthly_salary_components(employee, month_key, previous_balance):
     base_salary = Decimal(str(employee.salary))
-
-    # Other Deductions (from Deduction model)
     other_deductions = active_deduction_balance_for_month(employee, month_key)
 
-    # Adjustments (IOU, Bonus, etc.)
     try:
         year, m = map(int, month_key.split('-'))
-    except:
+    except Exception:
         year, m = timezone.now().year, timezone.now().month
 
     adj_qs = EmployeeSalaryAdjustment.objects.filter(
@@ -230,22 +272,66 @@ def compute_total_salary_payable(employee, month_key):
         date_added__year=year,
         date_added__month=m,
     )
-    
+
     try:
         bonus = adj_qs.filter(type__in=[AdjustmentType.BONUS, AdjustmentType.EXTRA_PAYMENT]).aggregate(total=Sum('amount'))['total'] or Decimal('0')
         iou = adj_qs.filter(type__in=[AdjustmentType.IOU, AdjustmentType.LOAN, AdjustmentType.SALARY_ADVANCE]).aggregate(total=Sum('amount'))['total'] or Decimal('0')
-    except:
+    except Exception:
         bonus = Decimal('0')
         iou = Decimal('0')
-    
-    prev_balance = outstanding_previous_balance_for_month(employee, month_key)
 
-    # Total Monthly Due = Base Salary + Bonus + Prev Month Balance (Unpaid)
-    # Deductions are subtracted to get the final net payable
-    final_net_salary = (base_salary + bonus + prev_balance) - (iou + other_deductions)
-    
-    if final_net_salary < 0:
-        final_net_salary = Decimal('0')
+    total_due = (base_salary + bonus + previous_balance) - (iou + other_deductions)
+    if total_due < 0:
+        total_due = Decimal('0')
+
+    return {
+        'base_salary': base_salary,
+        'other_deductions': other_deductions,
+        'bonus': bonus,
+        'iou': iou,
+        'total_due': total_due,
+    }
+
+
+def outstanding_previous_balance_for_month(employee, month_key):
+    """Return the outstanding balance that should be carried into this month."""
+    row = EmployeeBalanceLedger.objects.filter(
+        employee=employee,
+        month_key=month_key,
+    ).first()
+    if row:
+        return row.outstanding_balance
+
+    anchor = EmployeeBalanceLedger.objects.filter(
+        employee=employee,
+        month_key__lt=month_key,
+    ).order_by('-month_key').first()
+    if not anchor:
+        return Decimal('0')
+
+    balance = Decimal(str(anchor.outstanding_balance or 0))
+    cursor = anchor.month_key
+    while cursor < month_key:
+        components = _monthly_salary_components(employee, cursor, balance)
+        paid = Payment.objects.filter(
+            employee=employee,
+            payment_month=cursor,
+            status='completed',
+        ).aggregate(total=Sum('amount_paid'))['total'] or Decimal('0')
+        balance = max(Decimal('0'), components['total_due'] - Decimal(str(paid)))
+        cursor = _next_month_key(cursor)
+    return balance
+
+
+def compute_total_salary_payable(employee, month_key):
+    """Compute detailed breakdown and net payable for the month."""
+    prev_balance = outstanding_previous_balance_for_month(employee, month_key)
+    components = _monthly_salary_components(employee, month_key, prev_balance)
+    base_salary = components['base_salary']
+    other_deductions = components['other_deductions']
+    bonus = components['bonus']
+    iou = components['iou']
+    final_net_salary = components['total_due']
 
     # Sum of all 'completed' payments for this specific month
     total_paid = Payment.objects.filter(
@@ -278,31 +364,49 @@ class PaystackService:
 
     def _validate_paystack_bank_code(self, bank_code, employee):
         bank_code_str = str(bank_code).strip()
-        if not bank_code_str.isdigit() or len(bank_code_str) != 3:
+        if not is_valid_paystack_bank_code(bank_code_str):
             raise ValueError(
-                f"Invalid bank_code for {employee.name}. Expected 3-digit Paystack bank_code, got '{bank_code_str}'."
+                f"Invalid bank code for {employee.name}. Please select a supported Paystack bank and try again."
             )
         return bank_code_str
 
+    def invalidate_recipient(self, employee, reason=''):
+        recipient_code = getattr(employee, 'paystack_recipient_code', None)
+        employee.paystack_recipient_code = None
+        employee.save(update_fields=['paystack_recipient_code'])
+        cache.delete_many([
+            f"paystack:recipient:{employee.id}",
+            f"paystack_recipient_{employee.id}",
+            paystack_recipient_fingerprint_key(employee),
+        ])
+        logger.warning(
+            "Invalidated Paystack recipient employee_id=%s recipient_code=%s reason=%s",
+            employee.id,
+            recipient_code,
+            reason,
+        )
+
     def get_or_create_recipient(self, employee):
         recipient_code = getattr(employee, 'paystack_recipient_code', None)
-        if not recipient_code:
-            bank_code = get_employee_bank_code(employee)
+        bank_code = get_employee_bank_code(employee)
+
+        if not bank_code:
+            bank_name = (getattr(employee, 'bank_name', None) or '').strip()
+            if bank_name:
+                derived = get_employee_bank_code(employee)
+                if derived:
+                    bank_code = derived
 
             if not bank_code:
-                # If employee.bank_code isn't set (or wasn't recognized), try deriving it from bank_name.
-                # This prevents blocking transfers due to stale/missing bank_code.
-                bank_name = (getattr(employee, 'bank_name', None) or '').strip()
-                if bank_name:
-                    derived = get_employee_bank_code(employee)
-                    if derived:
-                        bank_code = derived
+                raise ValueError(f"Employee {employee.name} bank code is missing or unsupported.")
 
-                if not bank_code:
-                    raise ValueError(f"Employee {employee.name} bank_code is missing.")
+        bank_code_str = self._validate_paystack_bank_code(bank_code, employee)
 
-            bank_code_str = self._validate_paystack_bank_code(bank_code, employee)
+        if recipient_code and not employee_recipient_matches_current_bank_details(employee, bank_code_str):
+            self.invalidate_recipient(employee, reason='stale_bank_details')
+            recipient_code = None
 
+        if not recipient_code:
             result = self.paystack.create_recipient(
 
                 name=employee.name,
@@ -319,6 +423,7 @@ class PaystackService:
                 raise Exception("Failed to create recipient: missing recipient code")
             employee.paystack_recipient_code = recipient_code
             employee.save(update_fields=['paystack_recipient_code'])
+            remember_employee_recipient_bank_details(employee, bank_code_str)
         return recipient_code
 
 
@@ -375,9 +480,19 @@ class PaystackService:
                 reason=f"Salary - {employee.name} ({employee.employee_id})"
             )
 
+            if not transfer_result.get('status') and is_invalid_recipient_error(transfer_result):
+                self.invalidate_recipient(employee, reason='paystack_invalid_recipient')
+                recipient_code = self.get_or_create_recipient(employee)
+                transfer_result = self.paystack.initiate_transfer(
+                    amount=int((amount_paid or net_salary) * 100),
+                    recipient_code=recipient_code,
+                    reference=payment.transaction_reference,
+                    reason=f"Salary - {employee.name} ({employee.employee_id})"
+                )
+
             if not transfer_result.get('status'):
                 payment.change_status('failed')
-                raise Exception(f"Transfer failed: {transfer_result.get('message')}")
+                raise Exception("Transfer failed. Please try again or contact your administrator.")
             
             return payment, transfer_result
 
@@ -425,6 +540,19 @@ class PaystackService:
 
         if transfers_payload:
             bulk_result = self.paystack.bulk_transfer(transfers_payload)
+            if not bulk_result.get('status') and is_invalid_recipient_error(bulk_result):
+                refreshed_payload = []
+                for payment in payments_created:
+                    employee = payment.employee
+                    self.invalidate_recipient(employee, reason='paystack_bulk_invalid_recipient')
+                    recipient_code = self.get_or_create_recipient(employee)
+                    refreshed_payload.append({
+                        "amount": int(payment.net_amount * 100),
+                        "recipient": recipient_code,
+                        "reference": payment.transaction_reference,
+                        "reason": f"Salary - {employee.name} ({employee.employee_id})"
+                    })
+                bulk_result = self.paystack.bulk_transfer(refreshed_payload)
             return payments_created, total_amount, errors, bulk_result
         return [], 0, errors, None
 

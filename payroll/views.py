@@ -73,10 +73,15 @@ from .serializers import (
     PaystackResolveAccountSerializer,
 )
 
-from .paystack import PaystackAPI, PaystackAccountResolutionService
+from .paystack import PaystackAPI, PaystackAccountResolutionService, is_invalid_recipient_error
 from .services import (
     applied_deductions_for_month,
     get_employee_bank_code,
+    employee_recipient_matches_current_bank_details,
+    is_valid_paystack_bank_code,
+    paystack_bank_name,
+    paystack_recipient_fingerprint_key,
+    remember_employee_recipient_bank_details,
     compute_total_salary_payable,
     outstanding_previous_balance_for_month,
     approved_adjustment_totals_for_month,
@@ -255,6 +260,8 @@ def _apply_paystack_transfer_result(payment, transfer_data, save=True):
 
     if save:
         payment.save(update_fields=['status', 'paystack_reference', 'paystack_transfer_code', 'updated_at'])
+        if payment.status == 'completed':
+            _carry_forward_partial_payment_balance(payment)
     return payment
 
 
@@ -329,6 +336,8 @@ def _friendly_payment_error(result, default='Payment could not be completed. Ple
         error_code = ''
         message = str(result or '').lower()
 
+    if is_invalid_recipient_error(result):
+        return "The employee's payment account needs to be refreshed before payment can continue. Please try again or contact your administrator."
     if 'insufficient' in message and 'balance' in message:
         return 'Insufficient Paystack balance. Fund the transfer balance and try again.'
     if error_code in {'rate_limited', 'paystack_rate_limited'} or 'rate limit' in message:
@@ -1796,25 +1805,42 @@ class PaymentViewSet(viewsets.ModelViewSet):
         This prevents failures like "Cannot resolve account" from surfacing as
         an opaque recipient-creation error.
         """
-        recipient_code = getattr(employee, 'paystack_recipient_code', None)
-        if recipient_code:
-            return recipient_code
-
         bank_code = get_employee_bank_code(employee)
         if not bank_code:
-            raise ValueError(f"Employee {employee.name} bank_code is missing.")
+            raise ValueError(f"Employee {employee.name} bank code is missing or unsupported.")
 
         bank_code_str = str(bank_code).strip()
-        if not bank_code_str.isdigit() or len(bank_code_str) != 3:
+        if not is_valid_paystack_bank_code(bank_code_str):
             raise ValueError(
-                f"Invalid bank_code for {employee.name}. Expected 3-digit Paystack bank_code, got '{bank_code_str}'."
+                f"Invalid bank code for {employee.name}. Please select a supported Paystack bank and try again."
             )
 
         account_number = getattr(employee, 'account_number', None)
         if not account_number:
             raise ValueError(f"Employee {employee.name} account_number is missing.")
 
+        recipient_code = getattr(employee, 'paystack_recipient_code', None)
+        if recipient_code:
+            if employee_recipient_matches_current_bank_details(employee, bank_code_str):
+                logger.info(
+                    "Reusing Paystack recipient for current bank details employee_id=%s bank_name=%s bank_code=%s recipient_code=%s",
+                    employee.id,
+                    getattr(employee, 'bank_name', '') or paystack_bank_name(bank_code_str),
+                    bank_code_str,
+                    recipient_code,
+                )
+                return recipient_code
+            self._invalidate_paystack_recipient(employee, reason='stale_bank_details', bank_code=bank_code_str)
+
         # 1) Verify/resolve account on Paystack first
+        masked_account = f"{'*' * max(0, len(str(account_number)) - 4)}{str(account_number)[-4:]}"
+        logger.info(
+            "Paystack account resolve preflight employee_id=%s bank_name=%s bank_code=%s account=%s",
+            employee.id,
+            getattr(employee, 'bank_name', '') or paystack_bank_name(bank_code_str),
+            bank_code_str,
+            masked_account,
+        )
         resolve_result = paystack.verify_account(str(account_number), bank_code_str)
         if resolve_result.get('status') is False:
             # Preserve structured rate-limit information.
@@ -1829,7 +1855,16 @@ class PaymentViewSet(viewsets.ModelViewSet):
                     retry_after,
                 )
             else:
-                raise ValueError(f"Paystack account resolve failed: {msg}")
+                logger.warning(
+                    "Paystack account resolve failed employee_id=%s bank_name=%s bank_code=%s account=%s error_code=%s message=%s",
+                    employee.id,
+                    getattr(employee, 'bank_name', ''),
+                    bank_code_str,
+                    masked_account,
+                    error_code,
+                    msg,
+                )
+                raise ValueError("We couldn't verify the employee's bank account details. Please confirm the account number and selected bank before trying again.")
 
 
         # Optional: you can enforce account_holder match here if desired
@@ -1850,7 +1885,40 @@ class PaymentViewSet(viewsets.ModelViewSet):
 
         employee.paystack_recipient_code = recipient_code
         employee.save(update_fields=['paystack_recipient_code'])
+        remember_employee_recipient_bank_details(employee, bank_code_str)
         return recipient_code
+
+    def _recipient_cache_keys(self, employee, bank_code=None):
+        account_number = str(getattr(employee, 'account_number', '') or '').strip()
+        bank_code = str(bank_code or getattr(employee, 'bank_code', '') or '').strip()
+        keys = [
+            f"paystack:recipient:{employee.id}",
+            f"paystack_recipient_{employee.id}",
+            paystack_recipient_fingerprint_key(employee),
+        ]
+        if account_number and bank_code:
+            keys.extend([
+                PaystackAccountResolutionService.cache_key(bank_code, account_number),
+                PaystackAccountResolutionService.legacy_cache_key(bank_code, account_number),
+            ])
+        return keys
+
+    def _invalidate_paystack_recipient(self, employee, reason='', bank_code=None):
+        recipient_code = getattr(employee, 'paystack_recipient_code', None)
+        account_number = str(getattr(employee, 'account_number', '') or '')
+        masked_account = f"{'*' * max(0, len(account_number) - 4)}{account_number[-4:]}" if account_number else '****'
+        employee.paystack_recipient_code = None
+        employee.save(update_fields=['paystack_recipient_code'])
+        cache.delete_many(self._recipient_cache_keys(employee, bank_code=bank_code))
+        logger.warning(
+            "Invalidated Paystack recipient employee_id=%s recipient_code=%s bank_name=%s bank_code=%s account=%s reason=%s",
+            employee.id,
+            recipient_code,
+            getattr(employee, 'bank_name', ''),
+            bank_code or getattr(employee, 'bank_code', ''),
+            masked_account,
+            reason,
+        )
 
     def _send_internal_payment_otp(self, user, reference, payments, subject='Internal Payment Verification OTP'):
         if not user.email:
@@ -1996,8 +2064,44 @@ class PaymentViewSet(viewsets.ModelViewSet):
 
         Payment.objects.filter(id__in=transfer_payment_ids, status='pending').update(status='processing')
         bulk_result = paystack.bulk_transfer(transfers_payload)
-        data = bulk_result.get('data', {}) if isinstance(bulk_result.get('data'), dict) else {}
         target_payments = list(Payment.objects.filter(id__in=transfer_payment_ids).select_related('employee'))
+
+        if not bulk_result.get('status') and is_invalid_recipient_error(bulk_result):
+            logger.warning(
+                "Paystack bulk transfer rejected recipient; retrying once payment_ids=%s result=%s",
+                [str(payment_id) for payment_id in transfer_payment_ids],
+                bulk_result,
+            )
+            refreshed_payload = []
+            try:
+                for payment in target_payments:
+                    employee = payment.employee
+                    self._invalidate_paystack_recipient(employee, reason='paystack_bulk_invalid_recipient')
+                    recipient_code = self._get_or_create_paystack_recipient(employee, paystack)
+                    amount_to_pay = payment.amount_paid if payment.amount_paid is not None else payment.net_amount
+                    refreshed_payload.append({
+                        "amount": int(amount_to_pay * 100),
+                        "recipient": recipient_code,
+                        "reference": payment.transaction_reference,
+                        "reason": f"Salary - {employee.name} ({employee.employee_id})",
+                    })
+            except ValueError as exc:
+                Payment.objects.filter(id__in=transfer_payment_ids, status='processing').update(status='failed')
+                logger.warning(
+                    "Paystack bulk recipient refresh failed after invalid recipient payment_ids=%s error=%s",
+                    [str(payment_id) for payment_id in transfer_payment_ids],
+                    exc,
+                )
+                errors.append('One or more payment recipients could not be refreshed. Please confirm employee bank details and try again.')
+                return {
+                    'message': 'Bulk transfer failed.',
+                    'errors': errors,
+                    'payments': [],
+                    'status': 'failed',
+                }
+            bulk_result = paystack.bulk_transfer(refreshed_payload)
+
+        data = bulk_result.get('data', {}) if isinstance(bulk_result.get('data'), dict) else {}
 
         if not bulk_result.get('status'):
             Payment.objects.filter(id__in=transfer_payment_ids, status='processing').update(status='failed')
@@ -2090,6 +2194,40 @@ class PaymentViewSet(viewsets.ModelViewSet):
             reference=payment.transaction_reference,
             reason=f"Salary - {employee.name} ({employee.employee_id})"
         )
+
+        if not transfer_result.get('status') and is_invalid_recipient_error(transfer_result):
+            logger.warning(
+                "Paystack transfer rejected recipient; retrying once payment_id=%s employee_id=%s recipient_code=%s result=%s",
+                payment.id,
+                employee.id,
+                recipient_code,
+                transfer_result,
+            )
+            self._invalidate_paystack_recipient(employee, reason='paystack_invalid_recipient', bank_code=bank_code)
+            try:
+                recipient_code = self._get_or_create_paystack_recipient(employee, paystack)
+            except ValueError as exc:
+                payment.status = 'failed'
+                payment.save(update_fields=['status', 'updated_at'])
+                logger.warning(
+                    "Paystack recipient refresh failed after invalid recipient payment_id=%s employee_id=%s error=%s",
+                    payment.id,
+                    employee.id,
+                    exc,
+                )
+                return False, str(exc)
+            logger.info(
+                "Retrying Paystack transfer with refreshed recipient payment_id=%s employee_id=%s recipient_code=%s",
+                payment.id,
+                employee.id,
+                recipient_code,
+            )
+            transfer_result = paystack.initiate_transfer(
+                amount=int(transfer_amount * 100),
+                recipient_code=recipient_code,
+                reference=payment.transaction_reference,
+                reason=f"Salary - {employee.name} ({employee.employee_id})"
+            )
 
         if transfer_result.get('status'):
             data = transfer_result.get('data', {})
@@ -3836,6 +3974,22 @@ class ClientMonthlyPaymentViewSet(viewsets.ModelViewSet):
             status=self._payment_status(amount_paid, amount_due),
             outstanding_balance=max(0, amount_due - amount_paid)
         )
+
+
+class EmployeeBalanceLedgerViewSet(viewsets.ReadOnlyModelViewSet):
+    serializer_class = EmployeeBalanceLedgerSerializer
+    permission_classes = [IsAuthenticated, IsPayrollAdmin]
+    filterset_fields = ['employee', 'month_key']
+    search_fields = ['employee__employee_id', 'employee__name', 'employee__email']
+    ordering_fields = ['month_key', 'outstanding_balance', 'created_at']
+    ordering = ['-month_key', 'employee__employee_id']
+
+    def get_queryset(self):
+        queryset = EmployeeBalanceLedger.objects.select_related('employee').order_by('-month_key', 'employee__employee_id')
+        outstanding_only = self.request.query_params.get('outstanding_only')
+        if str(outstanding_only).lower() in {'1', 'true', 'yes'}:
+            queryset = queryset.filter(outstanding_balance__gt=0)
+        return queryset
 
     def perform_update(self, serializer):
         instance = serializer.instance
