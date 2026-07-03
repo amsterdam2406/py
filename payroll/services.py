@@ -114,7 +114,8 @@ def get_employee_bank_code(employee):
 
 
 ACTIVE_DEDUCTION_STATUSES = [
-    DeductionStatus.PENDING,
+    # Only deductions that have been approved/applied or are partially recovered
+    # should reduce the employee's salary. Pending deductions are not yet active.
     DeductionStatus.PARTIAL,
     DeductionStatus.APPLIED,
 ]

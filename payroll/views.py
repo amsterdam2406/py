@@ -201,7 +201,7 @@ def _apply_paystack_transfer_result(payment, transfer_data, save=True):
     we immediately verify the transfer and complete/failed automatically.
     """
     transfer_data = transfer_data if isinstance(transfer_data, dict) else {}
-    transfer_status = transfer_data.get('status')
+    transfer_status = str(transfer_data.get('status') or '').lower()
     original_status = payment.status
     paystack_ref = _paystack_reference_from_data(transfer_data)
     transfer_code = _paystack_transfer_code_from_data(transfer_data)
@@ -217,6 +217,9 @@ def _apply_paystack_transfer_result(payment, transfer_data, save=True):
             # keep transfer_data as-is; mapping uses paystack_ref/paystack_code above.
             pass
 
+    failed_statuses = {'failed', 'reversed', 'rejected', 'returned'}
+    non_terminal_statuses = {'pending', 'processing', 'queued', 'received'}
+
     # If Paystack says OTP, verify again and auto-resolve if already successful.
     if transfer_status == 'otp':
         try:
@@ -224,11 +227,11 @@ def _apply_paystack_transfer_result(payment, transfer_data, save=True):
                 verify = PaystackAPI().verify_transfer(payment.transaction_reference)
                 if verify.get('status') is True:
                     verified_data = verify.get('data') if isinstance(verify.get('data'), dict) else {}
-                    verified_status = verified_data.get('status')
+                    verified_status = str(verified_data.get('status') or '').lower()
                     if verified_status == 'success':
                         payment.status = 'completed'
                         transfer_data = verified_data
-                    elif verified_status in ['failed', 'reversed']:
+                    elif verified_status in failed_statuses:
                         payment.status = 'failed'
                         transfer_data = verified_data
                     else:
@@ -245,11 +248,11 @@ def _apply_paystack_transfer_result(payment, transfer_data, save=True):
     # Terminal outcomes: never keep stuck in processing.
     elif transfer_status == 'success':
         payment.status = 'completed'
-    elif transfer_status in ['failed', 'reversed']:
+    elif transfer_status in failed_statuses:
         payment.status = 'failed'
 
     # Non-terminal states: allow processing.
-    elif transfer_status in ['pending', 'processing', 'queued', 'received']:
+    elif transfer_status in non_terminal_statuses:
         payment.status = 'processing'
 
     elif transfer_status:
@@ -658,7 +661,7 @@ def paystack_webhook(request):
 
         if event == 'transfer.success':
             _handle_transfer_success(data)
-        elif event == 'transfer.failed':
+        elif event in ['transfer.failed', 'transfer.rejected', 'transfer.returned']:
             _handle_transfer_failed(data)
         elif event == 'transfer.reversed':
             _handle_transfer_reversed(data)
@@ -2196,9 +2199,12 @@ class PaymentViewSet(viewsets.ModelViewSet):
                         continue
 
                     transfer_status = str(transfer.get('status') or '').lower()
+                    failed_statuses = {'failed', 'reversed', 'rejected', 'returned'}
+                    in_progress_statuses = {'pending', 'processing', 'queued', 'received'}
+
                     if transfer_status == 'success':
                         payment.status = 'completed'
-                    elif transfer_status in ['failed', 'reversed']:
+                    elif transfer_status in failed_statuses:
                         payment.status = 'failed'
                         any_failed = True
                     elif transfer_status == 'otp':
@@ -2208,7 +2214,7 @@ class PaymentViewSet(viewsets.ModelViewSet):
                         else:
                             payment.status = 'failed'
                             any_failed = True
-                    elif transfer_status in ['pending', 'processing', 'queued', 'received']:
+                    elif transfer_status in in_progress_statuses:
                         payment.status = 'processing'
                         all_completed = False
                     else:
