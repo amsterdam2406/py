@@ -968,11 +968,15 @@ class Payment(TimeStampedModel):
     transaction_reference = models.CharField(max_length=100, unique=True, db_index=True)
     paystack_reference = models.CharField(max_length=100, blank=True, null=True)
     paystack_transfer_code = models.CharField(max_length=100, blank=True, null=True)
+    failure_reason = models.TextField(blank=True, null=True)
+    paystack_last_status = models.CharField(max_length=50, blank=True, null=True)
+    paystack_last_response = models.JSONField(blank=True, null=True)
     status = models.CharField(
         max_length=25,
         choices=PaymentStatus.choices,
         default=PaymentStatus.PENDING
     )
+
     remaining_balance = models.DecimalField(
         max_digits=10, decimal_places=2, default=0,
         validators=[MinValueValidator(0)],
@@ -1143,6 +1147,10 @@ class Payment(TimeStampedModel):
         return self.updated_at + timedelta(minutes=stale_minutes) <= timezone.now()
 
     def fail_due_to_expiry(self, reason):
+        """Mark the payment failed due to expiry (OTP or stale auth).
+
+        Must only update real model fields (failure_reason already exists).
+        """
         if self.status not in [
             PaymentStatus.PENDING,
             PaymentStatus.PROCESSING,
@@ -1150,9 +1158,11 @@ class Payment(TimeStampedModel):
         ]:
             return False
         self.status = PaymentStatus.FAILED
-        self.termination_reason = reason
-        self.save(update_fields=['status', 'termination_reason', 'updated_at'])
+        self.failure_reason = reason
+        self.save(update_fields=['status', 'failure_reason', 'updated_at'])
         return True
+
+
 
     @transaction.atomic
     def mark_as_paid(self, amount=None):

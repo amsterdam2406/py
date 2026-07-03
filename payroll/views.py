@@ -210,6 +210,13 @@ def _apply_paystack_transfer_result(payment, transfer_data, save=True):
         payment.paystack_reference = paystack_ref
     if transfer_code:
         payment.paystack_transfer_code = transfer_code
+
+    # Always store latest raw Paystack outcome for troubleshooting.
+    if transfer_status:
+        payment.paystack_last_status = transfer_status
+    if isinstance(transfer_data, dict) and transfer_data:
+        payment.paystack_last_response = transfer_data
+
     if transfer_status in [None, ''] and isinstance(transfer_data.get('data'), dict):
         # Defensive: in case nested structure exists.
         transfer_status = transfer_data.get('data', {}).get('status')
@@ -234,6 +241,7 @@ def _apply_paystack_transfer_result(payment, transfer_data, save=True):
                     elif verified_status in failed_statuses:
                         payment.status = 'failed'
                         transfer_data = verified_data
+                        payment.failure_reason = 'Paystack transfer failed'
                     else:
                         # Still shows OTP-required state -> keep awaiting OTP
                         payment.status = 'pending_paystack_otp'
@@ -250,6 +258,7 @@ def _apply_paystack_transfer_result(payment, transfer_data, save=True):
         payment.status = 'completed'
     elif transfer_status in failed_statuses:
         payment.status = 'failed'
+        payment.failure_reason = 'Paystack transfer failed'
 
     # Non-terminal states: allow processing.
     elif transfer_status in non_terminal_statuses:
@@ -262,9 +271,23 @@ def _apply_paystack_transfer_result(payment, transfer_data, save=True):
             transfer_status,
             original_status,
         )
+        # Unknown statuses should remain processing temporarily; stale/expiry logic will finalize it.
+        payment.status = 'processing'
+    else:
+        # No recognizable status: safest is processing; stale-payment logic will eventually fail it.
+        payment.status = 'processing'
 
     if save:
-        payment.save(update_fields=['status', 'paystack_reference', 'paystack_transfer_code', 'updated_at'])
+        update_fields = [
+            'status',
+            'paystack_reference',
+            'paystack_transfer_code',
+            'paystack_last_status',
+            'paystack_last_response',
+            'failure_reason',
+            'updated_at',
+        ]
+        payment.save(update_fields=update_fields)
         if payment.status == 'completed':
             _carry_forward_partial_payment_balance(payment)
     return payment
@@ -796,7 +819,10 @@ def _handle_transfer_failed(data):
             payment.paystack_reference = _paystack_reference_from_data(data) or payment.paystack_reference
             payment.paystack_transfer_code = _paystack_transfer_code_from_data(data) or payment.paystack_transfer_code
             payment.status = 'failed'
-            payment.save(update_fields=['status', 'paystack_reference', 'paystack_transfer_code', 'updated_at'])
+            payment.failure_reason = 'Paystack transfer failed'
+            payment.paystack_last_status = str(data.get('status') or 'failed')
+            payment.paystack_last_response = data
+            payment.save(update_fields=['status', 'paystack_reference', 'paystack_transfer_code', 'failure_reason', 'paystack_last_status', 'paystack_last_response', 'updated_at'])
             
             # Keep deductions as 'pending' unless they are cancelled manually by deduction admin.
 
@@ -836,7 +862,10 @@ def _handle_transfer_reversed(data):
             payment.paystack_reference = _paystack_reference_from_data(data) or payment.paystack_reference
             payment.paystack_transfer_code = _paystack_transfer_code_from_data(data) or payment.paystack_transfer_code
             payment.status = 'failed'
-            payment.save(update_fields=['status', 'paystack_reference', 'paystack_transfer_code', 'updated_at'])
+            payment.failure_reason = 'Paystack transfer reversed'
+            payment.paystack_last_status = str(data.get('status') or 'reversed')
+            payment.paystack_last_response = data
+            payment.save(update_fields=['status', 'paystack_reference', 'paystack_transfer_code', 'failure_reason', 'paystack_last_status', 'paystack_last_response', 'updated_at'])
 
             Notification.objects.create(
                 user=payment.employee.user,
@@ -2109,7 +2138,10 @@ class PaymentViewSet(viewsets.ModelViewSet):
                 recipient_code = self._get_or_create_paystack_recipient(employee, paystack)
             except ValueError as e:
                 payment.status = 'failed'
-                payment.save(update_fields=['status', 'updated_at'])
+                payment.failure_reason = 'Paystack recipient setup failure'
+                payment.paystack_last_status = 'recipient_setup_failed'
+                payment.paystack_last_response = {'error': str(e)}
+                payment.save(update_fields=['status', 'failure_reason', 'paystack_last_status', 'paystack_last_response', 'updated_at'])
                 logger.warning(
                     "Skipping bulk payment after Paystack recipient setup failure payment_id=%s employee_id=%s error=%s",
                     payment.id,
@@ -2162,19 +2194,24 @@ class PaymentViewSet(viewsets.ModelViewSet):
                         "reason": f"Salary - {employee.name} ({employee.employee_id})",
                     })
             except ValueError as exc:
-                Payment.objects.filter(id__in=transfer_payment_ids, status='processing').update(status='failed')
-                logger.warning(
-                    "Paystack bulk recipient refresh failed after invalid recipient payment_ids=%s error=%s",
-                    [str(payment_id) for payment_id in transfer_payment_ids],
-                    exc,
-                )
-                errors.append('One or more payment recipients could not be refreshed. Please confirm employee bank details and try again.')
-                return {
-                    'message': 'Bulk transfer failed.',
-                    'errors': errors,
-                    'payments': [],
-                    'status': 'failed',
-                }
+                    Payment.objects.filter(id__in=transfer_payment_ids, status='processing').update(
+                        status='failed',
+                        failure_reason='Paystack bulk recipient refresh failed',
+                        paystack_last_status='bulk_recipient_refresh_failed',
+                        paystack_last_response={'error': str(exc)},
+                    )
+                    logger.warning(
+                        "Paystack bulk recipient refresh failed after invalid recipient payment_ids=%s error=%s",
+                        [str(payment_id) for payment_id in transfer_payment_ids],
+                        exc,
+                    )
+                    errors.append('One or more payment recipients could not be refreshed. Please confirm employee bank details and try again.')
+                    return {
+                        'message': 'Bulk transfer failed.',
+                        'errors': errors,
+                        'payments': [],
+                        'status': 'failed',
+                    }
             bulk_result = paystack.bulk_transfer(refreshed_payload)
 
         data = bulk_result.get('data', {}) if isinstance(bulk_result.get('data'), dict) else {}
@@ -2405,7 +2442,10 @@ class PaymentViewSet(viewsets.ModelViewSet):
             }
         else:
             payment.status = 'failed'
-            payment.save(update_fields=['status', 'updated_at'])
+            payment.failure_reason = 'Paystack transfer initiation failed'
+            payment.paystack_last_status = str((transfer_result or {}).get('status') or 'failed')
+            payment.paystack_last_response = transfer_result
+            payment.save(update_fields=['status', 'failure_reason', 'paystack_last_status', 'paystack_last_response', 'updated_at'])
             logger.error(
                 "Paystack transfer initiation failed payment_id=%s reference=%s result=%s",
                 payment.id,
