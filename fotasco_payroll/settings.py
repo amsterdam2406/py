@@ -172,11 +172,12 @@ CSRF_FAILURE_VIEW = 'payroll.views.csrf_failure'
 # DATABASE (Supabase PostgreSQL)
 # ============================================
 
-DATABASE_URL = os.environ.get("DATABASE_URL")
+DATABASE_URL = config("DATABASE_URL", default=None)
+
 
 if DATABASE_URL:
     DATABASES = {
-        'default': dj_database_url.config(
+        "default": dj_database_url.config(
             default=DATABASE_URL,
             conn_max_age=300,
             conn_health_checks=False,
@@ -184,17 +185,17 @@ if DATABASE_URL:
         )
     }
 
-    DATABASES['default']['OPTIONS'] = {
-        'connect_timeout': 10,
+    DATABASES["default"]["OPTIONS"] = {
+        "connect_timeout": 10,
     }
-
 else:
     DATABASES = {
-        'default': {
-            'ENGINE': 'django.db.backends.sqlite3',
-            'NAME': BASE_DIR / 'db.sqlite3',
+        "default": {
+            "ENGINE": "django.db.backends.sqlite3",
+            "NAME": BASE_DIR / "db.sqlite3",
         }
     }
+
 
 # ============================================
 # REDIS & CELERY
@@ -363,19 +364,19 @@ DEFAULT_FROM_EMAIL = f"{RESEND_SENDER_NAME} <{RESEND_SENDER_EMAIL}>"
 INTERNAL_PAYMENT_OTP_EXPIRY_SECONDS = config('INTERNAL_PAYMENT_OTP_EXPIRY_SECONDS', default=60, cast=int)
 PAYSTACK_TRANSFER_OTP_ENABLED = config('PAYSTACK_TRANSFER_OTP_ENABLED', default=False, cast=bool)
 
-if EMAIL_BACKEND == 'payroll.email_backend.ResendEmailBackend':
-    missing_resend_settings = [
-        name for name, value in {
-            'RESEND_API_KEY': RESEND_API_KEY,
-            'RESEND_SENDER_EMAIL': RESEND_SENDER_EMAIL,
-        }.items()
-        if not str(value or '').strip()
-    ]
-    if missing_resend_settings:
-        raise ImproperlyConfigured(
-            "Resend email configuration is incomplete. Missing required environment variable(s): "
-            + ", ".join(missing_resend_settings)
-        )
+# if EMAIL_BACKEND == 'payroll.email_backend.ResendEmailBackend':
+#     missing_resend_settings = [
+#         name for name, value in {
+#             'RESEND_API_KEY': RESEND_API_KEY,
+#             'RESEND_SENDER_EMAIL': RESEND_SENDER_EMAIL,
+#         }.items()
+#         if not str(value or '').strip()
+#     ]
+#     if missing_resend_settings:
+#         raise ImproperlyConfigured(
+#             "Resend email configuration is incomplete. Missing required environment variable(s): "
+#             + ", ".join(missing_resend_settings)
+#         )
 
 
 # ============================================
