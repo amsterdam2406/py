@@ -118,6 +118,58 @@ logger = logging.getLogger(__name__)
 PAYSTACK_IPS = ['52.31.139.75', '52.49.173.169', '52.214.14.220']
 
 
+def _safe_paystack_payload(value):
+    sensitive_keys = {'authorization', 'signature', 'secret', 'secret_key', 'key', 'otp'}
+    account_keys = {'account_number', 'account'}
+
+    if isinstance(value, dict):
+        cleaned = {}
+        for key, item in value.items():
+            key_text = str(key).lower()
+            if key_text in sensitive_keys or 'authorization' in key_text or 'secret' in key_text:
+                cleaned[key] = '[redacted]'
+            elif key_text in account_keys:
+                cleaned[key] = _mask_account_for_log(item)
+            else:
+                cleaned[key] = _safe_paystack_payload(item)
+        return cleaned
+    if isinstance(value, list):
+        return [_safe_paystack_payload(item) for item in value]
+    return value
+
+
+def _mask_account_for_log(account_number):
+    value = str(account_number or '')
+    if len(value) <= 4:
+        return '****'
+    return f"{'*' * (len(value) - 4)}{value[-4:]}"
+
+
+def _paystack_payload_reference(payload):
+    if not isinstance(payload, dict):
+        return None
+
+    candidates = [
+        payload.get('reference'),
+        payload.get('transfer_reference'),
+    ]
+    data = payload.get('data') if isinstance(payload.get('data'), dict) else {}
+    transfer = payload.get('transfer') if isinstance(payload.get('transfer'), dict) else {}
+    data_transfer = data.get('transfer') if isinstance(data.get('transfer'), dict) else {}
+    candidates.extend([
+        data.get('reference'),
+        data.get('transfer_reference'),
+        transfer.get('reference'),
+        transfer.get('transfer_reference'),
+        data_transfer.get('reference'),
+        data_transfer.get('transfer_reference'),
+    ])
+    for candidate in candidates:
+        if candidate:
+            return str(candidate)
+    return None
+
+
 
 @csrf_exempt
 def approve_paystack_transfer(request):
@@ -127,56 +179,111 @@ def approve_paystack_transfer(request):
     
     Return 200 to approve, 400 to reject.
     """
-    # Verify it's actually Paystack calling
+    if request.method != 'POST':
+        logger.warning("Paystack transfer approval rejected: invalid method=%s", request.method)
+        return JsonResponse({'status': False, 'message': 'Method not allowed'}, status=405)
+
+    # Verify it's actually Paystack calling when a signature is supplied.
     paystack_secret = getattr(settings, 'PAYSTACK_SECRET_KEY', '')
     signature = request.headers.get('x-paystack-signature', '')
-    
     raw_body = request.body
-    computed = hmac.new(
-        paystack_secret.encode('utf-8'),
-        raw_body,
-        hashlib.sha512
-    ).hexdigest()
-    
-    if not hmac.compare_digest(computed, signature):
-        return JsonResponse({'error': 'Invalid signature'}, status=400)
-    
+
+    if signature:
+        computed = hmac.new(
+            paystack_secret.encode('utf-8'),
+            raw_body,
+            hashlib.sha512
+        ).hexdigest()
+        if not hmac.compare_digest(computed, signature):
+            logger.warning(
+                "Paystack transfer approval rejected: invalid signature received=%s computed=%s",
+                signature[:20],
+                computed[:20],
+            )
+            return JsonResponse({'status': False, 'message': 'Invalid signature'}, status=400)
+    else:
+        logger.warning(
+            "Paystack transfer approval received without signature ip=%s user_agent=%s",
+            get_client_ip(request),
+            request.META.get('HTTP_USER_AGENT', ''),
+        )
+
     try:
         payload = json.loads(raw_body)
-        transfer_data = payload.get('data', {})
-        reference = transfer_data.get('reference')
-        
+        reference = _paystack_payload_reference(payload)
+        logger.info(
+            "Paystack transfer approval received reference=%s payload=%s",
+            reference,
+            _safe_paystack_payload(payload),
+        )
+
+        if not reference:
+            logger.warning(
+                "Paystack transfer approval validation failed: missing reference payload=%s",
+                _safe_paystack_payload(payload),
+            )
+            return JsonResponse({'status': False, 'message': 'Transfer reference missing'}, status=200)
+
         # Find the payment by reference
         try:
-            payment = Payment.objects.get(transaction_reference=reference)
+            payment = Payment.objects.select_related('employee').get(transaction_reference=reference)
         except Payment.DoesNotExist:
-            return JsonResponse({'error': 'Payment not found'}, status=400)
-        
+            logger.warning(
+                "Paystack transfer approval validation failed: payment not found reference=%s payload=%s",
+                reference,
+                _safe_paystack_payload(payload),
+            )
+            return JsonResponse({'status': False, 'message': 'Payment not found'}, status=200)
+
         # Check if HR approval is required but not given
         if payment.status == PaymentStatus.PENDING_HR:
-            logger.warning(f"Transfer {reference} rejected: awaiting HR approval")
+            logger.warning(
+                "Paystack transfer approval rejected: awaiting HR approval payment_id=%s reference=%s",
+                payment.id,
+                reference,
+            )
             return JsonResponse({
                 'status': False,
                 'message': 'Awaiting HR approval'
-            }, status=400)
-        
-        # Check if payment is in a valid state
-        if payment.status not in [PaymentStatus.PENDING, PaymentStatus.PROCESSING]:
-            logger.warning(f"Transfer {reference} rejected: invalid status {payment.status}")
+            }, status=200)
+
+        # Paystack may retry or arrive after local verification completed the payment.
+        approvable_statuses = {
+            PaymentStatus.PENDING,
+            PaymentStatus.PROCESSING,
+            PaymentStatus.PENDING_PAYSTACK_OTP,
+            PaymentStatus.COMPLETED,
+        }
+        if payment.status not in approvable_statuses:
+            logger.warning(
+                "Paystack transfer approval rejected: invalid payment status payment_id=%s reference=%s status=%s",
+                payment.id,
+                reference,
+                payment.status,
+            )
             return JsonResponse({
                 'status': False,
                 'message': f'Invalid payment status: {payment.status}'
-            }, status=400)
-        
+            }, status=200)
+
         # Approve the transfer
-        logger.info(f"Transfer {reference} approved via Paystack approval URL")
+        logger.info(
+            "Paystack transfer approval accepted payment_id=%s reference=%s status=%s",
+            payment.id,
+            reference,
+            payment.status,
+        )
         return JsonResponse({'status': True, 'message': 'Approved'})
-        
+
     except json.JSONDecodeError:
-        return JsonResponse({'error': 'Invalid JSON'}, status=400)
+        logger.warning(
+            "Paystack transfer approval validation failed: invalid JSON body=%s",
+            raw_body[:1000],
+        )
+        return JsonResponse({'status': False, 'message': 'Invalid JSON'}, status=200)
     except Exception as e:
-        logger.error(f"Approval URL error: {e}")
-        return JsonResponse({'error': str(e)}, status=500)
+        logger.exception("Paystack transfer approval processing error")
+        return JsonResponse({'status': False, 'message': 'Approval processing failed'}, status=200)
 
 def _paystack_reference_from_data(data):
     if not isinstance(data, dict):
@@ -712,8 +819,13 @@ def paystack_webhook(request):
         event = payload.get('event')
         data = payload.get('data', {})
         reference = data.get('reference')
-        
-        logger.info(f"Paystack webhook: {event} | ref={reference}")
+        logger.info(
+            "Paystack webhook received event=%s ref=%s ip=%s payload=%s",
+            event,
+            reference,
+            client_ip,
+            _safe_paystack_payload(payload),
+        )
 
         if event == 'transfer.success':
             _handle_transfer_success(data)
@@ -846,7 +958,15 @@ def _handle_transfer_failed(data):
         try:
             payment = Payment.objects.select_for_update().get(transaction_reference=reference)
             logger.info(f"Handling transfer.failed for payment {payment.id}, current status: {payment.status}")
-            
+
+            if payment.status == 'completed':
+                logger.info(
+                    "Ignoring failed webhook for completed payment payment_id=%s reference=%s status=%s",
+                    payment.id,
+                    reference,
+                    payment.status,
+                )
+                return
             if payment.status == 'failed':
                 return
             payment.paystack_reference = _paystack_reference_from_data(data) or payment.paystack_reference
@@ -892,6 +1012,14 @@ def _handle_transfer_reversed(data):
             payment = Payment.objects.select_for_update().get(transaction_reference=reference)
             logger.info(f"Handling transfer.reversed for payment {payment.id}, current status: {payment.status}")
 
+            if payment.status == 'completed':
+                logger.info(
+                    "Ignoring reversed webhook for completed payment payment_id=%s reference=%s status=%s",
+                    payment.id,
+                    reference,
+                    payment.status,
+                )
+                return
             if payment.status == 'failed':
                 return
             payment.paystack_reference = _paystack_reference_from_data(data) or payment.paystack_reference

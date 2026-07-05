@@ -56,6 +56,27 @@ def _paystack_error_text(result):
     return _flatten_paystack_error_text(parts)
 
 
+def _paystack_error_code(result):
+    if not isinstance(result, dict):
+        return ''
+
+    candidates = [
+        result.get('error_code'),
+        result.get('code'),
+    ]
+    data = result.get('data')
+    if isinstance(data, dict):
+        candidates.extend([data.get('error_code'), data.get('code')])
+    meta = result.get('meta')
+    if isinstance(meta, dict):
+        candidates.extend([meta.get('error_code'), meta.get('code')])
+
+    for candidate in candidates:
+        if candidate:
+            return str(candidate)
+    return ''
+
+
 def is_invalid_recipient_error(result):
     if isinstance(result, dict):
         meta = result.get('meta')
@@ -116,9 +137,11 @@ def _paystack_error_response(exc, fallback_status='failed'):
         if isinstance(error_payload, dict) and error_payload.get('message')
         else str(exc)
     )
+    error_code = _paystack_error_code(error_payload) if isinstance(error_payload, dict) else ''
     return {
         'status': False,
         'message': message,
+        'error_code': error_code or 'paystack_api_error',
         'data': error_payload if error_payload is not None else {'status': fallback_status},
     }
 
@@ -640,8 +663,14 @@ class PaystackAPI:
                 return {"status": True, "recipient_code": recipient_code, "data": response_data}
             return {"status": False, "message": data.get("message")}
         except requests.exceptions.RequestException as e:
-            logger.error(f"Paystack create recipient error: {e}")
-            return _paystack_error_response(e)
+            result = _paystack_error_response(e)
+            logger.error(
+                "Paystack create recipient error message=%s error_code=%s data=%s",
+                result.get('message'),
+                result.get('error_code'),
+                result.get('data'),
+            )
+            return result
         except Exception as e:
             logger.error(f"Paystack create recipient error: {e}")
             return {"status": False, "message": str(e)}
@@ -740,7 +769,12 @@ class PaystackAPI:
             return result
         except requests.exceptions.RequestException as e:
             result = _paystack_error_response(e)
-            logger.error(f"Paystack initiate transfer error: {result.get('message')} data={result.get('data')}")
+            logger.error(
+                "Paystack initiate transfer error message=%s error_code=%s data=%s",
+                result.get('message'),
+                result.get('error_code'),
+                result.get('data'),
+            )
             return result
         except Exception as e:
             logger.error(f"Paystack initiate transfer unexpected error: {e}")
@@ -764,7 +798,12 @@ class PaystackAPI:
             return response.json()
         except requests.exceptions.RequestException as e:
             result = _paystack_error_response(e)
-            logger.error(f"Paystack bulk transfer error: {result.get('message')} payload={result.get('data')}")
+            logger.error(
+                "Paystack bulk transfer error message=%s error_code=%s payload=%s",
+                result.get('message'),
+                result.get('error_code'),
+                result.get('data'),
+            )
             return result
         except Exception as e:
             logger.error(f"Paystack bulk transfer unexpected error: {e}")
@@ -783,7 +822,12 @@ class PaystackAPI:
             return response.json()
         except requests.exceptions.RequestException as e:
             result = _paystack_error_response(e)
-            logger.error(f"Paystack verify transfer error: {result.get('message')} data={result.get('data')}")
+            logger.error(
+                "Paystack verify transfer error message=%s error_code=%s data=%s",
+                result.get('message'),
+                result.get('error_code'),
+                result.get('data'),
+            )
             return result
         except Exception as e:
             logger.error(f"Paystack verify transfer unexpected error: {e}")
