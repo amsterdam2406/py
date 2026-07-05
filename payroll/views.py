@@ -75,7 +75,7 @@ from .serializers import (
     PaystackResolveAccountSerializer,
 )
 
-from .paystack import PaystackAPI, PaystackAccountResolutionService, is_invalid_recipient_error, _paystack_error_text
+from .paystack import PaystackAPI, PaystackAccountResolutionService, is_invalid_recipient_error, is_blacklisted_recipient_error, _paystack_error_text
 from .services import (
     applied_deductions_for_month,
     get_employee_bank_code,
@@ -259,6 +259,8 @@ def _apply_paystack_transfer_result(payment, transfer_data, save=True):
     elif transfer_status in failed_statuses:
         payment.status = 'failed'
         payment.failure_reason = 'Paystack transfer failed'
+        if is_invalid_recipient_error(transfer_data):
+            _clear_employee_paystack_recipient(payment.employee, reason='paystack_transfer_failed_invalid_recipient')
 
     # Non-terminal states: allow processing.
     elif transfer_status in non_terminal_statuses:
@@ -409,6 +411,8 @@ def _friendly_payment_error(result, default='Payment could not be completed. Ple
         message = str(result or '').lower()
         nested = message
 
+    if is_blacklisted_recipient_error(result):
+        return "This employee's bank details need to be refreshed before payment can continue."
     if is_invalid_recipient_error(result):
         return "The employee's payment account needs to be refreshed before payment can continue. Please try again or contact your administrator."
     if 'insufficient' in nested and 'balance' in nested:
@@ -426,6 +430,35 @@ def _friendly_payment_error(result, default='Payment could not be completed. Ple
     if 'network' in nested or 'connection' in nested or 'temporarily unavailable' in nested:
         return 'Payment service is temporarily unavailable. Please try again.'
     return default
+
+
+def _clear_employee_paystack_recipient(employee, reason=''):
+    recipient_code = getattr(employee, 'paystack_recipient_code', None)
+    if not recipient_code:
+        return
+
+    account_number = str(getattr(employee, 'account_number', '') or '').strip()
+    bank_code = str(get_employee_bank_code(employee) or getattr(employee, 'bank_code', '') or '').strip()
+    keys = [
+        f"paystack:recipient:{employee.id}",
+        f"paystack_recipient_{employee.id}",
+        paystack_recipient_fingerprint_key(employee),
+    ]
+    if account_number and bank_code:
+        keys.extend([
+            PaystackAccountResolutionService.cache_key(bank_code, account_number),
+            PaystackAccountResolutionService.legacy_cache_key(bank_code, account_number),
+        ])
+
+    employee.paystack_recipient_code = None
+    employee.save(update_fields=['paystack_recipient_code'])
+    cache.delete_many(keys)
+    logger.warning(
+        "Cleared Paystack recipient after invalid-recipient failure employee_id=%s recipient_code=%s reason=%s",
+        employee.id,
+        recipient_code,
+        reason,
+    )
 
 
 class InternalPaymentOtpVerifySerializer(serializers.Serializer):
@@ -822,6 +855,8 @@ def _handle_transfer_failed(data):
             payment.failure_reason = 'Paystack transfer failed'
             payment.paystack_last_status = str(data.get('status') or 'failed')
             payment.paystack_last_response = data
+            if is_invalid_recipient_error(data):
+                _clear_employee_paystack_recipient(payment.employee, reason='paystack_webhook_failed_invalid_recipient')
             payment.save(update_fields=['status', 'paystack_reference', 'paystack_transfer_code', 'failure_reason', 'paystack_last_status', 'paystack_last_response', 'updated_at'])
             
             # Keep deductions as 'pending' unless they are cancelled manually by deduction admin.
@@ -2213,6 +2248,12 @@ class PaymentViewSet(viewsets.ModelViewSet):
                         'status': 'failed',
                     }
             bulk_result = paystack.bulk_transfer(refreshed_payload)
+            if is_invalid_recipient_error(bulk_result):
+                for payment in target_payments:
+                    self._invalidate_paystack_recipient(
+                        payment.employee,
+                        reason='paystack_bulk_invalid_recipient_after_refresh',
+                    )
 
         data = bulk_result.get('data', {}) if isinstance(bulk_result.get('data'), dict) else {}
 
@@ -2262,6 +2303,11 @@ class PaymentViewSet(viewsets.ModelViewSet):
 
                     if payment.status == 'failed':
                         reason = transfer.get('reason') or transfer.get('message') or 'Bulk transfer failed for this payment.'
+                        if is_invalid_recipient_error(transfer):
+                            self._invalidate_paystack_recipient(
+                                payment.employee,
+                                reason='paystack_bulk_transfer_item_invalid_recipient',
+                            )
                         transfer_errors.append(_friendly_payment_error({'message': reason}, default=reason))
 
                     if payment.status != 'completed':
@@ -2441,6 +2487,12 @@ class PaymentViewSet(viewsets.ModelViewSet):
                 'status': payment.status
             }
         else:
+            if is_invalid_recipient_error(transfer_result):
+                self._invalidate_paystack_recipient(
+                    employee,
+                    reason='paystack_invalid_recipient_after_refresh',
+                    bank_code=bank_code,
+                )
             payment.status = 'failed'
             payment.failure_reason = 'Paystack transfer initiation failed'
             payment.paystack_last_status = str((transfer_result or {}).get('status') or 'failed')
@@ -4203,3 +4255,4 @@ class EmployeeBalanceLedgerViewSet(viewsets.ReadOnlyModelViewSet):
             status=self._payment_status(amount_paid, amount_due),
             outstanding_balance=max(0, amount_due - amount_paid)
         )
+

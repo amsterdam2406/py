@@ -945,6 +945,36 @@ function formatApiError(data, fallback) {
 }
 window.formatApiError = formatApiError;
 
+function sanitizePaymentError(message) {
+  const text = String(message || "").trim();
+  if (!text) return "Payment could not be completed. Please try again later.";
+
+  const lower = text.toLowerCase();
+  if (
+    lower.includes("blacklisted") ||
+    lower.includes("blacklistedrecipients") ||
+    lower.includes("invalid recipient") ||
+    lower.includes("recipient code") ||
+    lower.includes("recipient_not_found")
+  ) {
+    return "This employee's bank details need to be refreshed before payment can continue.";
+  }
+  if (
+    lower.includes("account could not be verified") ||
+    lower.includes("couldn't verify") ||
+    lower.includes("could not validate") ||
+    lower.includes("invalid account")
+  ) {
+    return "The bank account could not be verified. Please contact your administrator.";
+  }
+  if (/^\s*[\[{]/.test(text) || /status['"]?\s*:|traceback|exception|stack|paystack_last_response/i.test(text)) {
+    return "Payment could not be completed. Please try again later.";
+  }
+
+  return text;
+}
+window.sanitizePaymentError = sanitizePaymentError;
+
 async function apiRequest(url, options = {}) {
   // FIXED: Ensure proper URL construction
   const baseUrl = window.location.origin;
@@ -3522,7 +3552,7 @@ async function processBulkPayment() {
     });
 
     if (!res.success) {
-      throw new Error(res.message || "Bulk payment failed");
+      throw new Error(sanitizePaymentError(res.message || "Bulk payment failed"));
     }
 
     const results = res.data || {};
@@ -3565,7 +3595,7 @@ async function processBulkPayment() {
     }
   } catch (err) {
     console.error("Bulk payment error:", err);
-    showToast(err.message || "Bulk payment failed", "error");
+    showToast(sanitizePaymentError(err.message || "Bulk payment failed"), "error");
   } finally {
     hideLoading(btn);
   }
@@ -3715,7 +3745,7 @@ async function initiateIndividualPayment(empId) {
         });
 
         if (!res.success) {
-            const detail = formatApiError(res.data, res.message || "Failed to initiate payment");
+            const detail = sanitizePaymentError(formatApiError(res.data, res.message || "Failed to initiate payment"));
             const err = new Error(detail || "Failed to initiate payment");
             err.raw = res;
             throw err;
@@ -3744,7 +3774,7 @@ async function initiateIndividualPayment(empId) {
         await updateDashboardStats();
         startPaymentStatusPolling(reference);
     } catch (err) {
-        let errorMsg = err.message || "Failed to initiate payment";
+        let errorMsg = sanitizePaymentError(err.message || "Failed to initiate payment");
 
         if (errorMsg.includes("bank_code is missing")) {
             showToast("Bank Code missing. Redirecting to edit employee record...", "warning", 5000);
@@ -3951,16 +3981,16 @@ async function submitPaystackOtp(e) {
             }
         } else {
             if (res.data?.paystack_otp_required) {
-                showToast(res.message || "Invalid OTP. Please try again.", "error");
+                showToast(sanitizePaymentError(res.message || "Invalid OTP. Please try again."), "error");
                 document.getElementById("paystackOtpInput").value = "";
                 document.getElementById("paystackOtpInput").focus();
             } else {
-                showToast(res.message || "OTP verification failed", "error");
+                showToast(sanitizePaymentError(res.message || "OTP verification failed"), "error");
                 closeModal("paystackOtpModal");
             }
         }
     } catch (err) {
-        showToast(err.message || "Failed to verify OTP", "error");
+        showToast(sanitizePaymentError(err.message || "Failed to verify OTP"), "error");
     } finally {
         hideLoading(btn);
     }

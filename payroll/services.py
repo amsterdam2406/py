@@ -492,6 +492,8 @@ class PaystackService:
                 )
 
             if not transfer_result.get('status'):
+                if is_invalid_recipient_error(transfer_result):
+                    self.invalidate_recipient(employee, reason='paystack_invalid_recipient_after_refresh')
                 payment.change_status('failed')
                 raise Exception("Transfer failed. Please try again or contact your administrator.")
             
@@ -554,6 +556,12 @@ class PaystackService:
                         "reason": f"Salary - {employee.name} ({employee.employee_id})"
                     })
                 bulk_result = self.paystack.bulk_transfer(refreshed_payload)
+                if not bulk_result.get('status') and is_invalid_recipient_error(bulk_result):
+                    for payment in payments_created:
+                        self.invalidate_recipient(
+                            payment.employee,
+                            reason='paystack_bulk_invalid_recipient_after_refresh',
+                        )
             return payments_created, total_amount, errors, bulk_result
         return [], 0, errors, None
 

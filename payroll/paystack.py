@@ -68,6 +68,18 @@ def is_invalid_recipient_error(result):
     return any(phrase in normalized for phrase in INVALID_RECIPIENT_ERROR_PHRASES)
 
 
+def is_blacklisted_recipient_error(result):
+    if isinstance(result, dict):
+        meta = result.get('meta')
+        if isinstance(meta, dict):
+            blacklisted = meta.get('blacklistedRecipients')
+            if isinstance(blacklisted, (list, tuple)) and len(blacklisted) > 0:
+                return True
+
+    normalized = _paystack_error_text(result).lower()
+    return "recipient is blacklisted" in normalized or "blacklistedrecipient" in normalized
+
+
 def classify_account_resolution_failure(account_number, bank_code, response_payload=None, secret_key=None):
     account_number = str(account_number or '').strip()
     bank_code = str(bank_code or '').strip()
