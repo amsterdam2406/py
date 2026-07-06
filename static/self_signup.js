@@ -62,6 +62,13 @@
     return message || fallback;
   }
 
+  function validateSignupEmail(value) {
+    const email = String(value || '').trim().toLowerCase();
+    if (!email) return 'Email address is required.';
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return 'Enter a valid email address.';
+    return '';
+  }
+
   // Wire up the static modal's close button and backdrop click
   function initSelfSignupModal() {
     const modal = document.getElementById('selfSignupModal');
@@ -124,6 +131,12 @@
         account_number: getVal('signupAccountNumber'),
         account_holder: getVal('signupAccountHolder')
       };
+
+      const emailError = validateSignupEmail(payload.email);
+      if (emailError) {
+        notify(emailError, 'warning');
+        return;
+      }
 
       // Basic client-side validation for missing fields
       const requiredBank = ['bank_name', 'bank_code', 'account_number', 'account_holder'];

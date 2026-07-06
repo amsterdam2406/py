@@ -1232,6 +1232,8 @@ class EmployeeViewSet(viewsets.ModelViewSet):
     def get_queryset(self):
         user = self.request.user
         if user.is_superuser or user.role == 'admin' or getattr(user, 'is_hr_admin', False) or getattr(user, 'is_employee_admin', False):
+            if self.action == 'retrieve':
+                return Employee.objects.all().order_by('-created_at')
             return Employee.objects.filter(status__in=['active', 'pending']).order_by('-created_at')
         return Employee.objects.filter(user=user).order_by('-created_at')
 
@@ -2289,239 +2291,91 @@ class PaymentViewSet(viewsets.ModelViewSet):
             otp_obj.save(update_fields=['is_used', 'updated_at'])
             return True, None
 
-    def _execute_bulk_paystack_transfer(self, payments):
-        paystack = PaystackAPI()
-        transfers_payload = []
-        errors = []
-        transfer_payment_ids = []
+    def _bulk_payment_summary(self, payments, total_selected=None, skipped_count=0):
+        payment_list = list(payments)
+        successful = sum(1 for payment in payment_list if payment.status == 'completed')
+        failed = sum(1 for payment in payment_list if payment.status == 'failed') + skipped_count
+        pending_statuses = {'pending', 'processing', 'pending_paystack_otp', 'pending_hr'}
+        pending = sum(1 for payment in payment_list if payment.status in pending_statuses)
+        total_paid = sum(
+            (payment.amount_paid if payment.amount_paid is not None else payment.net_amount)
+            for payment in payment_list
+            if payment.status == 'completed'
+        )
+        return {
+            'total_employees': total_selected if total_selected is not None else len(payment_list) + skipped_count,
+            'successful': successful,
+            'failed': failed,
+            'pending': pending,
+            'total_amount_paid': float(total_paid or 0),
+        }
 
-        for payment in payments:
+    def _bulk_payment_rows(self, payments):
+        return [
+            {
+                'employee_id': payment.employee.employee_id,
+                'employee_name': payment.employee.name,
+                'reference': payment.transaction_reference,
+                'status': payment.status,
+                'failure_reason': payment.failure_reason or '',
+                'amount': float(payment.amount_paid if payment.amount_paid is not None else payment.net_amount),
+            }
+            for payment in payments
+        ]
+
+    def _execute_bulk_paystack_transfer(self, payments):
+        target_payments = list(payments)
+        errors = []
+        paystack_otp_payment = None
+
+        for payment in target_payments:
             employee = payment.employee
-            try:
-                recipient_code = self._get_or_create_paystack_recipient(employee, paystack)
-            except ValueError as e:
+            bank_code = get_employee_bank_code(employee)
+            if not bank_code:
                 payment.status = 'failed'
-                payment.failure_reason = 'Paystack recipient setup failure'
-                payment.paystack_last_status = 'recipient_setup_failed'
-                payment.paystack_last_response = {'error': str(e)}
+                payment.failure_reason = 'Employee bank code is missing. Update the employee bank details and try again.'
                 payment.save(update_fields=['status', 'failure_reason', 'paystack_last_status', 'paystack_last_response', 'updated_at'])
-                logger.warning(
-                    "Skipping bulk payment after Paystack recipient setup failure payment_id=%s employee_id=%s error=%s",
-                    payment.id,
-                    employee.id,
-                    e,
-                )
-                errors.append(f"{employee.name}: Payment recipient could not be verified.")
+                errors.append(f"{employee.name}: {payment.failure_reason}")
                 continue
 
-            amount_to_pay = payment.amount_paid if payment.amount_paid is not None else payment.net_amount
-            transfers_payload.append({
-                "amount": int(amount_to_pay * 100),
-                "recipient": recipient_code,
-                "reference": payment.transaction_reference,
-                "reason": f"Salary - {employee.name} ({employee.employee_id})",
-            })
-            transfer_payment_ids.append(payment.id)
+            success, result = self._execute_paystack_transfer(payment, employee, bank_code)
+            if not success:
+                friendly_reason = _friendly_payment_error(result)
+                payment.refresh_from_db()
+                payment.failure_reason = friendly_reason
+                payment.save(update_fields=['failure_reason', 'updated_at'])
+                errors.append(f"{employee.name}: {friendly_reason}")
+                continue
 
-        if not transfers_payload:
-            return {
-                'message': 'No transfers were sent to Paystack.',
-                'errors': errors,
-                'payments': [],
-                'status': 'failed',
-            }
+            payment.refresh_from_db()
+            if payment.status == 'pending_paystack_otp' and paystack_otp_payment is None:
+                paystack_otp_payment = payment
 
-        Payment.objects.filter(id__in=transfer_payment_ids, status='pending').update(status='processing')
-        bulk_result = paystack.bulk_transfer(transfers_payload)
-        target_payments = list(Payment.objects.filter(id__in=transfer_payment_ids).select_related('employee'))
-        payments_by_id = {payment.id: payment for payment in target_payments}
-        target_payments = [payments_by_id[payment_id] for payment_id in transfer_payment_ids if payment_id in payments_by_id]
+        summary = self._bulk_payment_summary(target_payments)
+        if paystack_otp_payment:
+            message = 'Some transfers require Paystack OTP. Completed and failed payments have been recorded.'
+        elif summary['failed'] and (summary['successful'] or summary['pending']):
+            message = 'Bulk payment completed with some failed payments.'
+        elif summary['failed']:
+            message = 'Bulk payment failed for all selected employees.'
+        else:
+            message = 'Bulk payment processing completed.'
 
-        if is_invalid_recipient_error(bulk_result):
-            logger.warning(
-                "Paystack bulk transfer rejected recipient; clearing stored recipients and retrying once payment_ids=%s result=%s",
-                [str(payment_id) for payment_id in transfer_payment_ids],
-                bulk_result,
-            )
-            refreshed_payload = []
-            try:
-                for payment in target_payments:
-                    employee = payment.employee
-                    self._invalidate_paystack_recipient(employee, reason='paystack_bulk_invalid_recipient')
-                    recipient_code = self._get_or_create_paystack_recipient(employee, paystack)
-                    amount_to_pay = payment.amount_paid if payment.amount_paid is not None else payment.net_amount
-                    refreshed_payload.append({
-                        "amount": int(amount_to_pay * 100),
-                        "recipient": recipient_code,
-                        "reference": payment.transaction_reference,
-                        "reason": f"Salary - {employee.name} ({employee.employee_id})",
-                    })
-            except ValueError as exc:
-                    Payment.objects.filter(id__in=transfer_payment_ids, status='processing').update(
-                        status='failed',
-                        failure_reason='Paystack bulk recipient refresh failed',
-                        paystack_last_status='bulk_recipient_refresh_failed',
-                        paystack_last_response={'error': str(exc)},
-                    )
-                    logger.warning(
-                        "Paystack bulk recipient refresh failed after invalid recipient payment_ids=%s error=%s",
-                        [str(payment_id) for payment_id in transfer_payment_ids],
-                        exc,
-                    )
-                    errors.append('One or more payment recipients could not be refreshed. Please confirm employee bank details and try again.')
-                    return {
-                        'message': 'Bulk transfer failed.',
-                        'errors': errors,
-                        'payments': [],
-                        'status': 'failed',
-                    }
-            bulk_result = paystack.bulk_transfer(refreshed_payload)
-            if is_invalid_recipient_error(bulk_result):
-                for payment in target_payments:
-                    self._invalidate_paystack_recipient(
-                        payment.employee,
-                        reason='paystack_bulk_invalid_recipient_after_refresh',
-                    )
-
-        data = bulk_result.get('data', {}) if isinstance(bulk_result.get('data'), dict) else {}
-
-        if isinstance(data, dict):
-            transfers = data.get('transfers')
-            if isinstance(transfers, list):
-                transfer_errors = []
-                any_failed = False
-                all_completed = True
-
-                for transfer in transfers:
-                    reference = transfer.get('reference')
-                    if not reference:
-                        continue
-
-                    payment = next(
-                        (p for p in target_payments if p.transaction_reference == reference),
-                        None,
-                    )
-                    if not payment:
-                        continue
-
-                    transfer_status = str(transfer.get('status') or '').lower()
-                    failed_statuses = {'failed', 'reversed', 'rejected', 'returned'}
-                    in_progress_statuses = {'pending', 'processing', 'queued', 'received'}
-
-                    if transfer_status == 'success':
-                        payment.status = 'completed'
-                    elif transfer_status in failed_statuses:
-                        payment.status = 'failed'
-                        any_failed = True
-                    elif transfer_status == 'otp':
-                        if self._paystack_otp_enabled():
-                            payment.status = 'pending_paystack_otp'
-                            all_completed = False
-                        else:
-                            payment.status = 'failed'
-                            any_failed = True
-                    elif transfer_status in in_progress_statuses:
-                        payment.status = 'processing'
-                        all_completed = False
-                    else:
-                        payment.status = 'processing'
-                        all_completed = False
-
-                    payment.save(update_fields=['status', 'updated_at'])
-
-                    if payment.status == 'failed':
-                        reason = transfer.get('reason') or transfer.get('message') or 'Bulk transfer failed for this payment.'
-                        if is_invalid_recipient_error(transfer):
-                            self._invalidate_paystack_recipient(
-                                payment.employee,
-                                reason='paystack_bulk_transfer_item_invalid_recipient',
-                            )
-                        transfer_errors.append(_friendly_payment_error({'message': reason}, default=reason))
-
-                    if payment.status != 'completed':
-                        all_completed = False
-
-                if any_failed or all_completed:
-                    errors.extend(transfer_errors)
-                    response_status = 'failed' if any_failed else 'completed'
-                    response_message = (
-                        'Bulk transfer completed with some failed payments.'
-                        if any_failed
-                        else 'Bulk transfer completed successfully.'
-                    )
-                    return {
-                        'message': response_message,
-                        'paystack_otp_required': False,
-                        'status': response_status,
-                        'errors': errors,
-                        'payments': [
-                            {
-                                'employee_id': p.employee.employee_id,
-                                'employee_name': p.employee.name,
-                                'reference': p.transaction_reference,
-                                'status': p.status,
-                            }
-                            for p in target_payments
-                        ],
-                    }
-
-        if not bulk_result.get('status'):
-            Payment.objects.filter(id__in=transfer_payment_ids, status='processing').update(status='failed')
-            logger.error(
-                "Paystack bulk transfer failed payment_ids=%s result=%s",
-                [str(payment_id) for payment_id in transfer_payment_ids],
-                bulk_result,
-            )
-            errors.append(_friendly_payment_error(bulk_result, default='Bulk transfer could not be completed. Please try again.'))
-            return {
-                'message': 'Bulk transfer failed.',
-                'errors': errors,
-                'payments': [],
-                'status': 'failed',
-            }
-
-        if data.get('status') == 'otp':
-            if not self._paystack_otp_enabled():
-                Payment.objects.filter(id__in=transfer_payment_ids).update(status='failed')
-                logger.error(
-                    "Paystack returned OTP for bulk transfer while PAYSTACK_TRANSFER_OTP_ENABLED is disabled payment_ids=%s",
-                    transfer_payment_ids,
-                )
-                return {
-                    'message': 'Payment could not continue because Paystack requires an OTP for this transfer.',
-                    'paystack_otp_required': False,
-                    'status': 'failed',
-                    'errors': errors,
-                    'payments': [],
-                }
-
-            transfer_code = data.get('transfer_code')
-            Payment.objects.filter(id__in=transfer_payment_ids).update(
-                status='pending_paystack_otp',
-                paystack_transfer_code=transfer_code,
-            )
-            return {
-                'message': 'Paystack requires OTP to authorize this bulk transfer batch.',
-                'paystack_otp_required': True,
-                'paystack_transfer_code': transfer_code,
-                'reference': target_payments[0].transaction_reference if target_payments else None,
-                'status': 'pending_paystack_otp',
-                'errors': errors,
-            }
+        response_status = 'completed'
+        if summary['failed'] and not (summary['successful'] or summary['pending']):
+            response_status = 'failed'
+        elif summary['pending'] or summary['failed']:
+            response_status = 'processing'
 
         return {
-            'message': f'Initiated {len(target_payments)} salary transfers.',
-            'paystack_otp_required': False,
-            'status': 'processing',
+            'message': message,
+            'paystack_otp_required': bool(paystack_otp_payment),
+            'paystack_transfer_code': paystack_otp_payment.paystack_transfer_code if paystack_otp_payment else None,
+            'reference': paystack_otp_payment.transaction_reference if paystack_otp_payment else None,
+            'status': response_status,
             'errors': errors,
-            'payments': [
-                {
-                    'employee_id': p.employee.employee_id,
-                    'employee_name': p.employee.name,
-                    'reference': p.transaction_reference,
-                }
-                for p in target_payments
-            ],
+            'payments': self._bulk_payment_rows(target_payments),
+            'summary': summary,
         }
 
 
@@ -2543,8 +2397,9 @@ class PaymentViewSet(viewsets.ModelViewSet):
                 return False, payload
 
             payment.status = 'failed'
-            payment.save(update_fields=['status', 'updated_at'])
-            return False, str(e)
+            payment.failure_reason = _friendly_payment_error(payload or str(e))
+            payment.save(update_fields=['status', 'failure_reason', 'updated_at'])
+            return False, payment.failure_reason
 
 
         # Transfer amount_paid if partial, else net_amount
@@ -2570,14 +2425,15 @@ class PaymentViewSet(viewsets.ModelViewSet):
                 recipient_code = self._get_or_create_paystack_recipient(employee, paystack)
             except ValueError as exc:
                 payment.status = 'failed'
-                payment.save(update_fields=['status', 'updated_at'])
+                payment.failure_reason = _friendly_payment_error(str(exc))
+                payment.save(update_fields=['status', 'failure_reason', 'updated_at'])
                 logger.warning(
                     "Paystack recipient refresh failed after invalid recipient payment_id=%s employee_id=%s error=%s",
                     payment.id,
                     employee.id,
                     exc,
                 )
-                return False, str(exc)
+                return False, payment.failure_reason
             logger.info(
                 "Created a refreshed Paystack recipient for retry payment_id=%s employee_id=%s new_recipient_code=%s",
                 payment.id,
@@ -2622,7 +2478,7 @@ class PaymentViewSet(viewsets.ModelViewSet):
                     bank_code=bank_code,
                 )
             payment.status = 'failed'
-            payment.failure_reason = 'Paystack transfer initiation failed'
+            payment.failure_reason = _friendly_payment_error(transfer_result)
             payment.paystack_last_status = str((transfer_result or {}).get('status') or 'failed')
             payment.paystack_last_response = transfer_result
             payment.save(update_fields=['status', 'failure_reason', 'paystack_last_status', 'paystack_last_response', 'updated_at'])
@@ -3114,12 +2970,17 @@ class PaymentViewSet(viewsets.ModelViewSet):
 
             if local_payments:
                 if self._paystack_otp_enabled():
+                    skipped_count = len(errors)
                     result = self._execute_bulk_paystack_transfer(local_payments)
-                    response_status = status.HTTP_200_OK if result.get('status') != 'failed' else status.HTTP_400_BAD_REQUEST
+                    response_status = status.HTTP_200_OK
+                    summary = result.get('summary') or self._bulk_payment_summary(local_payments)
+                    summary['total_employees'] = len(employee_ids)
+                    summary['failed'] = summary.get('failed', 0) + skipped_count
                     result.update({
                         'internal_otp_required': False,
                         'total_amount': total_amount,
-                        'total_employees': len(payments_created),
+                        'total_employees': len(employee_ids),
+                        'summary': summary,
                     })
                     if payments_created and 'payments' not in result:
                         result['payments'] = payments_created
@@ -3166,17 +3027,31 @@ class PaymentViewSet(viewsets.ModelViewSet):
                     'paystack_otp_required': False,
                     'status': 'pending',
                     'total_amount': total_amount,
-                    'total_employees': len(payments_created),
+                    'total_employees': len(employee_ids),
                     'payments': payments_created,
                     'errors': errors,
+                    'summary': {
+                        'total_employees': len(employee_ids),
+                        'successful': 0,
+                        'failed': len(errors),
+                        'pending': len(payments_created),
+                        'total_amount_paid': 0,
+                    },
                 })
 
             return Response({
                 'message': f'Staged {len(payments_created)} salary transfers',
                 'total_amount': total_amount,
-                'total_employees': len(payments_created),
+                'total_employees': len(employee_ids),
                 'payments': payments_created,
                 'errors': errors,
+                'summary': {
+                    'total_employees': len(employee_ids),
+                    'successful': 0,
+                    'failed': len(errors),
+                    'pending': 0,
+                    'total_amount_paid': 0,
+                },
                 'note': 'No transfers were sent to Paystack because no valid payments were staged.'
             })
 
@@ -3226,8 +3101,7 @@ class PaymentViewSet(viewsets.ModelViewSet):
 
         if len(payments) > 1:
             result = self._execute_bulk_paystack_transfer(payments)
-            response_status = status.HTTP_200_OK if result.get('status') != 'failed' else status.HTTP_400_BAD_REQUEST
-            return Response(result, status=response_status)
+            return Response(result, status=status.HTTP_200_OK)
 
         payment = payments[0]
         employee = payment.employee

@@ -1,6 +1,7 @@
 from django.core.validators import FileExtensionValidator
 from django.core.validators import RegexValidator, MinValueValidator
 from django.db import models, IntegrityError, transaction
+from django.db.models.functions import Lower
 from django.contrib.auth.models import AbstractUser
 import uuid
 from django.conf import settings
@@ -300,7 +301,7 @@ class User(AbstractUser):
         choices=ROLE_CHOICES,
         default=ROLE_STAFF
     )
-    email = models.EmailField(_('email address'), unique=True, db_index=True)
+    email = models.EmailField(_('email address'), db_index=True)
     full_name = models.CharField(_('full name'), max_length=150, blank=True)
     phone = models.CharField(_('phone number'), max_length=20, blank=True)
 
@@ -308,6 +309,15 @@ class User(AbstractUser):
 
     USERNAME_FIELD = 'email'
     REQUIRED_FIELDS = ['full_name']
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                Lower('email'),
+                condition=~models.Q(email__iexact='fotasco@gmail.com'),
+                name='unique_user_email_except_default',
+            ),
+        ]
 
     # Admin permission flags
     is_company_admin = models.BooleanField(default=False)

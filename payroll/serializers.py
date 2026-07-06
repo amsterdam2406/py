@@ -7,6 +7,14 @@ from .models import (
     SackedEmployee, Notification, OTP, ExportToken, EmployeeRequest, EmployeeRequestAttachment,
     EmployeeSalaryAdjustment, EmployeeBalanceLedger, ClientMonthlyPayment
 )
+
+DEFAULT_SHARED_EMAIL = 'fotasco@gmail.com'
+
+
+def _is_default_shared_email(value):
+    return str(value or '').strip().lower() == DEFAULT_SHARED_EMAIL
+
+
 from .services import compute_total_salary_payable
 
 from django.contrib.auth import get_user_model
@@ -102,6 +110,8 @@ class UserSerializer(serializers.ModelSerializer):
         if not value or not value.strip():
             raise serializers.ValidationError("email is required")
         value = value.lower()
+        if _is_default_shared_email(value):
+            return value
         if User.objects.filter(email=value).exclude(
             id=self.instance.id if self.instance else None
         ).exists():
@@ -193,6 +203,9 @@ class EmployeeSerializer(serializers.ModelSerializer):
     
     def validate_email(self, value):
         if not value:
+            return value
+        value = value.strip().lower()
+        if _is_default_shared_email(value):
             return value
         # Check for duplicates
         queryset = Employee.objects.filter(email__iexact=value, status__in=['active', 'terminated'])

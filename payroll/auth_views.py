@@ -18,6 +18,7 @@ from django.core.exceptions import ValidationError
 from .models import Employee, User, Notification
 from .utils import get_client_ip, log_audit
 from django.contrib.auth.password_validation import validate_password
+from django.core.validators import validate_email
 from django.core.mail import send_mail
 from django.template.loader import render_to_string
 from django.utils.html import strip_tags
@@ -39,6 +40,28 @@ from .utils import log_audit
 
 logger = logging.getLogger(__name__)
 User = get_user_model()
+DEFAULT_SHARED_EMAIL = 'fotasco@gmail.com'
+
+
+def _normalize_signup_email(email):
+    return str(email or '').strip().lower()
+
+
+def _is_default_shared_email(email):
+    return _normalize_signup_email(email) == DEFAULT_SHARED_EMAIL
+
+
+def _validate_signup_email(email):
+    email = _normalize_signup_email(email)
+    if not email:
+        return '', 'Email address is required.'
+    try:
+        validate_email(email)
+    except ValidationError:
+        return email, 'Enter a valid email address.'
+    if not _is_default_shared_email(email) and User.objects.filter(email__iexact=email).exists():
+        return email, 'This email address is already registered. Use a different email or use fotasco@gmail.com if the employee has no email.'
+    return email, None
 
 
 def _name_tokens(value):
@@ -324,11 +347,10 @@ def register_view(request):
             status=status.HTTP_400_BAD_REQUEST
         )
     
-    # DUPLICATE DETECTION: Check email if provided
-    email = data.get('email')
-    if email and User.objects.filter(email__iexact=email).exists():
+    email, email_error = _validate_signup_email(data.get('email'))
+    if email_error:
         return Response(
-            {'error': 'Email already registered', 'field': 'email'},
+            {'error': email_error, 'field': 'email'},
             status=status.HTTP_400_BAD_REQUEST
         )
     
@@ -351,6 +373,8 @@ def register_view(request):
             )
     
     # Employee validation fields
+    verified_holder = None
+    verification_error = None
     if role in ['staff', 'guard']:
         required_fields = ['salary', 'location', 'bank_name', 'bank_code', 'account_number', 'account_holder']
         missing = [f for f in required_fields if not data.get(f)]
@@ -478,7 +502,7 @@ def register_view(request):
             )
         elif 'email' in str(e):
             return Response(
-                {'error': 'This email is already registered for another employee.'},
+                {'error': 'This email address is already registered. Use a different email or use fotasco@gmail.com if the employee has no email.'},
                 status=status.HTTP_400_BAD_REQUEST
             )
         return Response(
@@ -576,8 +600,9 @@ def self_register_employee(request):
     if User.objects.filter(username=data['username']).exists():
         return Response({'error': 'Username already exists', 'field': 'username'}, status=status.HTTP_400_BAD_REQUEST)
 
-    if User.objects.filter(email__iexact=data['email']).exists():
-        return Response({'error': 'Email already registered', 'field': 'email'}, status=status.HTTP_400_BAD_REQUEST)
+    email, email_error = _validate_signup_email(data.get('email'))
+    if email_error:
+        return Response({'error': email_error, 'field': 'email'}, status=status.HTTP_400_BAD_REQUEST)
 
     name_error = _validate_full_name(data.get('full_name'))
     if name_error:
@@ -613,7 +638,7 @@ def self_register_employee(request):
             user = User.objects.create_user(
                 username=data['username'],
                 password=data['password'],
-                email=data['email'].lower(),
+                email=email,
                 role=role_type,
                 first_name=first_name,
                 last_name=last_name,
@@ -629,7 +654,7 @@ def self_register_employee(request):
                 location=data['location'],
                 salary=Decimal(str(data.get('salary', 0))),
                 phone=data.get('phone', ''),
-                email=data['email'],
+                email=email,
                 bank_name=data.get('bank_name', ''),
                 bank_code=data.get('bank_code', ''),
                 account_number=data.get('account_number', ''),
@@ -689,7 +714,7 @@ def self_register_employee(request):
             )
         elif 'email' in str(e):
             return Response(
-                {'error': 'This email is already registered.'},
+                {'error': 'This email address is already registered. Use a different email or use fotasco@gmail.com if the employee has no email.'},
                 status=status.HTTP_400_BAD_REQUEST
             )
         return Response(

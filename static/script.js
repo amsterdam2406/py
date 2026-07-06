@@ -89,6 +89,7 @@ const ACCOUNT_VERIFICATION_DEBOUNCE_MS = 800;
 const SECTION_STALE_MS = 30 * 1000;
 const AUTO_REFRESH_DELAY_MS = 350;
 const BACKGROUND_REFRESH_INTERVAL_MS = 60 * 1000;
+const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
 // ==========================================
 // UTILITY FUNCTIONS
@@ -909,7 +910,12 @@ function formatApiError(data, fallback) {
   const cleanText = (value) => {
     if (Array.isArray(value)) return value.map(cleanText).filter(Boolean).join(", ");
     if (value && typeof value === "object") return formatApiError(value, "");
-    return String(value || "").replace(/[\[\]{}"]/g, "").trim();
+    const text = String(value || "").replace(/[\[\]{}"]/g, "").trim();
+    if (/traceback|stack trace|exception|paystack_last_response|^html>/i.test(text)) {
+      console.error("Technical API error hidden from user:", value);
+      return "";
+    }
+    return text;
   };
 
   const fieldMessage = (field, value) => {
@@ -926,6 +932,7 @@ function formatApiError(data, fallback) {
   const direct = data.detail || data.error || data.message;
   if (direct) {
     const directText = cleanText(direct);
+    if (!directText) return fallback;
     if (/csrf|forbidden|permission denied|authentication failed/i.test(directText)) {
       return "Permission denied or session invalid. Please refresh the page and try again.";
     }
@@ -974,6 +981,23 @@ function sanitizePaymentError(message) {
   return text;
 }
 window.sanitizePaymentError = sanitizePaymentError;
+
+function validateEmailInput(value, required = true) {
+  const email = String(value || "").trim().toLowerCase();
+  if (!email) return required ? "Email address is required." : "";
+  if (!EMAIL_PATTERN.test(email)) return "Enter a valid email address.";
+  return "";
+}
+
+function formatBulkPaymentSummary(results, selectedCount) {
+  const summary = results?.summary || {};
+  const totalEmployees = summary.total_employees ?? selectedCount ?? 0;
+  const successful = summary.successful ?? 0;
+  const failed = summary.failed ?? (Array.isArray(results?.errors) ? results.errors.length : 0);
+  const pending = summary.pending ?? 0;
+  const totalPaid = summary.total_amount_paid ?? 0;
+  return `Total Employees: ${totalEmployees}. Successful: ${successful}. Failed: ${failed}. Pending: ${pending}. Total Amount Paid: ${formatCurrency(totalPaid)}.`;
+}
 
 async function apiRequest(url, options = {}) {
   // FIXED: Ensure proper URL construction
@@ -1032,17 +1056,7 @@ async function apiRequest(url, options = {}) {
         const errorData = await response.json().catch(() => ({}));
         logout();
         let authErrorMessage =
-          errorData.detail ||
-          errorData.error ||
-          errorData.message ||
-          "Session expired. Please login again.";
-        if (typeof authErrorMessage === 'object') {
-          try {
-            authErrorMessage = JSON.stringify(authErrorMessage);
-          } catch (err) {
-            authErrorMessage = String(authErrorMessage);
-          }
-        }
+          formatApiError(errorData, "Session expired. Please login again.");
         return {
           success: false,
           status: response.status,
@@ -1064,7 +1078,7 @@ async function apiRequest(url, options = {}) {
 
     if (response.status === 403) {
       const errorData = await response.json().catch(() => ({}));
-      const serverMessage = errorData.detail || errorData.error || errorData.message;
+      const serverMessage = formatApiError(errorData, "");
       return {
         success: false,
         status: response.status,
@@ -1081,7 +1095,7 @@ async function apiRequest(url, options = {}) {
       const waitTime = Number.isFinite(retryAfter) && retryAfter > 0
         ? Math.max(1, Math.ceil(retryAfter / 60))
         : null;
-      const serverMessage = errorData.detail || errorData.error || errorData.message;
+      const serverMessage = formatApiError(errorData, "");
       return {
         success: false,
         status: response.status,
@@ -1098,13 +1112,6 @@ async function apiRequest(url, options = {}) {
 
     if (!response.ok) {
       let message = formatApiError(data, `Request failed (${response.status})`);
-      if (typeof message === 'object') {
-        try {
-          message = JSON.stringify(message);
-        } catch (err) {
-          message = String(message);
-        }
-      }
       if (response.status >= 500) {
         const hasServerMessage = data && (data.detail || data.error || data.message);
         if (!hasServerMessage) {
@@ -2066,10 +2073,15 @@ async function loadEmployees(page = 1) {
 // ==========================================
 
 async function viewEmployeeDetail(employeeId) {
-  const employee = AppState.employees.find((e) => idsMatch(e.id, employeeId));
+  let employee = AppState.employees.find((e) => idsMatch(e.id, employeeId));
   if (!employee) {
-    showToast("Employee not found", "error");
-    return;
+    const detailRes = await apiRequest(`/api/employees/${employeeId}/`);
+    if (detailRes.success) {
+      employee = detailRes.data;
+    } else {
+      showToast(detailRes.message || "Employee details could not be loaded.", "error");
+      return;
+    }
   }
 
   const content = document.getElementById("employeeDetailContent");
@@ -2112,14 +2124,14 @@ async function viewEmployeeDetail(employeeId) {
             <div class="detail-section">
                 <h4>Salary Information</h4>
                 <table class="detail-table">
-                    <tr><td><strong>Base Salary:</strong></td><td>${formatCurrency(d.base_salary)}</td></tr>
-                    <tr><td><strong>IOU Deduction:</strong></td><td class="text-danger">${formatCurrency(d.iou_deduction)}</td></tr>
-                    <tr><td><strong>Other Deductions:</strong></td><td class="text-danger">${formatCurrency(d.other_deductions)}</td></tr>
-                    <tr><td><strong>Bonus:</strong></td><td class="text-success">${formatCurrency(d.bonus)}</td></tr>
-                    <tr><td><strong>Prev. Month Balance Added:</strong></td><td class="text-info">${formatCurrency(d.previous_balance)}</td></tr>
-                    <tr><td><strong>Total Monthly Payable:</strong></td><td><strong>${formatCurrency(d.final_net_salary)}</strong></td></tr>
-                    <tr><td><strong>Total Paid This Month:</strong></td><td>${formatCurrency(d.total_paid)}</td></tr>
-                    <tr><td><strong>Outstanding Balance:</strong></td><td class="text-success font-bold">${formatCurrency(d.outstanding_balance)}</td></tr>
+                    <tr><td><strong>Base Salary:</strong></td><td>${formatCurrency(d?.base_salary ?? employee.salary ?? 0)}</td></tr>
+                    <tr><td><strong>IOU Deduction:</strong></td><td class="text-danger">${formatCurrency(d?.iou_deduction ?? 0)}</td></tr>
+                    <tr><td><strong>Other Deductions:</strong></td><td class="text-danger">${formatCurrency(d?.other_deductions ?? 0)}</td></tr>
+                    <tr><td><strong>Bonus:</strong></td><td class="text-success">${formatCurrency(d?.bonus ?? 0)}</td></tr>
+                    <tr><td><strong>Prev. Month Balance Added:</strong></td><td class="text-info">${formatCurrency(d?.previous_balance ?? 0)}</td></tr>
+                    <tr><td><strong>Total Monthly Payable:</strong></td><td><strong>${formatCurrency(d?.final_net_salary ?? employee.salary ?? 0)}</strong></td></tr>
+                    <tr><td><strong>Total Paid This Month:</strong></td><td>${formatCurrency(d?.total_paid ?? 0)}</td></tr>
+                    <tr><td><strong>Outstanding Balance:</strong></td><td class="text-success font-bold">${formatCurrency(d?.outstanding_balance ?? 0)}</td></tr>
                 </table>
             </div>
         </div>
@@ -2344,7 +2356,8 @@ async function handleCreateEmployee(e) {
   if (!payload.type) missingFields.push("Type");
   if (!payload.location) missingFields.push("Location");
   if (!payload.salary) missingFields.push("Valid Salary");
-  if (!payload.email) missingFields.push("Email");
+  const emailError = validateEmailInput(payload.email, true);
+  if (emailError) missingFields.push(emailError);
   if (!payload.phone) missingFields.push("Phone");
   if (!payload.bank_name || !payload.bank_code) missingFields.push("Valid Bank Selection");
   if (!payload.account_number || payload.account_number.length !== 10)
@@ -2527,6 +2540,8 @@ async function handleRegistration(e, isSelfSignup = false) {
       missing.push("10-digit Account Number");
     if (!payload.account_holder) missing.push("Verified Account Holder Name");
   }
+  const emailError = validateEmailInput(payload.email, true);
+  if (emailError) missing.push(emailError);
 
   if (missing.length) {
     showToast("Missing or invalid fields: " + missing.join(", "), "warning");
@@ -3116,6 +3131,7 @@ async function loadAttendance() {
     if (!res.success) throw new Error(res.message);
 
     const list = res.data?.results || res.data || [];
+    AppState.sackedEmployees = list;
     AppState.attendance = list; // Store for stats
     const tbody =
       AppState.elements.attendanceTbody ||
@@ -3566,7 +3582,7 @@ async function processBulkPayment() {
           "A security verification code has been sent to your email. Enter it to authorize this bulk payment."
         );
         closeModal("bulkPaymentModal");
-        showToast(results.message || "Internal OTP sent", "info");
+        showToast(`${results.message || "Internal OTP sent"} ${formatBulkPaymentSummary(results, checked.length)}`, "info");
         return;
     }
 
@@ -3578,11 +3594,12 @@ async function processBulkPayment() {
     }
 
     // Show initial summary
-    let message = `Initiated ${payments.length}/${checked.length} transfers.`;
+    let message = formatBulkPaymentSummary(results, checked.length);
     if (errors.length > 0) {
-      message += ` ${errors.length} errors.`;
+      console.warn("Bulk payment employee-level failures:", errors);
+      message += ` Some payments need attention.`;
     }
-    showToast(message, payments.length > 0 ? "success" : "error");
+    showToast(message, (results.summary?.successful || payments.length) > 0 ? "success" : "error");
 
     // Close modal and refresh tables
     closeModal("bulkPaymentModal");
@@ -4269,6 +4286,9 @@ async function loadSackedEmployees() {
                 <td>${escapeHtml(record.offense || "-")}</td>
                 <td>${escapeHtml(record.terminated_by_name || "-")}</td>
                 <td>
+                    <button type="button" class="btn btn-sm btn-info" onclick="viewEmployeeDetail('${record.employee}')">
+                        <i class="fas fa-eye"></i> View
+                    </button>
                     <button type="button" onclick="reinstateEmployee('${record.id}')" class="btn btn-sm btn-success">Reinstate</button>
                 </td>
             `;
