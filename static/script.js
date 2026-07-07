@@ -47,6 +47,9 @@ const AppState = {
   bankListPromise: null,
   lastVerifiedAccountKey: null,
   globalLoadingCount: 0, // ADDED: Counter for global loading operations
+  activeToasts: new Map(),
+  networkMessageVisible: false,
+  tokenRefreshNetworkFailed: false,
   pendingAccountVerificationKey: null,
 
   // ADDED: single-flight de-duplication for resolve-account GET
@@ -321,17 +324,13 @@ function showLoading(btn, spinnerEl) {
       if (!btn.dataset.originalText) btn.dataset.originalText = btn.innerHTML;
       btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Loading...';
     }
-    const spinner =
-      spinnerEl ||
-      AppState.elements.globalSpinner ||
-      document.getElementById("globalSpinner");
+    const spinner = spinnerEl || document.getElementById("globalSpinner");
     if (spinner) {
       // Ensure we have a reference to the global spinner element
       AppState.elements.globalSpinner = spinner;
       // Increment global loading counter when showing spinner without a button
       if (!btn) {
         AppState.globalLoadingCount = (AppState.globalLoadingCount || 0) + 1;
-        console.debug(`Spinner shown. Count: ${AppState.globalLoadingCount}`);
       }
       spinner.classList.remove("hidden");
     }
@@ -354,19 +353,14 @@ function hideLoading(btn, spinnerEl) {
         delete btn.dataset.originalText;
       }
     }
-    const spinner =
-      spinnerEl ||
-      AppState.elements.globalSpinner ||
-      document.getElementById("globalSpinner");
+    const spinner = spinnerEl || document.getElementById("globalSpinner");
     if (spinner) {
       if (!btn)
         AppState.globalLoadingCount = Math.max(
           0,
           AppState.globalLoadingCount - 1,
         ); // Decrement global counter
-      
-      console.debug(`Spinner hide request. Count: ${AppState.globalLoadingCount}`);
-      
+
       if (AppState.globalLoadingCount === 0 && !AppState.isPolling) {
         spinner.classList.add("hidden");
       }
@@ -455,10 +449,56 @@ async function toggleBulkDetails(empId) {
 
 let lastToastInfo = { message: "", time: 0 };
 
-function showToast(message, type = "info", duration = CONFIG.TOAST_DURATION) {
+function friendlyToastMessage(message) {
+  const text = String(message || "").trim();
+  if (!text) return "Something went wrong. Please try again.";
+  if (/^\s*[\[{]/.test(text) || /traceback|stack trace|exception|html>|paystack_last_response/i.test(text)) {
+    return "Something went wrong. Please try again.";
+  }
+  if (/token expired/i.test(text)) {
+    return "Session expired. Please login again.";
+  }
+  if (/failed to fetch|networkerror|load failed|connection|offline/i.test(text)) {
+    return "Connection problem. Please check your internet and try again.";
+  }
+  return text;
+}
+
+function isNetworkError(err) {
+  const message = String(err?.message || err || "").toLowerCase();
+  return (
+    !navigator.onLine ||
+    message.includes("failed to fetch") ||
+    message.includes("networkerror") ||
+    message.includes("load failed") ||
+    message.includes("connection")
+  );
+}
+
+function setNetworkMessage(visible) {
+  AppState.networkMessageVisible = visible;
+  if (visible) {
+    showToast("Connection problem. Please check your internet and try again.", "warning", 0, {
+      key: "network-status",
+    });
+    return;
+  }
+
+  const toast = AppState.activeToasts.get("network-status");
+  if (toast) closeToast(toast);
+  AppState.networkMessageVisible = false;
+}
+
+window.addEventListener("online", () => setNetworkMessage(false));
+window.addEventListener("offline", () => setNetworkMessage(true));
+
+function showToast(message, type = "info", duration = CONFIG.TOAST_DURATION, options = {}) {
+  message = friendlyToastMessage(message);
   const now = Date.now();
-  // Prevent showing the exact same message twice within 1 second
-  if (message === lastToastInfo.message && now - lastToastInfo.time < 1000)
+  const toastKey = options.key || `${type}:${message}`;
+  if (AppState.activeToasts.has(toastKey)) return;
+  // Prevent showing the exact same message repeatedly during rapid retries.
+  if (message === lastToastInfo.message && now - lastToastInfo.time < 4000)
     return;
   lastToastInfo = { message, time: now };
 
@@ -471,6 +511,7 @@ function showToast(message, type = "info", duration = CONFIG.TOAST_DURATION) {
   } // Fixed: Ensure toast container exists
   const toast = document.createElement("div");
   toast.className = `toast ${type}`;
+  toast.dataset.toastKey = toastKey;
 
   // Fixed styling to ensure content visibility
   toast.style.cssText =
@@ -494,12 +535,20 @@ function showToast(message, type = "info", duration = CONFIG.TOAST_DURATION) {
     .querySelector(".toast-close")
     .addEventListener("click", () => closeToast(toast));
   container.appendChild(toast);
+  AppState.activeToasts.set(toastKey, toast);
   requestAnimationFrame(() => toast.classList.add("show"));
   if (duration > 0) setTimeout(() => closeToast(toast), duration);
 }
 
 function closeToast(toast) {
   if (!toast) return;
+  const toastKey = toast.dataset?.toastKey;
+  if (toastKey && AppState.activeToasts.get(toastKey) === toast) {
+    AppState.activeToasts.delete(toastKey);
+  }
+  if (toastKey === "network-status") {
+    AppState.networkMessageVisible = false;
+  }
   toast.classList.remove("show");
   setTimeout(() => toast?.remove(), 300);
 }
@@ -690,7 +739,7 @@ async function refreshSectionData(id = AppState.currentSection, options = {}) {
       return true;
     } catch (err) {
       console.error(`Failed to refresh section ${id}:`, err);
-      if (showSpinner) {
+      if (showSpinner && !isNetworkError(err)) {
         showToast(`Failed to refresh ${SECTION_LABELS[id] || "section"}`, "error");
       }
       return false;
@@ -764,6 +813,8 @@ function initAutoRefresh() {
 }
 
 async function showSection(id) {
+  updateLoadingProgress(`Loading ${SECTION_LABELS[id] || "section"}...`);
+  showLoading();
   AppState.currentSection = id;
   document
     .querySelectorAll(".content-section")
@@ -777,7 +828,12 @@ async function showSection(id) {
     link.classList.toggle("active", isActive);
   });
 
-  await refreshSectionData(id, { showSpinner: true });
+  try {
+    await refreshSectionData(id, { showSpinner: false });
+  } finally {
+    updateLoadingProgress("Loading...");
+    hideLoading();
+  }
 }
 
 function openModal(id) {
@@ -1011,6 +1067,14 @@ async function apiRequest(url, options = {}) {
   // NEW: Proactively refresh token if expired to avoid unnecessary 401 logs and extra roundtrips
   if (options.auth !== false && token && isJwtExpired(token) && !url.includes("/token/refresh/") && !url.includes("/login/")) {
     const refreshed = await refreshAccessToken();
+    if (!refreshed && AppState.tokenRefreshNetworkFailed) {
+      setNetworkMessage(true);
+      return {
+        success: false,
+        networkError: true,
+        message: "Connection problem. Please check your internet and try again.",
+      };
+    }
     if (refreshed) token = AppState.accessToken;
   }
 
@@ -1038,6 +1102,7 @@ async function apiRequest(url, options = {}) {
 
   try {
     const response = await fetch(fullUrl, fetchOptions);
+    setNetworkMessage(false);
 
     if (response.status === 401) {
       // Prevent infinite loops on auth endpoints
@@ -1067,6 +1132,15 @@ async function apiRequest(url, options = {}) {
 
       const refreshed = await refreshAccessToken();
       if (refreshed) return apiRequest(url, { ...options, _authRetried: true });
+      if (AppState.tokenRefreshNetworkFailed) {
+        setNetworkMessage(true);
+        return {
+          success: false,
+          status: response.status,
+          networkError: true,
+          message: "Connection problem. Please check your internet and try again.",
+        };
+      }
       logout();
       showToast("Session expired. Please login again.", "error");
       return {
@@ -1133,9 +1207,17 @@ async function apiRequest(url, options = {}) {
     return { success: true, status: response.status, data };
   } catch (err) {
     console.error("API Error:", err);
+    if (isNetworkError(err)) {
+      setNetworkMessage(true);
+      return {
+        success: false,
+        networkError: true,
+        message: "Connection problem. Please check your internet and try again.",
+      };
+    }
     return {
       success: false,
-      message: err.message || "Network error. Check connection.",
+      message: friendlyToastMessage(err.message || "Request failed. Please try again."),
     };
   }
 }
@@ -1151,6 +1233,7 @@ async function refreshAccessToken() {
 
   const refreshPromise = (async () => {
     try {
+      AppState.tokenRefreshNetworkFailed = false;
       // IMPORTANT: refresh_token cookie is HttpOnly, so JS cannot read it.
       // Rely only on localStorage (and in-memory AppState) for SPA bootstrapping.
       const refreshToken =
@@ -1176,6 +1259,7 @@ async function refreshAccessToken() {
         ...fetchOptions,
         credentials: "same-origin",
       });
+      setNetworkMessage(false);
 
       if (response.status === 401 || response.status === 403) {
         throw new Error("AUTH_EXPIRED");
@@ -1195,8 +1279,14 @@ async function refreshAccessToken() {
       return true;
     } catch (err) {
       if (err.message === "AUTH_EXPIRED") {
+        AppState.tokenRefreshNetworkFailed = false;
         console.warn("Session expired.");
+      } else if (isNetworkError(err)) {
+        AppState.tokenRefreshNetworkFailed = true;
+        setNetworkMessage(true);
+        console.warn("Token refresh delayed by network error:", err);
       } else {
+        AppState.tokenRefreshNetworkFailed = false;
         console.error("Token refresh network error:", err);
       }
       return false;
@@ -1683,7 +1773,12 @@ async function handleLogin(e) {
   const password = document.getElementById("loginPassword")?.value;
 
   if (!username || !password) {
-    showToast("Username and password are required", "error");
+    showToast("Username or Employee ID and password are required", "error");
+    return;
+  }
+
+  if (username.includes("@")) {
+    showToast("Use your username or employee ID to login.", "error");
     return;
   }
 
@@ -1756,7 +1851,11 @@ async function handleLogin(e) {
     showToast("Login successful", "success");
   } catch (err) {
     console.error("Login error:", err);
-    showToast("Login failed. Please try again.", "error");
+    if (isNetworkError(err)) {
+      setNetworkMessage(true);
+    } else {
+      showToast("Login failed. Please try again.", "error");
+    }
   } finally {
     hideLoading(btn);
   }

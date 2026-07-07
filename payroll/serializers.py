@@ -614,9 +614,10 @@ class PaystackResolveAccountSerializer(serializers.Serializer):
         regex=r'^\d{10}$',
         error_messages={'invalid': 'A valid 10-digit account number is required.'},
     )
-    bank_code = serializers.RegexField(
-        regex=r'^\d{3,6}$',
-        error_messages={'invalid': 'A valid Paystack bank code is required.'},
+    bank_code = serializers.CharField(
+        trim_whitespace=True,
+        allow_blank=False,
+        error_messages={'blank': 'A valid Paystack bank code is required.'},
     )
 
 

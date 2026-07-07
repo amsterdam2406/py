@@ -310,15 +310,6 @@ class User(AbstractUser):
     USERNAME_FIELD = 'email'
     REQUIRED_FIELDS = ['full_name']
 
-    class Meta:
-        constraints = [
-            models.UniqueConstraint(
-                Lower('email'),
-                condition=~models.Q(email__iexact='fotasco@gmail.com'),
-                name='unique_user_email_except_default',
-            ),
-        ]
-
     # Admin permission flags
     is_company_admin = models.BooleanField(default=False)
     is_notification_admin = models.BooleanField(default=False)
@@ -333,6 +324,13 @@ class User(AbstractUser):
         db_table = 'users'
         verbose_name = _('User')
         verbose_name_plural = _('Users')
+        constraints = [
+            models.UniqueConstraint(
+                Lower('email'),
+                condition=~models.Q(email__iexact='fotasco@gmail.com'),
+                name='unique_user_email_except_default',
+            ),
+        ]
 
     def __str__(self):
         return self.email
@@ -610,8 +608,9 @@ class Employee(TimeStampedModel, SoftDeleteModel):
             
     def clean(self):
         super().clean()
-        if self.bank_code and (not self.bank_code.isdigit() or len(self.bank_code) not in [3, 6]):
-            raise ValidationError({"bank_code": "Invalid bank code. Must be 3 or 6 digits."})
+        if self.bank_code:
+            # Paystack bank codes are opaque strings; keep leading zeros and do not enforce length.
+            self.bank_code = str(self.bank_code).strip()
     
     def save(self, *args, **kwargs):
         if not self.employee_id and self.type in (EmployeeType.STAFF, EmployeeType.GUARD, EmployeeType.EMPLOYEE):

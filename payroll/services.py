@@ -19,7 +19,7 @@ from .models import (
     EmployeeSalaryAdjustment,
     AdjustmentType,
 )
-from .paystack import PaystackAPI, NIGERIAN_BANKS, is_invalid_recipient_error
+from .paystack import PaystackAPI, get_paystack_bank_map, is_invalid_recipient_error
 
 # l
 logger = logging.getLogger(__name__)
@@ -36,18 +36,25 @@ def paystack_recipient_fingerprint(bank_code, account_number):
 
 def is_valid_paystack_bank_code(bank_code):
     bank_code = str(bank_code or '').strip()
-    return bank_code in NIGERIAN_BANKS
+    if not bank_code:
+        return False
+    current_banks = get_paystack_bank_map(include_static_fallback=False)
+    # When Paystack's bank list is reachable, validate against it. If it is temporarily
+    # unavailable, let Paystack validate the opaque code during resolve/recipient creation.
+    return bank_code in current_banks if current_banks else True
 
 
 def paystack_bank_name(bank_code):
-    return NIGERIAN_BANKS.get(str(bank_code or '').strip(), '')
+    bank_code = str(bank_code or '').strip()
+    # Static names are only a display/logging fallback for legacy records.
+    return get_paystack_bank_map().get(bank_code, '')
 
 
 def paystack_bank_code_for_name(bank_name):
     normalized_name = (bank_name or '').strip().lower()
     if not normalized_name:
         return None
-    for code, name in NIGERIAN_BANKS.items():
+    for code, name in get_paystack_bank_map(include_static_fallback=False).items():
         target_name = (name or '').strip().lower()
         if normalized_name == target_name or normalized_name in target_name or target_name in normalized_name:
             return code
@@ -74,8 +81,8 @@ def get_employee_bank_code(employee):
     """Return a valid Paystack bank_code for an employee.
 
     Priority:
-      1) employee.bank_code if it is non-empty and matches known Paystack bank codes
-      2) derive from employee.bank_name
+      1) employee.bank_code if it is non-empty and valid for the current Paystack list
+      2) derive from employee.bank_name using Paystack's bank list
     """
 
     stored_code = (getattr(employee, 'bank_code', None) or '').strip()
@@ -98,7 +105,7 @@ def get_employee_bank_code(employee):
                 pass
         return derived_code
 
-    if stored_code and stored_code in NIGERIAN_BANKS:
+    if stored_code and is_valid_paystack_bank_code(stored_code):
         return stored_code
 
     if stored_code:

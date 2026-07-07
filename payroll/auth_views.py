@@ -174,7 +174,7 @@ class CookieTokenRefreshView(TokenRefreshView):
 @throttle_classes([LoginThrottle])
 def login_view(request):
     """Login endpoint - returns both tokens in body for SPA storage"""
-    username = request.data.get('username')
+    username = (request.data.get('username') or '').strip()
     password = request.data.get('password')
     
     try:
@@ -183,11 +183,17 @@ def login_view(request):
                 {'error': 'Username and password are required'},
                 status=status.HTTP_400_BAD_REQUEST
             )
+
+        if '@' in username:
+            logger.warning(f"Rejected email login attempt for {username} from {request.META.get('REMOTE_ADDR')}")
+            return Response(
+                {'error': 'Invalid credentials'},
+                status=status.HTTP_401_UNAUTHORIZED
+            )
             
         user = authenticate(request, username=username, password=password)
         
-        # Logic: If standard login fails, try login with Employee ID
-        # This is a good fallback handling for user convenience
+        # If standard username login fails, try the exact stored Employee ID.
         if not user:
             try:
                 employee = Employee.objects.get(employee_id=username)

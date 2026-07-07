@@ -20,26 +20,11 @@ from django.utils.html import format_html
 # ─────────────────────────────────────────────
 
 class EmailAuthenticationForm(AuthenticationForm):
-    """Custom admin login form that accepts email or username"""
+    """Custom admin login form that accepts username only."""
     username = forms.CharField(
-        label="Email / Username",
+        label="Username",
         widget=forms.TextInput(attrs={"autofocus": True})
     )
-
-    def clean(self):
-        username = self.cleaned_data.get('username')
-        password = self.cleaned_data.get('password')
-
-        if username and password:
-            try:
-                user = User.objects.get(email__iexact=username)
-                username = user.username
-            except User.DoesNotExist:
-                pass
-
-            self.cleaned_data['username'] = username
-
-        return super().clean()
 
 class CustomAdminSite(admin.AdminSite):
     login_form = EmailAuthenticationForm

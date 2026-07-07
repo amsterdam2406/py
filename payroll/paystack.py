@@ -9,6 +9,8 @@ from django.core.cache import cache
 logger = logging.getLogger(__name__)
 PAYSTACK_RESOLVE_GLOBAL_COOLDOWN_KEY = "paystack:resolve:global_temporary_unavailable"
 PAYSTACK_ACCOUNT_RESOLVE_TTL_SECONDS = 60 * 60 * 24
+PAYSTACK_BANKS_CACHE_KEY = "paystack:banks:nigeria"
+PAYSTACK_BANKS_TTL_SECONDS = 60 * 60 * 12
 INVALID_RECIPIENT_ERROR_PHRASES = (
     "recipient is blacklisted",
     "recipient_not_found",
@@ -110,9 +112,10 @@ def classify_account_resolution_failure(account_number, bank_code, response_payl
 
     if not re.fullmatch(r'\d{10}', account_number):
         return 'invalid_account_number'
-    if not re.fullmatch(r'\d{3}', bank_code):
+    if not bank_code:
         return 'invalid_bank_code'
-    if bank_code not in globals().get('NIGERIAN_BANKS', {}):
+    current_banks = get_paystack_bank_map(include_static_fallback=False)
+    if current_banks and bank_code not in current_banks:
         return 'unsupported_bank'
     if secret_key is not None and not _is_live_secret_key(secret_key):
         return 'configuration_issue'
@@ -144,6 +147,55 @@ def _paystack_error_response(exc, fallback_status='failed'):
         'error_code': error_code or 'paystack_api_error',
         'data': error_payload if error_payload is not None else {'status': fallback_status},
     }
+
+
+def _normalize_paystack_banks_result(result):
+    banks = {}
+    data = result.get('data') if isinstance(result, dict) else []
+    if not isinstance(data, list):
+        return banks
+
+    for bank in data:
+        if not isinstance(bank, dict):
+            continue
+        code = str(bank.get('code') or '').strip()
+        name = str(bank.get('name') or '').strip()
+        if code:
+            # Paystack bank codes are opaque strings; preserve leading zeros and length exactly.
+            banks[code] = name
+    return banks
+
+
+def get_paystack_bank_map(include_static_fallback=True):
+    cached = cache.get(PAYSTACK_BANKS_CACHE_KEY)
+    bank_map = _normalize_paystack_banks_result(cached)
+    if bank_map:
+        return bank_map
+
+    secret_key = getattr(settings, 'PAYSTACK_SECRET_KEY', '')
+    headers = {
+        'Authorization': f'Bearer {secret_key}',
+        'Content-Type': 'application/json',
+    }
+    timeout = max(1, int(getattr(settings, 'PAYSTACK_REQUEST_TIMEOUT_SECONDS', 8)))
+    response = None
+    try:
+        response = requests.get(f"{getattr(settings, 'PAYSTACK_BASE_URL', 'https://api.paystack.co')}/bank?country=nigeria", headers=headers, timeout=timeout)
+        response.raise_for_status()
+        result = response.json()
+        if isinstance(result, dict):
+            cache.set(PAYSTACK_BANKS_CACHE_KEY, result, PAYSTACK_BANKS_TTL_SECONDS)
+            bank_map = _normalize_paystack_banks_result(result)
+            if bank_map:
+                return bank_map
+    except Exception as exc:
+        logger.warning("Unable to refresh Paystack bank list for validation: %s", exc)
+    finally:
+        if response is not None:
+            response.close()
+
+    # Static codes are a compatibility fallback for old records/name matching, not the source of truth.
+    return dict(globals().get('NIGERIAN_BANKS', {})) if include_static_fallback else {}
 
 
 class PaystackAccountResolutionService:
@@ -261,7 +313,7 @@ class PaystackAccountResolutionService:
         bank_code = str(bank_code or '').strip()
         masked_account = _mask_account_number(account_number)
 
-        if not re.fullmatch(r'\d{10}', account_number) or not re.fullmatch(r'\d{3}', bank_code):
+        if not re.fullmatch(r'\d{10}', account_number) or not bank_code:
             cause = classify_account_resolution_failure(account_number, bank_code)
             if cause == 'invalid_bank_code':
                 message = 'We could not validate the selected bank. Please choose a supported bank and try again.'
@@ -281,8 +333,8 @@ class PaystackAccountResolutionService:
                 message,
             )
 
-        known_banks = globals().get('NIGERIAN_BANKS', {})
-        if known_banks and bank_code not in known_banks:
+        current_banks = get_paystack_bank_map(include_static_fallback=False)
+        if current_banks and bank_code not in current_banks:
             cause = classify_account_resolution_failure(account_number, bank_code)
             logger.warning(
                 "Paystack account resolve rejected unsupported bank_code=%s account=%s cause=%s",
@@ -681,8 +733,7 @@ class PaystackAPI:
     def get_banks(self):
         """Get list of Nigerian banks"""
         url = f"{self.BASE_URL}/bank?country=nigeria"
-        cache_key = "paystack:banks:nigeria"
-        cached = cache.get(cache_key)
+        cached = cache.get(PAYSTACK_BANKS_CACHE_KEY)
         if cached:
             return cached
         response = None
@@ -690,7 +741,7 @@ class PaystackAPI:
             response = requests.get(url, headers=self.headers, timeout=self.request_timeout)
             response.raise_for_status()
             result = response.json()
-            cache.set(cache_key, result, 60 * 60 * 12)
+            cache.set(PAYSTACK_BANKS_CACHE_KEY, result, PAYSTACK_BANKS_TTL_SECONDS)
             return result
         except Exception as e:
             logger.error(f"Paystack get banks error: {e}")

@@ -14,7 +14,8 @@ from django.core.exceptions import ImproperlyConfigured
 
 # Force IPv4 for Supabase (Render has IPv6 issues)
 _original_getaddrinfo = socket.getaddrinfo
-def _getaddrinfo_ipv4(host, port, family=0, socktype=0, proto=0, flags=0):
+def _getaddrinfo_ipv4(host, port, family=0, type=0, proto=0, flags=0, **kwargs):
+    socktype = kwargs.pop("socktype", type)
     return _original_getaddrinfo(host, port, socket.AF_INET, socktype, proto, flags)
 socket.getaddrinfo = _getaddrinfo_ipv4
 
@@ -26,7 +27,15 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 
 # Quick-start development settings - unsuitable for production
 SECRET_KEY = config('SECRET_KEY')
-DEBUG = config('DEBUG', default=False, cast=bool)
+def _safe_debug_bool(value):
+    normalized = str(value).strip().lower()
+    if normalized in {"1", "true", "t", "yes", "y", "on"}:
+        return True
+    if normalized in {"0", "false", "f", "no", "n", "off", "release", "production", "prod", ""}:
+        return False
+    return False
+
+DEBUG = config('DEBUG', default=False, cast=_safe_debug_bool)
 
 # ==================
 # CLOUDINARY SETUP (Safe)
@@ -196,6 +205,16 @@ else:
         }
     }
 
+if len(sys.argv) > 1 and sys.argv[1] == 'test':
+    TEST_DATABASE_URL = config("TEST_DATABASE_URL", default=None)
+    if TEST_DATABASE_URL:
+        DATABASES["default"] = dj_database_url.parse(TEST_DATABASE_URL, conn_max_age=0)
+    else:
+        DATABASES["default"] = {
+            "ENGINE": "django.db.backends.sqlite3",
+            "NAME": BASE_DIR / "test_db.sqlite3",
+        }
+
 
 # ============================================
 # REDIS & CELERY
@@ -268,7 +287,6 @@ AUTH_PASSWORD_VALIDATORS = [
 ]
 
 AUTHENTICATION_BACKENDS = [
-    'django.contrib.auth.backends.ModelBackend',
     'payroll.authentication.EmailOrUsernameBackend',
 ]
 
@@ -365,6 +383,7 @@ INTERNAL_PAYMENT_OTP_EXPIRY_SECONDS = config('INTERNAL_PAYMENT_OTP_EXPIRY_SECOND
 PAYSTACK_TRANSFER_OTP_ENABLED = config('PAYSTACK_TRANSFER_OTP_ENABLED', default=False, cast=bool)
 
 if EMAIL_BACKEND == 'payroll.email_backend.ResendEmailBackend':
+    _is_validation_command = len(sys.argv) > 1 and sys.argv[1] in {'check', 'test', 'makemigrations', 'shell'}
     missing_resend_settings = [
         name for name, value in {
             'RESEND_API_KEY': RESEND_API_KEY,
@@ -372,7 +391,7 @@ if EMAIL_BACKEND == 'payroll.email_backend.ResendEmailBackend':
         }.items()
         if not str(value or '').strip()
     ]
-    if missing_resend_settings:
+    if missing_resend_settings and not _is_validation_command:
         raise ImproperlyConfigured(
             "Resend email configuration is incomplete. Missing required environment variable(s): "
             + ", ".join(missing_resend_settings)
