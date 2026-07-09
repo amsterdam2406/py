@@ -5,7 +5,7 @@ from rest_framework import serializers
 from .models import (
     Employee, Attendance, Deduction, Payment, Company, 
     SackedEmployee, Notification, OTP, ExportToken, EmployeeRequest, EmployeeRequestAttachment,
-    EmployeeSalaryAdjustment, EmployeeBalanceLedger, ClientMonthlyPayment
+    EmployeeSalaryAdjustment, EmployeeBalanceLedger, ClientMonthlyPayment, Reminder
 )
 
 DEFAULT_SHARED_EMAIL = 'fotasco@gmail.com'
@@ -93,7 +93,24 @@ class UserSerializer(serializers.ModelSerializer):
             'is_superuser', 'is_staff', 'is_active',
             'date_joined', 'last_login', 'groups', 'user_permissions',
         ]
-        read_only_fields = ['id']
+        read_only_fields = [
+            'id',
+            'role',
+            'is_superuser',
+            'is_staff',
+            'is_active',
+            'groups',
+            'user_permissions',
+            'is_company_admin',
+            'is_notification_admin',
+            'is_payment_admin',
+            'is_deduction_admin',
+            'is_employee_admin',
+            'is_request_admin',
+            'is_hr_admin',
+            'date_joined',
+            'last_login',
+        ]
 
     def get_employee_id(self, obj):
         if hasattr(obj, 'employee_profile'):
@@ -418,12 +435,18 @@ class AttendanceSerializer(serializers.ModelSerializer):
 class DeductionSerializer(serializers.ModelSerializer):
     employee_id = serializers.CharField(source='employee.employee_id', read_only=True)
     employee_name = serializers.CharField(source='employee.name', read_only=True)
+    created_by_name = serializers.CharField(source='created_by.username', read_only=True)
+    hr_approved_by_name = serializers.CharField(source='hr_approved_by.username', read_only=True)
     display_status = serializers.SerializerMethodField()
     
     class Meta:
         model = Deduction
-        fields = ['id', 'employee', 'employee_id', 'employee_name', 'amount', 'reason', 'status', 'display_status', 'date', 'created_at']
-        read_only_fields = ['id', 'created_at']
+        fields = [
+            'id', 'employee', 'employee_id', 'employee_name', 'amount', 'reason',
+            'status', 'display_status', 'date', 'hr_approved', 'hr_approved_by',
+            'hr_approved_by_name', 'created_by', 'created_by_name', 'created_at'
+        ]
+        read_only_fields = ['id', 'hr_approved', 'hr_approved_by', 'created_by', 'created_at']
         extra_kwargs = {
             'employee': {'required': True},
             'amount': {'required': True},
@@ -455,6 +478,9 @@ class DeductionSerializer(serializers.ModelSerializer):
 class PaymentSerializer(serializers.ModelSerializer):
     employee_name = serializers.CharField(source='employee.name', read_only=True)
     employee_id = serializers.CharField(source='employee.employee_id', read_only=True)
+    recipient_name = serializers.CharField(source='employee.account_holder', read_only=True)
+    processed_by_name = serializers.CharField(source='processed_by.username', read_only=True)
+    hr_approved_by_name = serializers.CharField(source='hr_approved_by.username', read_only=True)
     bank_account = serializers.SerializerMethodField()
     paystack_otp_required = serializers.SerializerMethodField()
 
@@ -481,10 +507,18 @@ class PaymentSerializer(serializers.ModelSerializer):
             'paystack_reference',
             'paystack_transfer_code',
             'paystack_otp_required',
+            'paystack_last_status',
+            'paystack_last_response',
+            'failure_reason',
             'status',
             'payment_date',
             'processed_by',
+            'processed_by_name',
+            'hr_approved',
+            'hr_approved_by',
+            'hr_approved_by_name',
             'bank_account',
+            'recipient_name',
             'created_at',
             'updated_at',
         ]
@@ -586,10 +620,34 @@ class SackedEmployeeSerializer(serializers.ModelSerializer):
 
 
 class NotificationSerializer(serializers.ModelSerializer):
+    user_name = serializers.CharField(source='user.username', read_only=True)
+    employee_id = serializers.SerializerMethodField()
+
     class Meta:
         model = Notification
         fields = '__all__'
         read_only_fields = ['created_at']
+
+    def get_employee_id(self, obj):
+        employee = getattr(getattr(obj, 'user', None), 'employee_profile', None)
+        return getattr(employee, 'employee_id', None)
+
+
+class ReminderSerializer(serializers.ModelSerializer):
+    user_name = serializers.CharField(source='user.username', read_only=True)
+
+    class Meta:
+        model = Reminder
+        fields = [
+            'id', 'user', 'user_name', 'title', 'purpose', 'remind_at',
+            'is_complete', 'completed_at', 'created_at', 'updated_at'
+        ]
+        read_only_fields = ['id', 'user', 'is_complete', 'completed_at', 'created_at', 'updated_at']
+
+    def validate_remind_at(self, value):
+        if value < timezone.now() - timezone.timedelta(minutes=5):
+            raise serializers.ValidationError("Reminder date/time cannot be in the past.")
+        return value
 
 
 class OTPSerializer(serializers.ModelSerializer):

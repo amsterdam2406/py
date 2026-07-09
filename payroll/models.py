@@ -792,6 +792,13 @@ class Deduction(TimeStampedModel):
         blank=True,
         related_name='hr_approved_deductions'
     )
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='created_deductions'
+    )
     history = HistoricalRecords(excluded_fields=['updated_at'])
 
     objects = DeductionQuerySet.as_manager()
@@ -1456,6 +1463,40 @@ class Notification(TimeStampedModel):
         if not self.is_read:
             self.is_read = True
             self.save(update_fields=['is_read'])
+
+
+# ==================== REMINDERS ====================
+
+class Reminder(TimeStampedModel):
+    """User reminder with optional completion notification."""
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name='reminders'
+    )
+    title = models.CharField(max_length=160)
+    purpose = models.TextField(max_length=1000)
+    remind_at = models.DateTimeField(db_index=True)
+    is_complete = models.BooleanField(default=False)
+    completed_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        db_table = 'reminders'
+        ordering = ['is_complete', 'remind_at']
+        indexes = [
+            models.Index(fields=['user', 'is_complete', 'remind_at'], name='rem_user_status_time_idx'),
+        ]
+
+    def __str__(self):
+        return f"{self.title} - {self.remind_at:%Y-%m-%d %H:%M}"
+
+    def complete(self):
+        if not self.is_complete:
+            self.is_complete = True
+            self.completed_at = timezone.now()
+            self.save(update_fields=['is_complete', 'completed_at', 'updated_at'])
 
 
 # ==================== EMPLOYEE REQUEST ====================

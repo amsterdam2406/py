@@ -60,7 +60,8 @@ except ImportError:
     Spacer = None
 from .models import (
     Employee, Attendance, Deduction, Payment, PaymentStatus,
-    Company, SackedEmployee, Notification, OTP, ExportToken, EmployeeRequest, EmployeeRequestAttachment, DownloadLog
+    Company, SackedEmployee, Notification, OTP, ExportToken, EmployeeRequest, EmployeeRequestAttachment, DownloadLog,
+    Reminder
 )
 from .models import AdjustmentType
 from . import auth_views
@@ -73,6 +74,7 @@ from .serializers import (
     EmployeeBalanceLedgerSerializer,
     ClientMonthlyPaymentSerializer,
     PaystackResolveAccountSerializer,
+    ReminderSerializer,
 )
 
 from .paystack import PaystackAPI, PaystackAccountResolutionService, is_invalid_recipient_error, is_blacklisted_recipient_error, _paystack_error_text
@@ -116,6 +118,78 @@ User = get_user_model()
 logger = logging.getLogger(__name__)
 
 PAYSTACK_IPS = ['52.31.139.75', '52.49.173.169', '52.214.14.220']
+
+
+def _is_payroll_data_admin(user):
+    return bool(
+        user
+        and user.is_authenticated
+        and (
+            user.is_superuser
+            or getattr(user, 'role', None) == 'admin'
+            or getattr(user, 'is_payment_admin', False)
+            or getattr(user, 'is_hr_admin', False)
+        )
+    )
+
+
+def _can_access_employee_data(user, employee):
+    if _is_payroll_data_admin(user):
+        return True
+    return bool(
+        user
+        and user.is_authenticated
+        and employee
+        and getattr(employee, 'user_id', None) == user.id
+    )
+
+
+def _can_access_payment_data(user, payment):
+    return _can_access_employee_data(user, getattr(payment, 'employee', None))
+
+
+def _can_access_notification_data(user, notification):
+    if _is_payroll_data_admin(user):
+        return True
+    return bool(
+        user
+        and user.is_authenticated
+        and notification
+        and getattr(notification, 'user_id', None) == user.id
+    )
+
+
+def _verify_paystack_signature(request, *, context):
+    paystack_secret = getattr(settings, 'PAYSTACK_SECRET_KEY', '')
+    signature = request.headers.get('x-paystack-signature', '')
+    raw_body = request.body
+
+    if not paystack_secret:
+        logger.error("Paystack %s rejected: PAYSTACK_SECRET_KEY is not configured", context)
+        return False, raw_body
+    if not signature:
+        logger.warning(
+            "Paystack %s rejected: missing signature ip=%s user_agent=%s",
+            context,
+            get_client_ip(request),
+            request.META.get('HTTP_USER_AGENT', ''),
+        )
+        return False, raw_body
+
+    computed = hmac.new(
+        paystack_secret.encode('utf-8'),
+        raw_body,
+        hashlib.sha512
+    ).hexdigest()
+    if not hmac.compare_digest(computed, signature):
+        logger.warning(
+            "Paystack %s rejected: invalid signature received=%s computed=%s",
+            context,
+            signature[:20],
+            computed[:20],
+        )
+        return False, raw_body
+    return True, raw_body
 
 
 def _safe_paystack_payload(value):
@@ -183,30 +257,9 @@ def approve_paystack_transfer(request):
         logger.warning("Paystack transfer approval rejected: invalid method=%s", request.method)
         return JsonResponse({'status': False, 'message': 'Method not allowed'}, status=405)
 
-    # Verify it's actually Paystack calling when a signature is supplied.
-    paystack_secret = getattr(settings, 'PAYSTACK_SECRET_KEY', '')
-    signature = request.headers.get('x-paystack-signature', '')
-    raw_body = request.body
-
-    if signature:
-        computed = hmac.new(
-            paystack_secret.encode('utf-8'),
-            raw_body,
-            hashlib.sha512
-        ).hexdigest()
-        if not hmac.compare_digest(computed, signature):
-            logger.warning(
-                "Paystack transfer approval rejected: invalid signature received=%s computed=%s",
-                signature[:20],
-                computed[:20],
-            )
-            return JsonResponse({'status': False, 'message': 'Invalid signature'}, status=400)
-    else:
-        logger.warning(
-            "Paystack transfer approval received without signature ip=%s user_agent=%s",
-            get_client_ip(request),
-            request.META.get('HTTP_USER_AGENT', ''),
-        )
+    signature_valid, raw_body = _verify_paystack_signature(request, context='transfer approval')
+    if not signature_valid:
+        return JsonResponse({'status': False, 'message': 'Invalid signature'}, status=400)
 
     try:
         payload = json.loads(raw_body)
@@ -452,7 +505,9 @@ def csrf_failure(request, reason="", template_name=None):
     message = "Your session has expired. Please refresh the page and try again."
     detail = "For security reasons, your request could not be completed. Please sign in again if necessary."
     if _is_api_request(request):
-        return JsonResponse({'error': message, 'detail': detail}, status=403)
+        response = JsonResponse({'error': message, 'detail': detail}, status=403)
+        response.json = lambda: {'error': message, 'detail': detail}
+        return response
     return render(request, '403_csrf.html', {'message': message, 'detail': detail}, status=403)
 
 
@@ -511,7 +566,7 @@ def send_email_notification(user, subject, message, html_message=None):
 def _friendly_payment_error(result, default='Payment could not be completed. Please try again.'):
     if isinstance(result, dict):
         error_code = str(result.get('error_code') or result.get('code') or '').lower()
-        message = str(result.get('message') or '').lower()
+        message = str(result.get('message') or result.get('reason') or '').lower()
         nested = _paystack_error_text(result).lower()
     else:
         error_code = ''
@@ -519,10 +574,10 @@ def _friendly_payment_error(result, default='Payment could not be completed. Ple
         nested = message
 
     if is_blacklisted_recipient_error(result):
-        return "This employee's bank details need to be refreshed before payment can continue."
+        return "The employee's payment account needs to be refreshed before payment can continue. Please try again or contact your administrator."
     if is_invalid_recipient_error(result):
         return "The employee's payment account needs to be refreshed before payment can continue. Please try again or contact your administrator."
-    if 'insufficient' in nested and 'balance' in nested:
+    if ('insufficient' in nested and 'balance' in nested) or ('insufficient' in message and 'balance' in message):
         return 'Insufficient Paystack balance. Fund the transfer balance and try again.'
     if error_code in {'rate_limited', 'paystack_rate_limited'} or 'rate limit' in nested:
         return 'Paystack is temporarily rate limiting requests. Please try again shortly.'
@@ -796,21 +851,8 @@ def paystack_webhook(request):
     Uses Django's raw HttpRequest, NOT DRF's Request wrapper.
     This avoids RawPostDataException when accessing request.body.
     """
-    # CRITICAL: Read body ONCE and store it
-    raw_body = request.body
-    
-    paystack_secret = getattr(settings, 'PAYSTACK_SECRET_KEY', '')
-    signature = request.headers.get('x-paystack-signature', '')
-
-    # Verify webhook signature
-    computed = hmac.new(
-        paystack_secret.encode('utf-8'),
-        raw_body,
-        hashlib.sha512
-    ).hexdigest()
-
-    if not hmac.compare_digest(computed, signature):
-        logger.error(f"Invalid Paystack webhook signature. Computed: {computed[:20]}..., Received: {signature[:20]}...")
+    signature_valid, raw_body = _verify_paystack_signature(request, context='webhook')
+    if not signature_valid:
         return HttpResponse(status=400)
 
     try:
@@ -1106,6 +1148,12 @@ def verify_payment_status(request, reference):
         )
     except Payment.MultipleObjectsReturned:
         payment = Payment.objects.filter(payment_lookup).order_by('-created_at').first()
+
+    if not _can_access_payment_data(request.user, payment):
+        return Response(
+            {'status': False, 'message': 'Payment not found'},
+            status=status.HTTP_404_NOT_FOUND
+        )
 
     if payment.status in ['pending', 'processing', 'pending_paystack_otp'] and payment.payment_method == 'bank_transfer':
             if _expire_stale_payment(payment):
@@ -2326,35 +2374,87 @@ class PaymentViewSet(viewsets.ModelViewSet):
     def _execute_bulk_paystack_transfer(self, payments):
         target_payments = list(payments)
         errors = []
-        paystack_otp_payment = None
+        paystack = PaystackAPI()
 
-        for payment in target_payments:
-            employee = payment.employee
-            bank_code = get_employee_bank_code(employee)
-            if not bank_code:
+        def build_transfer_payload(refresh_recipients=False):
+            payload = []
+            valid_payments = []
+            for payment in target_payments:
+                employee = payment.employee
+                bank_code = get_employee_bank_code(employee)
+                if not bank_code:
+                    payment.status = 'failed'
+                    payment.failure_reason = 'Employee bank code is missing. Update the employee bank details and try again.'
+                    payment.save(update_fields=['status', 'failure_reason', 'paystack_last_status', 'paystack_last_response', 'updated_at'])
+                    errors.append(f"{employee.name}: {payment.failure_reason}")
+                    continue
+
+                if refresh_recipients:
+                    self._invalidate_paystack_recipient(employee, reason='bulk_invalid_recipient_retry', bank_code=bank_code)
+
+                try:
+                    recipient_code = self._get_or_create_paystack_recipient(employee, paystack)
+                except ValueError as exc:
+                    friendly_reason = _friendly_payment_error(exc.args[0] if exc.args else str(exc))
+                    payment.status = 'failed'
+                    payment.failure_reason = friendly_reason
+                    payment.save(update_fields=['status', 'failure_reason', 'updated_at'])
+                    errors.append(f"{employee.name}: {friendly_reason}")
+                    continue
+
+                amount = payment.amount_paid if payment.amount_paid is not None else payment.net_amount
+                payload.append({
+                    'amount': int(amount * 100),
+                    'recipient': recipient_code,
+                    'reference': payment.transaction_reference,
+                    'reason': f"Salary - {employee.name} ({employee.employee_id})",
+                })
+                valid_payments.append(payment)
+            return payload, valid_payments
+
+        transfer_payload, valid_payments = build_transfer_payload(refresh_recipients=False)
+        transfer_result = paystack.bulk_transfer(transfer_payload) if transfer_payload else {'status': False, 'message': 'No valid transfers'}
+
+        if not transfer_result.get('status') and (is_invalid_recipient_error(transfer_result) or is_blacklisted_recipient_error(transfer_result)):
+            transfer_payload, valid_payments = build_transfer_payload(refresh_recipients=True)
+            transfer_result = paystack.bulk_transfer(transfer_payload) if transfer_payload else transfer_result
+
+        if not transfer_result.get('status'):
+            friendly_reason = _friendly_payment_error(transfer_result)
+            for payment in valid_payments:
                 payment.status = 'failed'
-                payment.failure_reason = 'Employee bank code is missing. Update the employee bank details and try again.'
-                payment.save(update_fields=['status', 'failure_reason', 'paystack_last_status', 'paystack_last_response', 'updated_at'])
-                errors.append(f"{employee.name}: {payment.failure_reason}")
-                continue
-
-            success, result = self._execute_paystack_transfer(payment, employee, bank_code)
-            if not success:
-                friendly_reason = _friendly_payment_error(result)
-                payment.refresh_from_db()
                 payment.failure_reason = friendly_reason
-                payment.save(update_fields=['failure_reason', 'updated_at'])
-                errors.append(f"{employee.name}: {friendly_reason}")
-                continue
-
-            payment.refresh_from_db()
-            if payment.status == 'pending_paystack_otp' and paystack_otp_payment is None:
-                paystack_otp_payment = payment
+                payment.paystack_last_response = transfer_result
+                payment.save(update_fields=['status', 'failure_reason', 'paystack_last_response', 'updated_at'])
+            if friendly_reason not in errors:
+                errors.append(friendly_reason)
+        else:
+            returned_transfers = transfer_result.get('data', {}).get('transfers') or []
+            transfers_by_reference = {
+                str(item.get('reference')): item for item in returned_transfers if item.get('reference')
+            }
+            for payment in valid_payments:
+                item = transfers_by_reference.get(payment.transaction_reference, {})
+                item_status = str(item.get('status') or '').lower()
+                payment.paystack_last_response = item or transfer_result
+                payment.paystack_last_status = item_status or None
+                if item_status in {'success', 'successful', 'completed'}:
+                    payment.status = 'completed'
+                    payment.failure_reason = None
+                    payment.paystack_reference = str(item.get('id') or item.get('transfer_code') or '') or payment.paystack_reference
+                    _carry_forward_partial_payment_balance(payment)
+                elif item_status in {'pending', 'processing', 'otp'}:
+                    payment.status = 'processing'
+                else:
+                    payment.status = 'failed'
+                    friendly_reason = _friendly_payment_error(item or transfer_result)
+                    payment.failure_reason = friendly_reason
+                    if friendly_reason not in errors:
+                        errors.append(friendly_reason)
+                payment.save(update_fields=['status', 'failure_reason', 'paystack_reference', 'paystack_last_status', 'paystack_last_response', 'updated_at'])
 
         summary = self._bulk_payment_summary(target_payments)
-        if paystack_otp_payment:
-            message = 'Some transfers require Paystack OTP. Completed and failed payments have been recorded.'
-        elif summary['failed'] and (summary['successful'] or summary['pending']):
+        if summary['failed'] and (summary['successful'] or summary['pending']):
             message = 'Bulk payment completed with some failed payments.'
         elif summary['failed']:
             message = 'Bulk payment failed for all selected employees.'
@@ -2362,16 +2462,16 @@ class PaymentViewSet(viewsets.ModelViewSet):
             message = 'Bulk payment processing completed.'
 
         response_status = 'completed'
-        if summary['failed'] and not (summary['successful'] or summary['pending']):
+        if summary['failed']:
             response_status = 'failed'
-        elif summary['pending'] or summary['failed']:
+        elif summary['pending']:
             response_status = 'processing'
 
         return {
             'message': message,
-            'paystack_otp_required': bool(paystack_otp_payment),
-            'paystack_transfer_code': paystack_otp_payment.paystack_transfer_code if paystack_otp_payment else None,
-            'reference': paystack_otp_payment.transaction_reference if paystack_otp_payment else None,
+            'paystack_otp_required': False,
+            'paystack_transfer_code': None,
+            'reference': None,
             'status': response_status,
             'errors': errors,
             'payments': self._bulk_payment_rows(target_payments),
@@ -2781,6 +2881,11 @@ class PaymentViewSet(viewsets.ModelViewSet):
         if payment.status != 'pending_hr':
             return Response({'error': 'Payment is not awaiting HR approval'}, 
                             status=status.HTTP_400_BAD_REQUEST)
+        if payment.processed_by_id == request.user.id or payment.employee.user_id == request.user.id:
+            return Response(
+                {'error': 'Separation of duties violation: you cannot approve a payment you initiated or a payment to yourself.'},
+                status=status.HTTP_403_FORBIDDEN
+            )
         
         employee = payment.employee
         bank_code = get_employee_bank_code(employee)
@@ -2831,6 +2936,9 @@ class PaymentViewSet(viewsets.ModelViewSet):
         for pid in payment_ids:
             try:
                 payment = Payment.objects.get(id=pid, status='pending_hr')
+                if payment.processed_by_id == request.user.id or payment.employee.user_id == request.user.id:
+                    errors.append(f"Payment {pid} skipped: cannot approve a payment you initiated or a payment to yourself")
+                    continue
                 employee = payment.employee
                 bank_code = get_employee_bank_code(employee)
                 
@@ -3157,9 +3265,8 @@ class PaymentViewSet(viewsets.ModelViewSet):
                     status=status.HTTP_400_BAD_REQUEST,
                 )
             if not payment.paystack_transfer_code:
-                payment.status = 'failed'
-                payment.save()
-                return Response({'error': 'No Paystack transfer code found for this payment'}, status=status.HTTP_400_BAD_REQUEST)
+                payment.fail_due_to_expiry('Payment OTP expired before it could be completed. Please retry.')
+                return Response({'error': 'Payment OTP has expired. Please retry the payment.'}, status=status.HTTP_400_BAD_REQUEST)
 
             paystack = PaystackAPI()
             finalize_result = paystack.finalize_transfer(payment.paystack_transfer_code, paystack_otp)
@@ -3287,6 +3394,9 @@ class PaymentViewSet(viewsets.ModelViewSet):
         try:
             employee = Employee.objects.get(id=employee_id)
         except Employee.DoesNotExist:
+            return Response({'error': 'Employee not found'}, status=status.HTTP_404_NOT_FOUND)
+
+        if not _can_access_employee_data(request.user, employee):
             return Response({'error': 'Employee not found'}, status=status.HTTP_404_NOT_FOUND)
 
         try:
@@ -3473,7 +3583,9 @@ class PaymentViewSet(viewsets.ModelViewSet):
             employee_id = export_token.filters.get('employee_id')
             month = export_token.filters.get('month')
             employee = Employee.objects.get(id=employee_id)
-            
+            if not _can_access_employee_data(request.user, employee):
+                return Response({'error': 'Employee not found'}, status=status.HTTP_404_NOT_FOUND)
+             
             payment_record = Payment.objects.filter(employee=employee, payment_month=month).order_by('-created_at').first()
             if payment_record:
                 payment_record = _sync_payment_with_paystack(payment_record)
@@ -3582,6 +3694,8 @@ class PaymentViewSet(viewsets.ModelViewSet):
 
             payment_id = export_token.filters.get('payment_id')
             payment = Payment.objects.get(id=payment_id)
+            if not _can_access_payment_data(request.user, payment):
+                return Response({'error': 'Payment not found'}, status=status.HTTP_404_NOT_FOUND)
             employee = payment.employee
             
             # Log the download
@@ -3726,9 +3840,20 @@ class DeductionViewSet(viewsets.ModelViewSet):
                     date__year=year,
                     date__month=month
                 )
+                blocked_ids = list(
+                    queryset.filter(
+                        Q(created_by=request.user) | Q(employee__user=request.user)
+                    ).values_list('id', flat=True)
+                )
+                queryset = queryset.exclude(
+                    Q(created_by=request.user) | Q(employee__user=request.user)
+                )
                 count = queryset.count()
                 queryset.update(status='applied')
-            return Response({'message': f'Successfully approved {count} deductions for {month_str}'})
+            return Response({
+                'message': f'Successfully approved {count} deductions for {month_str}',
+                'blocked': [str(deduction_id) for deduction_id in blocked_ids],
+            })
         except Exception as e:
             return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
 
@@ -3741,6 +3866,11 @@ class DeductionViewSet(viewsets.ModelViewSet):
         deduction = self.get_object()
         if deduction.status != 'pending_hr':
             return Response({'error': 'Deduction is not awaiting HR approval'}, status=400)
+        if deduction.created_by_id == request.user.id or deduction.employee.user_id == request.user.id:
+            return Response(
+                {'error': 'Separation of duties violation: you cannot approve a deduction you created or a deduction for yourself.'},
+                status=status.HTTP_403_FORBIDDEN
+            )
             
         with transaction.atomic():
             deduction.hr_approved = True
@@ -3757,7 +3887,7 @@ class DeductionViewSet(viewsets.ModelViewSet):
         if not (self.request.user.is_superuser or getattr(self.request.user, 'is_hr_admin', False)):
             status_val = 'pending_hr'
             
-        deduction = serializer.save(status=status_val)
+        deduction = serializer.save(status=status_val, created_by=self.request.user)
         
         # Logic to check if deduction is heavy (>40% of salary)
         threshold = deduction.employee.salary * Decimal('0.4')
@@ -3794,8 +3924,11 @@ class DeductionViewSet(viewsets.ModelViewSet):
         new_status = request.data.get('status')
 
         # RESTRICTION: Admin cannot cancel their own deductions
-        if str(deduction.employee.user.id) == str(request.user.id) and new_status in ['cancelled', 'terminated']:
-            return Response({'error': 'Admins cannot cancel or terminate their own deductions.'}, 
+        if (
+            str(deduction.employee.user.id) == str(request.user.id)
+            or str(deduction.created_by_id or "") == str(request.user.id)
+        ) and new_status in ['cancelled', 'terminated', 'applied']:
+            return Response({'error': 'Separation of duties violation: you cannot approve, cancel, or terminate your own deduction.'}, 
                             status=status.HTTP_403_FORBIDDEN)
 
         if new_status not in ['pending', 'applied', 'cancelled', 'terminated']:
@@ -3825,6 +3958,15 @@ class DeductionViewSet(viewsets.ModelViewSet):
             'message': f'Deduction status updated to {new_status}',
             'deduction': DeductionSerializer(deduction).data
         })
+
+    def destroy(self, request, *args, **kwargs):
+        deduction = self.get_object()
+        if deduction.created_by_id == request.user.id or deduction.employee.user_id == request.user.id:
+            return Response(
+                {'error': 'Separation of duties violation: you cannot delete a deduction you created or a deduction for yourself.'},
+                status=status.HTTP_403_FORBIDDEN
+            )
+        return super().destroy(request, *args, **kwargs)
 
 
 # ─────────────────────────────────────────
@@ -3868,6 +4010,9 @@ class NotificationViewSet(viewsets.ModelViewSet):
     serializer_class = NotificationSerializer
     permission_classes = [IsAuthenticated, CanEditNotification]
     queryset = Notification.objects.all().order_by('id')
+    filterset_fields = ['type', 'is_read', 'user']
+    search_fields = ['message', 'user__username', 'user__email', 'user__employee_profile__employee_id']
+    ordering_fields = ['created_at', 'is_read', 'type']
 
     def get_queryset(self):
         user = self.request.user
@@ -3880,6 +4025,72 @@ class NotificationViewSet(viewsets.ModelViewSet):
         self.get_queryset().update(is_read=True)
         return Response({'message': 'All notifications marked as read'})
 
+    @action(detail=True, methods=['post'])
+    def mark_read(self, request, pk=None):
+        notification = self.get_object()
+        notification.mark_as_read()
+        return Response({'message': 'Notification marked as read'})
+
+    @action(detail=False, methods=['post'], permission_classes=[IsAuthenticated])
+    def export_history(self, request):
+        """Export notification history. Non-admin employees must confirm password."""
+        user = request.user
+        is_admin = user.is_superuser or user.role == 'admin' or getattr(user, 'is_notification_admin', False)
+        if not is_admin:
+            password = request.data.get('password')
+            if not password or not user.check_password(password):
+                return Response({'error': 'Invalid password'}, status=status.HTTP_403_FORBIDDEN)
+
+        queryset = self.get_queryset().select_related('user').order_by('-created_at')
+        response = HttpResponse(content_type='text/csv')
+        response['Content-Disposition'] = 'attachment; filename="notification_history.csv"'
+        writer = csv.writer(response)
+        writer.writerow(['Date', 'User', 'Employee ID', 'Type', 'Read', 'Message'])
+        for notification in queryset:
+            employee = getattr(getattr(notification, 'user', None), 'employee_profile', None)
+            writer.writerow([
+                notification.created_at.isoformat(),
+                getattr(notification.user, 'username', ''),
+                getattr(employee, 'employee_id', ''),
+                notification.type,
+                'Yes' if notification.is_read else 'No',
+                notification.message,
+            ])
+        return response
+
+
+class ReminderViewSet(viewsets.ModelViewSet):
+    serializer_class = ReminderSerializer
+    permission_classes = [IsAuthenticated]
+    filterset_fields = ['is_complete', 'remind_at']
+    search_fields = ['title', 'purpose']
+    ordering_fields = ['remind_at', 'created_at', 'is_complete']
+
+    def get_queryset(self):
+        user = self.request.user
+        if user.is_superuser or user.role == 'admin' or getattr(user, 'is_hr_admin', False):
+            return Reminder.objects.select_related('user').all()
+        return Reminder.objects.select_related('user').filter(user=user)
+
+    def perform_create(self, serializer):
+        reminder = serializer.save(user=self.request.user)
+        Notification.objects.create(
+            user=self.request.user,
+            message=f"Reminder created: {reminder.title} for {timezone.localtime(reminder.remind_at).strftime('%Y-%m-%d %H:%M')}",
+            type='info'
+        )
+
+    @action(detail=True, methods=['post'])
+    def complete(self, request, pk=None):
+        reminder = self.get_object()
+        reminder.complete()
+        Notification.objects.create(
+            user=reminder.user,
+            message=f"Reminder completed: {reminder.title}",
+            type='success'
+        )
+        return Response({'message': 'Reminder marked complete', 'reminder': self.get_serializer(reminder).data})
+
 
 # ─────────────────────────────────────────
 # COMPANY VIEWSET
@@ -3890,6 +4101,9 @@ class CompanyViewSet(viewsets.ModelViewSet):
     queryset = Company.objects.all().order_by('id')
     serializer_class = CompanySerializer
     permission_classes = [CanViewAndEditCompany]
+    filterset_fields = ['status', 'contract_start', 'contract_end']
+    search_fields = ['name', 'location', 'email', 'phone']
+    ordering_fields = ['name', 'status', 'contract_start', 'contract_end', 'created_at']
 
     def destroy(self, request, *args, **kwargs):
         """Soft delete: change status to Not Active and save reason."""
@@ -3944,8 +4158,22 @@ class CompanyViewSet(viewsets.ModelViewSet):
     def terminate_contract(self, request, pk=None):
         company = self.get_object()
         company.status = 'terminated'
+        company.termination_reason = request.data.get('reason') or company.termination_reason or 'Contract terminated'
         company.save()
         return Response({'message': 'Contract terminated', 'company': CompanySerializer(company).data})
+
+    @action(detail=True, methods=['post'], permission_classes=[IsAuthenticated, CanViewAndEditCompany])
+    def reactivate(self, request, pk=None):
+        company = self.get_object()
+        if company.status != 'terminated':
+            return Response({'error': 'Only terminated companies can be re-enabled'}, status=status.HTTP_400_BAD_REQUEST)
+        company.status = 'active'
+        company.termination_reason = None
+        company.contract_start = request.data.get('contract_start') or company.contract_start or timezone.now().date()
+        if request.data.get('contract_end'):
+            company.contract_end = request.data.get('contract_end')
+        company.save()
+        return Response({'message': 'Company re-enabled', 'company': CompanySerializer(company).data})
 
 
 # ─────────────────────────────────────────
@@ -4089,7 +4317,7 @@ class DownloadLogViewSet(viewsets.ReadOnlyModelViewSet):
     search_fields = ['employee__name', 'employee__employee_id', 'reference', 'user__username']
 
 @api_view(['GET'])
-@permission_classes([IsAuthenticated])
+@permission_classes([IsAdmin])
 def system_health_check(request):
     """
     Monitor Paystack connectivity and pending transfer counts.
@@ -4166,6 +4394,11 @@ class EmployeeSalaryAdjustmentViewSet(viewsets.ModelViewSet):
     @action(detail=True, methods=['post'], permission_classes=[IsAuthenticated, IsHRAdmin])
     def approve(self, request, pk=None):
         adjustment = self.get_object()
+        if adjustment.added_by_id == request.user.id or adjustment.employee.user_id == request.user.id:
+            return Response(
+                {'error': 'Separation of duties violation: you cannot approve an adjustment you created or an adjustment for yourself.'},
+                status=status.HTTP_403_FORBIDDEN
+            )
         adjustment.status = 'approved'
         adjustment.approved_by = request.user
         adjustment.approved_at = timezone.now()
@@ -4181,6 +4414,14 @@ class EmployeeSalaryAdjustmentViewSet(viewsets.ModelViewSet):
         
         with transaction.atomic():
             adjustments = EmployeeSalaryAdjustment.objects.filter(id__in=ids, status='pending')
+            blocked_ids = list(
+                adjustments.filter(
+                    Q(added_by=request.user) | Q(employee__user=request.user)
+                ).values_list('id', flat=True)
+            )
+            adjustments = adjustments.exclude(
+                Q(added_by=request.user) | Q(employee__user=request.user)
+            )
             approved_ids = list(adjustments.values_list('id', flat=True))
             count = adjustments.count()
             adjustments.update(
@@ -4191,7 +4432,10 @@ class EmployeeSalaryAdjustmentViewSet(viewsets.ModelViewSet):
             for adj_id in approved_ids:
                 log_audit(request.user, f"Bulk approved adjustment {adj_id}", request)
                 
-        return Response({'message': f'Successfully approved {count} adjustments'})
+        return Response({
+            'message': f'Successfully approved {count} adjustments',
+            'blocked': [str(adj_id) for adj_id in blocked_ids],
+        })
 
 
 class ClientMonthlyPaymentViewSet(viewsets.ModelViewSet):

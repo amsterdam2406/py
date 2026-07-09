@@ -1,10 +1,8 @@
 """
-WSGI config for fotasco_payroll project.
+WSGI config for the fotasco_payroll project.
 
-It exposes the WSGI callable as a module-level variable named ``application``.
-
-For more information on this file, see
-https://docs.djangoproject.com/en/5.2/howto/deployment/wsgi/
+This exposes Django's WSGI callable as ``application``. It remains the current
+production entry point for the Render Gunicorn web service.
 """
 
 import os

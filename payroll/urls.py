@@ -12,6 +12,7 @@ router.register(r'payments', views.PaymentViewSet)
 router.register(r'companies', views.CompanyViewSet)
 router.register(r'sacked-employees', views.SackedEmployeeViewSet)
 router.register(r'notifications', views.NotificationViewSet)
+router.register(r'reminders', views.ReminderViewSet, basename='reminders')
 router.register(r'requests', views.EmployeeRequestViewSet)
 router.register(r'download-logs', views.DownloadLogViewSet, basename='download-logs')
 router.register(r'salary-adjustments', views.EmployeeSalaryAdjustmentViewSet)
@@ -106,11 +107,14 @@ urlpatterns = [
 
     # Notification Actions
     path('api/notifications/mark-all-read/', views.NotificationViewSet.as_view({'post': 'mark_all_read'}), name='mark_all_read'),
+    path('api/notifications/<uuid:pk>/mark-read/', views.NotificationViewSet.as_view({'post': 'mark_read'}), name='notification_mark_read'),
+    path('api/notifications/export-history/', views.NotificationViewSet.as_view({'post': 'export_history'}), name='notification_export_history'),
 
     # Company Actions
     path('api/companies/<uuid:pk>/profit/', views.CompanyViewSet.as_view({'get': 'profit'}), name='company_profit'),
     path('api/companies/<uuid:pk>/renew-contract/', views.CompanyViewSet.as_view({'post': 'renew_contract'}), name='company_renew'),
     path('api/companies/<uuid:pk>/terminate-contract/', views.CompanyViewSet.as_view({'post': 'terminate_contract'}), name='company_terminate'),
+    path('api/companies/<uuid:pk>/reactivate/', views.CompanyViewSet.as_view({'post': 'reactivate'}), name='company_reactivate'),
 
     # Request Actions
     path('api/requests/<uuid:pk>/approve/', views.EmployeeRequestViewSet.as_view({'post': 'approve'}), name='request_approve'),

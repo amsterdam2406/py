@@ -137,6 +137,9 @@
                 <li><a href="javascript:void(0)" onclick="showSection('notifications')">
                     <i class="fas fa-bell"></i> <span>Notifications</span>
                 </a></li>
+                <li><a href="javascript:void(0)" onclick="showSection('reminders')">
+                    <i class="fas fa-calendar-check"></i> <span>Reminders</span>
+                </a></li>
             </ul>
         </aside>
 
@@ -761,12 +764,63 @@
                 <!-- Notifications Section -->
                 <section class="content-section" id="notifications">
                     <div class="section-header">
-                        <h2><i class="fas fa-bell"></i> Notifications</h2>
-                        <button onclick="markAllNotificationsAsRead()" class="btn btn-secondary">
-                            <i class="fas fa-check-double"></i> Mark all as read
-                        </button>
+                        <h2><i class="fas fa-bell"></i> Notification Center</h2>
+                        <div class="btn-group">
+                            <button onclick="markAllNotificationsAsRead()" class="btn btn-secondary">
+                                <i class="fas fa-check-double"></i> Mark all as read
+                            </button>
+                            <button onclick="exportNotificationHistory()" class="btn btn-success">
+                                <i class="fas fa-file-export"></i> Export
+                            </button>
+                        </div>
+                    </div>
+                    <div class="filter-bar">
+                        <input type="text" id="notificationSearch" placeholder="Search notifications..." class="search-input">
+                        <select id="notificationTypeFilter" class="filter-select">
+                            <option value="">All Types</option>
+                            <option value="info">Info</option>
+                            <option value="success">Success</option>
+                            <option value="warning">Warning</option>
+                            <option value="error">Error</option>
+                        </select>
+                        <select id="notificationReadFilter" class="filter-select">
+                            <option value="">All Status</option>
+                            <option value="false">Unread</option>
+                            <option value="true">Read</option>
+                        </select>
                     </div>
                     <div id="notificationsList" class="notifications-list"></div>
+                </section>
+
+                <!-- Reminders Section -->
+                <section class="content-section" id="reminders">
+                    <div class="section-header">
+                        <h2><i class="fas fa-calendar-check"></i> Reminders</h2>
+                        <button onclick="showReminderModal()" class="btn btn-primary">
+                            <i class="fas fa-plus"></i> New Reminder
+                        </button>
+                    </div>
+                    <div class="filter-bar">
+                        <input type="text" id="reminderSearch" placeholder="Search reminders..." class="search-input">
+                        <select id="reminderStatusFilter" class="filter-select">
+                            <option value="">All Reminders</option>
+                            <option value="false">Open</option>
+                            <option value="true">Complete</option>
+                        </select>
+                    </div>
+                    <div class="table-responsive">
+                        <table class="data-table">
+                            <thead>
+                                <tr>
+                                    <th>Date/Time</th>
+                                    <th>Purpose</th>
+                                    <th>Status</th>
+                                    <th>Actions</th>
+                                </tr>
+                            </thead>
+                            <tbody id="remindersTableBody"></tbody>
+                        </table>
+                    </div>
                 </section>
             </main>
         </div>
@@ -1361,6 +1415,72 @@
                 <div class="modal-footer">
                     <button onclick="closeModal('employeeDetailModal')" class="btn btn-secondary">Close</button>
                 </div>
+            </div>
+        </div>
+
+        <!-- Payment Detail Modal -->
+        <div id="paymentDetailModal" class="modal" style="display: none;">
+            <div class="modal-content modal-lg">
+                <div class="modal-header">
+                    <h3>Payment Details</h3>
+                    <span class="close" onclick="closeModal('paymentDetailModal')">&times;</span>
+                </div>
+                <div id="paymentDetailContent" class="modal-body"></div>
+            </div>
+        </div>
+
+        <!-- Bulk Payment Preview Modal -->
+        <div id="bulkPaymentPreviewModal" class="modal" style="display: none;">
+            <div class="modal-content modal-lg">
+                <div class="modal-header">
+                    <h3>Confirm Bulk Payment</h3>
+                    <span class="close" onclick="closeModal('bulkPaymentPreviewModal')">&times;</span>
+                </div>
+                <div id="bulkPaymentPreviewContent" class="modal-body"></div>
+                <div class="modal-footer">
+                    <button type="button" onclick="closeModal('bulkPaymentPreviewModal')" class="btn btn-secondary">Cancel</button>
+                    <button type="button" id="confirmBulkPaymentBtn" onclick="confirmBulkPaymentSubmission()" class="btn btn-primary">
+                        <i class="fas fa-check"></i> Confirm Payment
+                    </button>
+                </div>
+            </div>
+        </div>
+
+        <!-- Notification Detail Modal -->
+        <div id="notificationDetailModal" class="modal" style="display: none;">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h3>Notification Details</h3>
+                    <span class="close" onclick="closeModal('notificationDetailModal')">&times;</span>
+                </div>
+                <div id="notificationDetailContent" class="modal-body"></div>
+            </div>
+        </div>
+
+        <!-- Reminder Modal -->
+        <div id="reminderModal" class="modal" style="display: none;">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h3>Create Reminder</h3>
+                    <span class="close" onclick="closeModal('reminderModal')">&times;</span>
+                </div>
+                <form id="reminderForm">
+                    <div class="form-group">
+                        <label for="reminderTitle">Title</label>
+                        <input type="text" id="reminderTitle" class="form-control" maxlength="160" required>
+                    </div>
+                    <div class="form-group">
+                        <label for="reminderAt">Date/Time</label>
+                        <input type="datetime-local" id="reminderAt" class="form-control" required>
+                    </div>
+                    <div class="form-group">
+                        <label for="reminderPurpose">Purpose</label>
+                        <textarea id="reminderPurpose" class="form-control" rows="4" maxlength="1000" required></textarea>
+                    </div>
+                    <button type="submit" class="btn btn-primary btn-block">
+                        <i class="fas fa-calendar-plus"></i> Save Reminder
+                    </button>
+                </form>
             </div>
         </div>
         

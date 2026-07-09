@@ -1,10 +1,9 @@
 """
-ASGI config for fotasco_payroll project.
+ASGI config for the fotasco_payroll project.
 
-It exposes the ASGI callable as a module-level variable named ``application``.
-
-For more information on this file, see
-https://docs.djangoproject.com/en/5.2/howto/deployment/asgi/
+This exposes Django's HTTP ASGI callable as ``application``. The production
+Render web service currently uses WSGI/Gunicorn, so this file is kept ready for
+future ASGI servers or Django Channels without changing today's deployment.
 """
 
 import os

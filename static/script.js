@@ -28,6 +28,7 @@ const AppState = {
   payments: [],
   clientPayments: [],
   notifications: [],
+  reminders: [],
   attendance: [],
   downloadLogs: [],
   currentUser: null,
@@ -43,6 +44,7 @@ const AppState = {
   loginAttempts: 0,
   loginLockedUntil: null,
   selectedEmployeesForBulk: new Set(),
+  pendingBulkPaymentPayload: null,
   bankList: [],
   bankListPromise: null,
   lastVerifiedAccountKey: null,
@@ -240,6 +242,15 @@ function formatDate(dateString) {
   if (!dateString) return "-";
   try {
     return new Date(dateString).toLocaleDateString("en-NG");
+  } catch {
+    return dateString;
+  }
+}
+
+function formatDateTime(dateString) {
+  if (!dateString) return "-";
+  try {
+    return new Date(dateString).toLocaleString("en-NG");
   } catch {
     return dateString;
   }
@@ -671,6 +682,7 @@ const SECTION_LABELS = {
   requests: "requests",
   sacked: "sacked employees",
   notifications: "notifications",
+  reminders: "reminders",
   "audit-logs": "audit logs",
   "company-payments": "company payments",
 };
@@ -721,6 +733,7 @@ async function refreshSectionData(id = AppState.currentSection, options = {}) {
     requests: loadRequests,
     sacked: loadSackedEmployees,
     notifications: loadNotifications,
+    reminders: loadReminders,
     "audit-logs": loadDownloadLogs,
     "company-payments": loadClientPayments,
   };
@@ -813,6 +826,10 @@ function initAutoRefresh() {
 }
 
 async function showSection(id) {
+  if (AppState.currentUser && !getAllowedSectionsForUser(AppState.currentUser).has(id)) {
+    showToast("You do not have access to that section.", "warning");
+    id = "dashboard";
+  }
   updateLoadingProgress(`Loading ${SECTION_LABELS[id] || "section"}...`);
   showLoading();
   AppState.currentSection = id;
@@ -1062,7 +1079,7 @@ async function apiRequest(url, options = {}) {
     ? url
     : `${baseUrl}${url.startsWith("/") ? "" : "/"}${url}`;
 
-  let token = options.auth === false ? null : AppState.accessToken || localStorage.getItem("accessToken");
+  let token = options.auth === false ? null : AppState.accessToken;
 
   // NEW: Proactively refresh token if expired to avoid unnecessary 401 logs and extra roundtrips
   if (options.auth !== false && token && isJwtExpired(token) && !url.includes("/token/refresh/") && !url.includes("/login/")) {
@@ -1234,15 +1251,9 @@ async function refreshAccessToken() {
   const refreshPromise = (async () => {
     try {
       AppState.tokenRefreshNetworkFailed = false;
-      // IMPORTANT: refresh_token cookie is HttpOnly, so JS cannot read it.
-      // Rely only on localStorage (and in-memory AppState) for SPA bootstrapping.
-      const refreshToken =
-        AppState.refreshToken || localStorage.getItem("refreshToken");
-
-      if (!refreshToken) return false;
-
-      // Prefer HttpOnly cookie refresh (DRF reads refresh_token cookie server-side).
-      // Send refresh token in body only if we explicitly have it.
+      // IMPORTANT: refresh_token is HttpOnly, so JS cannot read it.
+      // Use the cookie-backed refresh flow and keep tokens in memory only.
+      const refreshToken = AppState.refreshToken;
       const refreshBody = refreshToken ? { refresh: refreshToken } : null;
 
       const fetchOptions = {
@@ -1269,11 +1280,9 @@ async function refreshAccessToken() {
 
       const data = await response.json();
       AppState.accessToken = data.access;
-      localStorage.setItem("accessToken", data.access);
 
       if (data.refresh) {
         AppState.refreshToken = data.refresh;
-        localStorage.setItem("refreshToken", data.refresh);
       }
 
       return true;
@@ -1426,28 +1435,32 @@ function getPaymentStatusClass(status) {
 
 function renderPaymentAction(payment) {
   const reference = payment.transaction_reference || payment.id;
+  const viewButton = `<button type="button" class="btn btn-sm btn-info" onclick="viewPaymentDetail('${payment.id}')" title="View Details">
+              <i class="fas fa-eye"></i>
+            </button>`;
   if (payment.status === "completed") {
-    return `<span class="text-success"><i class="fas fa-check"></i> Paid</span>
+    return `${viewButton}
+            <span class="text-success"><i class="fas fa-check"></i> Paid</span>
             <button type="button" class="btn btn-sm btn-outline-success" onclick="exportReceipt('${payment.id}')" title="Download Receipt">
               <i class="fas fa-file-invoice"></i>
             </button>`;
   }
   if (payment.status === "pending_paystack_otp") {
-    return `<button type="button" class="btn btn-sm btn-warning" onclick="showPaystackOtpModal('${reference}', '${payment.paystack_transfer_code || ""}')">OTP</button>`;
+    return `${viewButton} <button type="button" class="btn btn-sm btn-warning" onclick="showPaystackOtpModal('${reference}', '${payment.paystack_transfer_code || ""}')">OTP</button>`;
   }
   if (payment.status === "pending") {
-    return `<button type="button" class="btn btn-sm btn-warning" onclick="showInternalOtpModal('${reference}')">Authorize</button>`;
+    return `${viewButton} <button type="button" class="btn btn-sm btn-warning" onclick="showInternalOtpModal('${reference}')">Authorize</button>`;
   }
   if (payment.status === "processing") {
-    return `<button type="button" class="btn btn-sm btn-info" onclick="retryPayment('${reference}')">Sync</button>`;
+    return `${viewButton} <button type="button" class="btn btn-sm btn-info" onclick="retryPayment('${reference}')">Sync</button>`;
   }
   if (payment.status === "pending_hr") {
-    return `<span class="text-warning">Awaiting HR</span>`;
+    return `${viewButton} <span class="text-warning">Awaiting HR</span>`;
   }
   if (payment.status === "failed") {
-    return `<span class="text-danger">Failed</span>`;
+    return `${viewButton} <span class="text-danger">Failed</span>`;
   }
-  return `<button type="button" class="btn btn-sm btn-info" onclick="retryPayment('${reference}')">Check</button>`;
+  return `${viewButton} <button type="button" class="btn btn-sm btn-info" onclick="retryPayment('${reference}')">Check</button>`;
 }
 
 function showInternalOtpModal(reference) {
@@ -1837,11 +1850,6 @@ async function handleLogin(e) {
     AppState.refreshToken = data.refresh;
     AppState.currentUser = data.user;
 
-    localStorage.setItem("accessToken", data.access);
-    localStorage.setItem("refreshToken", data.refresh); // ADDED
-    sessionStorage.setItem("accessToken", data.access);
-    sessionStorage.setItem("isLoggedIn", "true");
-
     document.getElementById("loginPage")?.classList.add("hidden");
     document.getElementById("dashboardPage")?.classList.remove("hidden");
 
@@ -1919,20 +1927,15 @@ async function handleSelfSignup(e) {
 async function logout(silent = false) {
   try {
     if (!silent) showLoading(null, AppState.elements.globalSpinner);
-    const refresh =
-      AppState.refreshToken || localStorage.getItem("refreshToken");
-    // If tokens are already gone, don't even try the network request to avoid noise
-    if (refresh) {
-      await fetch(`${window.location.origin}/logout/`, {
-        method: "POST",
-        credentials: "same-origin",
-        headers: {
-          "Content-Type": "application/json",
-          ...(AppState.accessToken ? { Authorization: `Bearer ${AppState.accessToken}` } : {}),
-        },
-        body: JSON.stringify({ refresh }),
-      }).catch(() => {}); // Ignore errors on logout
-    }
+    await fetch(`${window.location.origin}/logout/`, {
+      method: "POST",
+      credentials: "same-origin",
+      headers: {
+        "Content-Type": "application/json",
+        ...(AppState.accessToken ? { Authorization: `Bearer ${AppState.accessToken}` } : {}),
+      },
+      body: JSON.stringify({}),
+    }).catch(() => {}); // Ignore errors on logout
   } catch (err) {
     console.error("Logout error:", err);
   } finally {
@@ -2146,6 +2149,50 @@ function applyRolePermissions(user) {
     const element = document.getElementById(id);
     if (element) element.style.display = allowed ? "" : "none";
   });
+
+  applyNavigationPermissions(user);
+}
+
+function getAllowedSectionsForUser(user) {
+  const base = new Set(["dashboard", "attendance", "payslips", "history", "notifications", "reminders", "requests"]);
+  if (!user) return base;
+  if (user.is_superuser || user.role === "admin") {
+    return new Set([
+      "dashboard", "employees", "attendance", "deductions", "iou-management",
+      "bonus-management", "payments", "payslips", "companies", "accounts",
+      "history", "requests", "sacked", "notifications", "reminders",
+    ]);
+  }
+  if (user.is_employee_admin) {
+    base.add("employees");
+    base.add("sacked");
+  }
+  if (user.is_deduction_admin) base.add("deductions");
+  if (user.is_payment_admin || user.is_hr_admin) {
+    base.add("payments");
+    base.add("iou-management");
+    base.add("bonus-management");
+  }
+  if (user.is_company_admin) base.add("companies");
+  if (user.is_request_admin) base.add("requests");
+  if (user.is_notification_admin) base.add("notifications");
+  return base;
+}
+
+function applyNavigationPermissions(user) {
+  const allowedSections = getAllowedSectionsForUser(user);
+  document.querySelectorAll(".sidebar-menu a").forEach((link) => {
+    const onclick = link.getAttribute("onclick") || "";
+    const match = onclick.match(/showSection\('([^']+)'\)/);
+    if (!match) return;
+    const item = link.closest("li");
+    const allowed = allowedSections.has(match[1]);
+    if (item) item.style.display = allowed ? "" : "none";
+  });
+
+  if (!allowedSections.has(AppState.currentSection)) {
+    AppState.currentSection = "dashboard";
+  }
 }
 
 // ==========================================
@@ -2717,6 +2764,7 @@ function renderCompanies(list) {
       : company.guards_count || 0;
     const totalToGuards = Number(company.total_payment_to_guards) || 0;
     const profit = Number(company.profit) || 0;
+    const isTerminated = company.status === "terminated";
 
     const row = document.createElement("tr");
     row.innerHTML = `
@@ -2739,11 +2787,31 @@ function renderCompanies(list) {
             <td>
                 <button type="button" class="btn btn-sm btn-primary" onclick="editCompany('${company.id}')">Edit</button>
                 <button type="button" class="btn btn-sm btn-info" onclick="showCompanyPaymentVerifyModal('${company.id}')">Verify Payment</button>
-                <button type="button" class="btn btn-sm btn-danger" onclick="deleteCompany('${company.id}')">Delete</button>
+                ${isTerminated
+                  ? `<button type="button" class="btn btn-sm btn-success" onclick="reactivateCompany('${company.id}')">Re-enable</button>`
+                  : `<button type="button" class="btn btn-sm btn-danger" onclick="deleteCompany('${company.id}')">Deactivate</button>`}
             </td>
         `;
     tbody.appendChild(row);
   });
+}
+
+async function reactivateCompany(companyId) {
+  if (!(await appConfirm("Re-enable this company for a new or resumed contract?"))) return;
+  try {
+    showLoading();
+    const res = await apiRequest(`/api/companies/${companyId}/reactivate/`, {
+      method: "POST",
+      body: { contract_start: new Date().toISOString().split("T")[0] },
+    });
+    if (!res.success) throw new Error(res.message || "Failed to re-enable company");
+    showToast("Company re-enabled", "success");
+    await loadCompanies();
+  } catch (err) {
+    showToast(err.message || "Failed to re-enable company", "error");
+  } finally {
+    hideLoading();
+  }
 }
 
 async function showCompanyPaymentVerifyModal(companyId) {
@@ -3614,7 +3682,74 @@ async function loadPaymentHistory() {
   }
 }
 
-async function processBulkPayment() {
+async function viewPaymentDetail(paymentId) {
+  let payment = (AppState.payments || []).find((p) => idsMatch(p.id, paymentId));
+  if (!payment) {
+    const res = await apiRequest(`/api/payments/${paymentId}/`);
+    if (!res.success) {
+      showToast(res.message || "Payment details could not be loaded", "error");
+      return;
+    }
+    payment = res.data;
+  }
+
+  const content = document.getElementById("paymentDetailContent");
+  if (!content) return;
+
+  const paystackResponse = payment.paystack_last_response
+    ? `<pre class="code-block">${escapeHtml(JSON.stringify(payment.paystack_last_response, null, 2))}</pre>`
+    : '<span class="text-muted">No Paystack response recorded</span>';
+
+  content.innerHTML = `
+    <div class="detail-grid">
+      <div class="detail-section">
+        <h4>Payment Status</h4>
+        <table class="detail-table">
+          <tr><td><strong>Status</strong></td><td>${escapeHtml(formatPaymentStatus(payment.status))}</td></tr>
+          <tr><td><strong>Paid Amount</strong></td><td>${formatCurrency(payment.amount_paid || payment.net_amount || 0)}</td></tr>
+          <tr><td><strong>Partial</strong></td><td>${payment.is_partial ? "Yes" : "No"}</td></tr>
+          <tr><td><strong>Remaining Balance</strong></td><td>${formatCurrency(payment.remaining_balance || 0)}</td></tr>
+          <tr><td><strong>Failure Reason</strong></td><td>${escapeHtml(payment.failure_reason || "-")}</td></tr>
+        </table>
+      </div>
+      <div class="detail-section">
+        <h4>Approval & Processing</h4>
+        <table class="detail-table">
+          <tr><td><strong>HR Approved</strong></td><td>${payment.hr_approved ? "Yes" : "No"}</td></tr>
+          <tr><td><strong>Approved By</strong></td><td>${escapeHtml(payment.hr_approved_by_name || "-")}</td></tr>
+          <tr><td><strong>Processed By</strong></td><td>${escapeHtml(payment.processed_by_name || "-")}</td></tr>
+          <tr><td><strong>Created</strong></td><td>${formatDateTime(payment.created_at)}</td></tr>
+          <tr><td><strong>Updated</strong></td><td>${formatDateTime(payment.updated_at)}</td></tr>
+        </table>
+      </div>
+      <div class="detail-section">
+        <h4>Recipient</h4>
+        <table class="detail-table">
+          <tr><td><strong>Employee</strong></td><td>${escapeHtml(payment.employee_name || "-")} (${escapeHtml(payment.employee_id || "-")})</td></tr>
+          <tr><td><strong>Account Name</strong></td><td>${escapeHtml(payment.recipient_name || "-")}</td></tr>
+          <tr><td><strong>Bank Account</strong></td><td>${escapeHtml(payment.bank_account || "-")}</td></tr>
+          <tr><td><strong>Method</strong></td><td>${escapeHtml(payment.payment_method || "-")}</td></tr>
+        </table>
+      </div>
+      <div class="detail-section">
+        <h4>Transaction</h4>
+        <table class="detail-table">
+          <tr><td><strong>Reference</strong></td><td>${escapeHtml(payment.transaction_reference || "-")}</td></tr>
+          <tr><td><strong>Paystack Ref</strong></td><td>${escapeHtml(payment.paystack_reference || "-")}</td></tr>
+          <tr><td><strong>Transfer Code</strong></td><td>${escapeHtml(payment.paystack_transfer_code || "-")}</td></tr>
+          <tr><td><strong>Paystack Status</strong></td><td>${escapeHtml(payment.paystack_last_status || "-")}</td></tr>
+        </table>
+      </div>
+    </div>
+    <div class="detail-section">
+      <h4>Paystack Response</h4>
+      ${paystackResponse}
+    </div>
+  `;
+  openModal("paymentDetailModal");
+}
+
+async function processBulkPayment(confirmed = false) {
   const checked = Array.from(
     document.querySelectorAll(
       "#bulkPaymentModal tbody input[type=checkbox]:checked",
@@ -3659,6 +3794,12 @@ async function processBulkPayment() {
         return;
       }
       body.partials = partials;
+    }
+
+    if (!confirmed) {
+      AppState.pendingBulkPaymentPayload = { body, checked };
+      await showBulkPaymentConfirmationPreview(body, checked);
+      return;
     }
 
     const res = await apiRequest('/api/payments/bulk_payment/', {
@@ -3715,6 +3856,82 @@ async function processBulkPayment() {
   } finally {
     hideLoading(btn);
   }
+}
+
+async function showBulkPaymentConfirmationPreview(body, checked) {
+  const content = document.getElementById("bulkPaymentPreviewContent");
+  if (!content) return;
+
+  const previewRes = await apiRequest("/api/payments/bulk_preview/", {
+    method: "POST",
+    body,
+  });
+
+  const selectedRows = checked.map((employeeId) => {
+    const employee = AppState.employees.find((emp) => idsMatch(emp.id, employeeId)) || {};
+    const partial = (body.partials || []).find((item) => idsMatch(item.employee_id, employeeId));
+    const netText = document.getElementById(`net-${employeeId}`)?.textContent || formatCurrency(employee.salary || 0);
+    return {
+      employee_id: employee.employee_id || "-",
+      name: employee.name || "-",
+      bank: `${employee.bank_name || "-"} - ${employee.account_number || "-"}`,
+      amount: partial?.partial_amount ? formatCurrency(partial.partial_amount) : netText,
+      type: partial?.partial_amount ? "Partial" : "Full",
+      reason: partial?.partial_reason || "Salary payment",
+      warning: !employee.bank_code ? "Missing bank code" : "",
+    };
+  });
+
+  const warnings = selectedRows.filter((row) => row.warning);
+  const totalAmount = previewRes.success ? previewRes.data.total_amount : 0;
+  const totalCount = previewRes.success ? previewRes.data.count : selectedRows.length;
+
+  content.innerHTML = `
+    <div class="summary-grid">
+      <div class="summary-card"><h4>Employees</h4><p>${totalCount}</p></div>
+      <div class="summary-card"><h4>Total</h4><p>${formatCurrency(totalAmount)}</p></div>
+      <div class="summary-card"><h4>Payment Type</h4><p>Salary</p></div>
+      <div class="summary-card"><h4>Mode</h4><p>${body.partials?.length ? "Full & Partial" : "Full"}</p></div>
+    </div>
+    ${warnings.length ? `<div class="alert alert-warning"><i class="fas fa-triangle-exclamation"></i> ${warnings.length} selected employee(s) need attention before Paystack can process successfully.</div>` : ""}
+    <div class="table-responsive">
+      <table class="data-table">
+        <thead>
+          <tr>
+            <th>Employee</th>
+            <th>Bank</th>
+            <th>Payment</th>
+            <th>Amount</th>
+            <th>Reason</th>
+            <th>Warning</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${selectedRows.map((row) => `
+            <tr>
+              <td>${escapeHtml(row.employee_id)}<br><small>${escapeHtml(row.name)}</small></td>
+              <td>${escapeHtml(row.bank)}</td>
+              <td>${escapeHtml(row.type)}</td>
+              <td>${escapeHtml(row.amount)}</td>
+              <td>${escapeHtml(row.reason)}</td>
+              <td>${row.warning ? `<span class="text-warning">${escapeHtml(row.warning)}</span>` : "-"}</td>
+            </tr>
+          `).join("")}
+        </tbody>
+      </table>
+    </div>
+  `;
+  openModal("bulkPaymentPreviewModal");
+}
+
+async function confirmBulkPaymentSubmission() {
+  if (!AppState.pendingBulkPaymentPayload) {
+    showToast("Bulk payment preview has expired. Please review again.", "warning");
+    closeModal("bulkPaymentPreviewModal");
+    return;
+  }
+  closeModal("bulkPaymentPreviewModal");
+  await processBulkPayment(true);
 }
 
 async function startBulkPaymentPolling(
@@ -4475,8 +4692,16 @@ async function loadNotifications() {
   if (!container) return;
 
   try {
-    // No spinner here, caller manages
-    const res = await apiRequest("/api/notifications/");
+    const params = {
+      search: document.getElementById("notificationSearch")?.value || "",
+      type: document.getElementById("notificationTypeFilter")?.value || "",
+      is_read: document.getElementById("notificationReadFilter")?.value || "",
+      ordering: "-created_at",
+    };
+    Object.keys(params).forEach((key) => {
+      if (!params[key]) delete params[key];
+    });
+    const res = await apiRequest(buildUrl("/api/notifications/", params));
     if (!res.success) throw new Error(res.message);
 
     const list = res.data?.results || res.data || [];
@@ -4495,10 +4720,14 @@ async function loadNotifications() {
         ? new Date(notification.created_at).toLocaleString()
         : "";
 
-      item.className = `notification ${type}`;
+      item.className = `notification ${type} ${notification.is_read ? "is-read" : "is-unread"}`;
+      item.tabIndex = 0;
+      item.onclick = () => viewNotificationDetail(notification.id);
       item.innerHTML = `
                 <strong>${escapeHtml(type.charAt(0).toUpperCase() + type.slice(1))}</strong>
+                ${notification.is_read ? '<span class="badge badge-secondary">Read</span>' : '<span class="badge badge-warning">Unread</span>'}
                 <p>${escapeHtml(notification?.message || "")}</p>
+                ${notification.employee_id ? `<small class="text-muted">Employee: ${escapeHtml(notification.employee_id)}</small>` : ""}
                 ${createdAt ? `<div class="time text-muted">${escapeHtml(createdAt)}</div>` : ""}
             `;
       container.appendChild(item);
@@ -4525,6 +4754,185 @@ async function markAllNotificationsAsRead() {
   } finally {
     hideLoading();
   } // Global spinner
+}
+
+async function viewNotificationDetail(notificationId) {
+  let notification = (AppState.notifications || []).find((item) => idsMatch(item.id, notificationId));
+  if (!notification) {
+    const res = await apiRequest(`/api/notifications/${notificationId}/`);
+    if (!res.success) {
+      showToast(res.message || "Notification could not be loaded", "error");
+      return;
+    }
+    notification = res.data;
+  }
+
+  const content = document.getElementById("notificationDetailContent");
+  if (!content) return;
+  content.innerHTML = `
+    <div class="detail-section">
+      <table class="detail-table">
+        <tr><td><strong>Type</strong></td><td>${escapeHtml(notification.type || "-")}</td></tr>
+        <tr><td><strong>Status</strong></td><td>${notification.is_read ? "Read" : "Unread"}</td></tr>
+        <tr><td><strong>Time</strong></td><td>${formatDateTime(notification.created_at)}</td></tr>
+        <tr><td><strong>User</strong></td><td>${escapeHtml(notification.user_name || "-")}</td></tr>
+        <tr><td><strong>Employee</strong></td><td>${escapeHtml(notification.employee_id || "-")}</td></tr>
+      </table>
+      <p class="notification-detail-message">${escapeHtml(notification.message || "")}</p>
+    </div>
+  `;
+  openModal("notificationDetailModal");
+
+  if (!notification.is_read) {
+    const res = await apiRequest(`/api/notifications/${notification.id}/mark_read/`, { method: "POST" });
+    if (res.success) {
+      notification.is_read = true;
+      await loadNotifications();
+    }
+  }
+}
+
+async function exportNotificationHistory() {
+  let password = "";
+  const isAdmin =
+    AppState.currentUser?.is_superuser ||
+    AppState.currentUser?.role === "admin" ||
+    AppState.currentUser?.is_notification_admin;
+  if (!isAdmin) {
+    password = await appPrompt("Enter your password to download your notification history:", "", "Export Notifications");
+    if (!password) return;
+  }
+
+  try {
+    const response = await fetch(`${CONFIG.API_BASE_URL}/api/notifications/export_history/`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        ...(AppState.accessToken ? { Authorization: `Bearer ${AppState.accessToken}` } : {}),
+        ...(getCookie("csrftoken") ? { "X-CSRFToken": getCookie("csrftoken") } : {}),
+      },
+      body: JSON.stringify({ password }),
+    });
+    if (!response.ok) throw new Error("Notification export failed");
+    const blob = await response.blob();
+    const url = window.URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "notification_history.csv";
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    window.URL.revokeObjectURL(url);
+    showToast("Notification history download started", "success");
+  } catch (err) {
+    showToast(err.message || "Failed to export notifications", "error");
+  }
+}
+
+// ==========================================
+// REMINDERS
+// ==========================================
+
+async function loadReminders() {
+  const tbody = document.getElementById("remindersTableBody");
+  if (!tbody) return;
+
+  const params = {
+    search: document.getElementById("reminderSearch")?.value || "",
+    is_complete: document.getElementById("reminderStatusFilter")?.value || "",
+    ordering: "remind_at",
+  };
+  Object.keys(params).forEach((key) => {
+    if (!params[key]) delete params[key];
+  });
+
+  try {
+    const res = await apiRequest(buildUrl("/api/reminders/", params));
+    if (!res.success) throw new Error(res.message);
+    const list = res.data?.results || res.data || [];
+    AppState.reminders = list;
+    tbody.innerHTML = "";
+
+    if (!list.length) {
+      tbody.innerHTML = '<tr><td colspan="4" class="text-center">No reminders found</td></tr>';
+      return;
+    }
+
+    list.forEach((reminder) => {
+      const row = document.createElement("tr");
+      row.innerHTML = `
+        <td>${formatDateTime(reminder.remind_at)}</td>
+        <td>
+          <strong>${escapeHtml(reminder.title || "-")}</strong><br>
+          <small>${escapeHtml(reminder.purpose || "")}</small>
+        </td>
+        <td><span class="badge ${reminder.is_complete ? "badge-success" : "badge-warning"}">${reminder.is_complete ? "Complete" : "Open"}</span></td>
+        <td>
+          ${reminder.is_complete ? "-" : `<button type="button" class="btn btn-sm btn-success" onclick="completeReminder('${reminder.id}')"><i class="fas fa-check"></i> Complete</button>`}
+        </td>
+      `;
+      tbody.appendChild(row);
+    });
+  } catch (err) {
+    tbody.innerHTML = '<tr><td colspan="4" class="text-center text-danger">Failed to load reminders</td></tr>';
+    showToast(err.message || "Failed to load reminders", "error");
+  }
+}
+
+function showReminderModal() {
+  const form = document.getElementById("reminderForm");
+  if (form) form.reset();
+  const input = document.getElementById("reminderAt");
+  if (input) {
+    const soon = new Date(Date.now() + 60 * 60 * 1000);
+    soon.setMinutes(soon.getMinutes() - soon.getTimezoneOffset());
+    input.value = soon.toISOString().slice(0, 16);
+  }
+  openModal("reminderModal");
+}
+
+async function handleReminderSubmit(e) {
+  e.preventDefault();
+  const btn = e.target.querySelector('button[type="submit"]');
+  const title = document.getElementById("reminderTitle")?.value.trim();
+  const purpose = document.getElementById("reminderPurpose")?.value.trim();
+  const remindAt = document.getElementById("reminderAt")?.value;
+
+  if (!title || !purpose || !remindAt) {
+    showToast("Reminder title, date/time, and purpose are required", "warning");
+    return;
+  }
+
+  try {
+    showLoading(btn);
+    const res = await apiRequest("/api/reminders/", {
+      method: "POST",
+      body: {
+        title,
+        purpose,
+        remind_at: new Date(remindAt).toISOString(),
+      },
+    });
+    if (!res.success) throw new Error(res.message || "Failed to save reminder");
+    closeModal("reminderModal");
+    showToast("Reminder created", "success");
+    await loadReminders();
+  } catch (err) {
+    showToast(err.message || "Failed to save reminder", "error");
+  } finally {
+    hideLoading(btn);
+  }
+}
+
+async function completeReminder(reminderId) {
+  const res = await apiRequest(`/api/reminders/${reminderId}/complete/`, { method: "POST" });
+  if (res.success) {
+    showToast("Reminder marked complete", "success");
+    await loadReminders();
+    await loadNotifications();
+  } else {
+    showToast(res.message || "Failed to update reminder", "error");
+  }
 }
 
 // ==========================================
@@ -5659,8 +6067,7 @@ function exportPaymentHistory() {
 async function triggerSecureDownload(url, token, filename, { method = null } = {}) {
   try {
     showLoading(null, AppState.elements.globalSpinner);
-    const accessToken =
-      AppState.accessToken || localStorage.getItem("accessToken");
+    const accessToken = AppState.accessToken;
 
     // Employees + payments CSV endpoints expect `token` as a query param (GET action).
     // Payslip/receipt PDF endpoints also expect `token` as a query param.
@@ -6100,6 +6507,24 @@ function initAdjustmentSearch() {
     });
 }
 
+function initNotificationAndReminderFilters() {
+  ["notificationSearch", "notificationTypeFilter", "notificationReadFilter"].forEach((id) => {
+    const el = document.getElementById(id);
+    if (!el || el.dataset.filterBound === "true") return;
+    el.dataset.filterBound = "true";
+    const eventName = el.tagName === "INPUT" ? "input" : "change";
+    el.addEventListener(eventName, debounce(loadNotifications, 300));
+  });
+
+  ["reminderSearch", "reminderStatusFilter"].forEach((id) => {
+    const el = document.getElementById(id);
+    if (!el || el.dataset.filterBound === "true") return;
+    el.dataset.filterBound = "true";
+    const eventName = el.tagName === "INPUT" ? "input" : "change";
+    el.addEventListener(eventName, debounce(loadReminders, 300));
+  });
+}
+
 function setupBankCodeTracking() {
   const bankSelects = [
     document.getElementById("accountBankName"),
@@ -6122,6 +6547,7 @@ function setupBankCodeTracking() {
 function setupEventListeners() {
   initEmployeeSearch();
   initAdjustmentSearch();
+  initNotificationAndReminderFilters();
   setupEmployeeIdGeneration();
   setupBankCodeTracking(); // Fixed: Ensure bank code tracking is set up
   setupBankVerification();
@@ -6188,6 +6614,7 @@ function setupEventListeners() {
     { id: "leaveForm", handler: handleMarkLeave }, // ADDED
     { id: "requestForm", handler: handleCreateRequest },
     { id: "addAdjustmentForm", handler: handleAddAdjustment },
+    { id: "reminderForm", handler: handleReminderSubmit },
     // FIX: Ensure export confirm submit actually triggers confirmExport()
     { id: "exportPasswordForm", handler: confirmExport },
     { id: "paystackOtpForm", handler: submitPaystackOtp },
@@ -6297,7 +6724,7 @@ async function downloadRequestAttachments(requestId) {
 
   showLoading(); // Global spinner
   try {
-    const token = AppState.accessToken || localStorage.getItem("accessToken");
+    const token = AppState.accessToken;
     const response = await fetch(
       `${window.location.origin}/api/requests/${requestId}/download_attachments/`,
       {
@@ -6512,6 +6939,7 @@ async function loadDashboard() {
         loadAttendance(),
         loadSackedEmployees(),
         loadNotifications(),
+        loadReminders(),
       ]);
 
       // Step 3: Admin-only
@@ -6534,7 +6962,7 @@ async function loadDashboard() {
       // Step 5: Non-critical
       setTimeout(loadNigerianBanks, 2000);
       const now = Date.now();
-      ["dashboard", "employees", "attendance", "deductions", "requests", "sacked", "notifications"].forEach((sectionId) => {
+      ["dashboard", "employees", "attendance", "deductions", "requests", "sacked", "notifications", "reminders"].forEach((sectionId) => {
         AppState.lastSectionRefresh[sectionId] = now;
       });
     } catch (innerErr) {
@@ -6632,28 +7060,12 @@ document.addEventListener("DOMContentLoaded", async () => {
       openModal("resetPasswordModal");
     }
 
-    const storedToken =
-      localStorage.getItem("accessToken") ||
-      sessionStorage.getItem("accessToken");
-    const storedRefresh = localStorage.getItem("refreshToken");
-
-    if (!storedToken) {
-      console.log("No token found, showing login page");
+    const refreshed = await refreshAccessToken();
+    if (!refreshed) {
+      console.log("No active session found, showing login page");
       showLoginPage();
       setupEventListeners();
       return;
-    }
-
-    AppState.accessToken = storedToken;
-    if (storedRefresh) AppState.refreshToken = storedRefresh;
-
-    if (isJwtExpired(AppState.accessToken)) {
-      // No spinner for internal token check
-      console.log(
-        "Stored access token expired, refreshing before verification...",
-      );
-      const refreshed = await refreshAccessToken();
-      if (!refreshed) throw new Error("Cannot refresh token");
     }
 
     // Step 2: verify current user (at most 2 attempts total)
@@ -6735,6 +7147,7 @@ const EXPOSED_FUNCTIONS = {
   handleCreateCompany,
   editCompany,
   deleteCompany,
+  reactivateCompany,
   populateCompanyGuards,
   showCompanyPaymentVerifyModal,
   saveCompanyPaymentVerification,
@@ -6772,6 +7185,7 @@ const EXPOSED_FUNCTIONS = {
   // handleIndividualpayment,
   handleIndividualPaymentSubmit,
   processBulkPayment,
+  confirmBulkPaymentSubmission,
   updateBulkTotal, // Fixed: Ensure updateBulkTotal is exposed
   toggleAllBulkPayments,
   populateBulkTable,
@@ -6795,6 +7209,14 @@ const EXPOSED_FUNCTIONS = {
   // Notifications
   loadNotifications,
   markAllNotificationsAsRead,
+  viewNotificationDetail,
+  exportNotificationHistory,
+
+  // Reminders
+  loadReminders,
+  showReminderModal,
+  handleReminderSubmit,
+  completeReminder,
 
   // Audit Logs
   loadDownloadLogs,
@@ -6823,6 +7245,7 @@ const EXPOSED_FUNCTIONS = {
   clearBankCache,
   setupBankCodeTracking,
   viewEmployeeDetail,
+  viewPaymentDetail,
 
   // Requests
   showRequestModal,
