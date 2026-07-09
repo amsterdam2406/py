@@ -96,7 +96,6 @@ Thumbs.db
 # Render/Production
 *.pyc
 payroll/test_paystack_account_resolution.py
-render.yaml
 payroll/tests_auth_audit.py
 payroll/tests_payment_otp.py
 payroll/tests_dashboard.py 

@@ -1,0 +1,387 @@
+# ============================================================================
+# FOTASCO PAYROLL
+# Render Blueprint
+#
+# This Blueprint mirrors the current production infrastructure.
+#
+# Current Infrastructure
+# ----------------------
+# ✔ Django 4.2
+# ✔ Gunicorn
+# ✔ Supabase PostgreSQL
+# ✔ Render Redis (Valkey)
+# ✔ Cloudinary
+# ✔ Paystack
+# ✔ Resend
+#
+# Future Infrastructure (later)
+# --------------------------------
+# • Celery Worker
+# • Celery Beat Scheduler
+# • Cloudflare
+# • Cron Jobs
+#
+# ============================================================================
+services:
+
+##############################################################################
+# MAIN DJANGO WEB SERVICE
+##############################################################################
+
+  - type: web
+    name: fot_pyroll
+    runtime: python
+
+    # ----------------------------------------------------
+    # Leave plan unset so you choose it in the Render UI.
+    # This avoids hardcoding pricing into the Blueprint.
+    # ----------------------------------------------------
+
+    buildCommand: |
+      pip install --upgrade pip setuptools
+      pip install -r requirements/production.txt
+      python manage.py collectstatic --no-input
+      python manage.py migrate --noinput
+      python manage.py init_superuser
+
+    startCommand: >
+      gunicorn fotasco_payroll.wsgi:application
+      --workers=3
+      --timeout=120
+      --worker-tmp-dir=/dev/shm
+      --max-requests=1000
+      --max-requests-jitter=100
+      --access-logfile -
+
+    #######################################################
+    # Health Check
+    #######################################################
+
+    # Change if your endpoint differs.
+    healthCheckPath: /health-check/
+
+    #######################################################
+    # Auto Deploy
+    #######################################################
+
+    autoDeploy: false
+
+    #######################################################
+    # Environment Variables
+    #######################################################
+
+    envVars:
+
+    #################################################################
+    # Django
+    #################################################################
+
+      - key: PYTHON_VERSION
+        value: "3.11.0"
+
+      - key: DEBUG
+        value: "False"
+
+      - key: SECRET_KEY
+        sync: false
+
+      - key: ALLOWED_HOSTS
+        sync: false
+
+      - key: CSRF_TRUSTED_ORIGINS
+        sync: false
+
+      - key: FRONTEND_URL
+        sync: false
+
+    #################################################################
+    # Database (Supabase)
+    #################################################################
+
+      - key: DATABASE_URL
+        sync: false
+
+    #################################################################
+    # Redis (Render Valkey)
+    #################################################################
+
+      - key: REDIS_URL
+        sync: false
+
+    #################################################################
+    # Cloudinary
+    #################################################################
+
+      - key: CLOUDINARY_CLOUD_NAME
+        sync: false
+
+      - key: CLOUDINARY_API_KEY
+        sync: false
+
+      - key: CLOUDINARY_API_SECRET
+        sync: false
+
+    #################################################################
+    # Paystack
+    #################################################################
+
+      - key: PAYSTACK_PUBLIC_KEY
+        sync: false
+
+      - key: PAYSTACK_SECRET_KEY
+        sync: false
+
+      - key: PAYSTACK_CALLBACK_URL
+        sync: false
+
+      - key: PAYSTACK_WEBHOOK_URL
+        sync: false
+
+      - key: PAYSTACK_TRANSFER_TIMEOUT_SECONDS
+        sync: false
+
+      - key: PAYSTACK_REQUEST_TIMEOUT_SECONDS
+        sync: false
+
+      - key: PAYSTACK_ACCOUNT_RESOLVE_TIMEOUT_SECONDS
+        sync: false
+
+      - key: PAYSTACK_ACCOUNT_RESOLVE_ATTEMPTS
+        sync: false
+
+      - key: PAYSTACK_BULK_TRANSFER_TIMEOUT_SECONDS
+        sync: false
+
+      - key: PAYSTACK_TRANSFER_OTP_ENABLED
+        sync: false
+
+    #################################################################
+    # Resend Email
+    #################################################################
+
+      - key: RESEND_API_KEY
+        sync: false
+
+      - key: RESEND_SENDER_EMAIL
+        sync: false
+
+      - key: RESEND_SENDER_NAME
+        sync: false
+
+      - key: RESEND_REPLY_TO
+        sync: false
+
+      - key: RESEND_EMAIL_WORKERS
+        sync: false
+
+      - key: RESEND_EMAIL_CONNECT_TIMEOUT_SECONDS
+        sync: false
+
+      - key: RESEND_EMAIL_READ_TIMEOUT_SECONDS
+        sync: false
+
+      - key: RESEND_EMAIL_RETRIES
+        sync: false
+
+      - key: DEFAULT_FROM_EMAIL
+        sync: false
+
+    #################################################################
+    # Django Superuser
+    #################################################################
+
+      - key: DJANGO_SUPERUSER_USERNAME
+        sync: false
+
+      - key: DJANGO_SUPERUSER_EMAIL
+        sync: false
+
+      - key: DJANGO_SUPERUSER_PASSWORD
+        sync: false
+
+    #################################################################
+    # Internal Application
+    #################################################################
+
+      - key: INTERNAL_PAYMENT_OTP_EXPIRY_SECONDS
+        sync: false
+
+##############################################################################
+# CELERY WORKER
+##############################################################################
+
+  - type: worker
+    name: fot_pyroll-worker
+    runtime: python
+
+    buildCommand: |
+      pip install --upgrade pip setuptools
+      pip install -r requirements/production.txt
+
+    startCommand: >
+      celery -A fotasco_payroll worker
+      --loglevel=info
+      --concurrency=2
+
+    autoDeploy: false
+
+    envVars:
+
+      - key: PYTHON_VERSION
+        value: "3.11.0"
+
+      - key: DEBUG
+        value: "False"
+
+      - key: SECRET_KEY
+        sync: false
+
+      - key: DATABASE_URL
+        sync: false
+
+      - key: REDIS_URL
+        sync: false
+
+      - key: CLOUDINARY_CLOUD_NAME
+        sync: false
+
+      - key: CLOUDINARY_API_KEY
+        sync: false
+
+      - key: CLOUDINARY_API_SECRET
+        sync: false
+
+      - key: PAYSTACK_PUBLIC_KEY
+        sync: false
+
+      - key: PAYSTACK_SECRET_KEY
+        sync: false
+
+      - key: PAYSTACK_CALLBACK_URL
+        sync: false
+
+      - key: PAYSTACK_WEBHOOK_URL
+        sync: false
+
+      - key: PAYSTACK_TRANSFER_TIMEOUT_SECONDS
+        sync: false
+
+      - key: PAYSTACK_REQUEST_TIMEOUT_SECONDS
+        sync: false
+
+      - key: PAYSTACK_ACCOUNT_RESOLVE_TIMEOUT_SECONDS
+        sync: false
+
+      - key: PAYSTACK_ACCOUNT_RESOLVE_ATTEMPTS
+        sync: false
+
+      - key: PAYSTACK_BULK_TRANSFER_TIMEOUT_SECONDS
+        sync: false
+
+      - key: PAYSTACK_TRANSFER_OTP_ENABLED
+        sync: false
+
+      - key: RESEND_API_KEY
+        sync: false
+
+      - key: RESEND_SENDER_EMAIL
+        sync: false
+
+      - key: RESEND_SENDER_NAME
+        sync: false
+
+      - key: RESEND_REPLY_TO
+        sync: false
+
+      - key: RESEND_EMAIL_WORKERS
+        sync: false
+
+      - key: RESEND_EMAIL_CONNECT_TIMEOUT_SECONDS
+        sync: false
+
+      - key: RESEND_EMAIL_READ_TIMEOUT_SECONDS
+        sync: false
+
+      - key: RESEND_EMAIL_RETRIES
+        sync: false
+
+      - key: DEFAULT_FROM_EMAIL
+        sync: false
+
+      - key: INTERNAL_PAYMENT_OTP_EXPIRY_SECONDS
+        sync: false
+
+##############################################################################
+# CELERY BEAT
+##############################################################################
+
+  - type: worker
+    name: fot_pyroll-beat
+    runtime: python
+
+    buildCommand: |
+      pip install --upgrade pip setuptools
+      pip install -r requirements/production.txt
+
+    startCommand: >
+      celery -A fotasco_payroll beat
+      --loglevel=info
+      --scheduler django_celery_beat.schedulers:DatabaseScheduler
+
+    autoDeploy: false
+
+    envVars:
+
+      - key: PYTHON_VERSION
+        value: "3.11.0"
+
+      - key: DEBUG
+        value: "False"
+
+      - key: SECRET_KEY
+        sync: false
+
+      - key: DATABASE_URL
+        sync: false
+
+      - key: REDIS_URL
+        sync: false
+
+      - key: RESEND_API_KEY
+        sync: false
+
+      - key: RESEND_SENDER_EMAIL
+        sync: false
+
+      - key: RESEND_SENDER_NAME
+        sync: false
+
+      - key: RESEND_REPLY_TO
+        sync: false
+
+##############################################################################
+# FUTURE CRON JOBS
+##############################################################################
+
+# cronJobs:
+#
+#   - name: payroll-monthly-processing
+#     schedule: "0 0 28 * *"
+#     command: python manage.py process_monthly_payroll
+
+##############################################################################
+# FUTURE CLOUDFLARE
+#
+# Documentation will be added later.
+#
+# Planned:
+#
+# • Custom Domain
+# • SSL
+# • DNS
+# • Firewall
+# • Rate Limiting
+# • CDN
+# • WAF
+#
+##############################################################################
