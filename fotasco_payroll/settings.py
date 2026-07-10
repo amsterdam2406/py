@@ -92,11 +92,6 @@ STATIC_URL = '/static/'
 STATICFILES_DIRS = [BASE_DIR / "static"]
 STATIC_ROOT = os.path.join(BASE_DIR, 'staticfiles')
 
-# Compatibility for django-cloudinary-storage 0.3.0, whose collectstatic
-# command still reads Django's pre-4.2 storage setting names.
-STATICFILES_STORAGE = "whitenoise.storage.CompressedManifestStaticFilesStorage"
-DEFAULT_FILE_STORAGE = STORAGES["default"]["BACKEND"]
-
 WHITENOISE_MAX_AGE = 31536000
 
 ALLOWED_HOSTS = [
