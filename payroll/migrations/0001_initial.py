@@ -684,7 +684,7 @@ class Migration(migrations.Migration):
         ),
         migrations.AddConstraint(
             model_name='employee',
-            constraint=models.CheckConstraint(condition=models.Q(('salary__gte', 0)), name='employee_salary_positive'),
+            constraint=models.CheckConstraint(check=models.Q(('salary__gte', 0)), name='employee_salary_positive'),
         ),
         migrations.AddIndex(
             model_name='downloadlog',
@@ -704,11 +704,11 @@ class Migration(migrations.Migration):
         ),
         migrations.AddConstraint(
             model_name='deduction',
-            constraint=models.CheckConstraint(condition=models.Q(('amount__gte', 0)), name='deduction_amount_positive'),
+            constraint=models.CheckConstraint(check=models.Q(('amount__gte', 0)), name='deduction_amount_positive'),
         ),
         migrations.AddConstraint(
             model_name='deduction',
-            constraint=models.CheckConstraint(condition=models.Q(models.Q(('status', 'pending'), ('status', 'applied'), ('status', 'cancelled'), ('status', 'terminated'), ('status', 'pending_hr'), _connector='OR')), name='deduction_status_valid'),
+            constraint=models.CheckConstraint(check=models.Q(models.Q(('status', 'pending'), ('status', 'applied'), ('status', 'cancelled'), ('status', 'terminated'), ('status', 'pending_hr'), _connector='OR')), name='deduction_status_valid'),
         ),
         migrations.AddIndex(
             model_name='company',
@@ -720,15 +720,15 @@ class Migration(migrations.Migration):
         ),
         migrations.AddConstraint(
             model_name='company',
-            constraint=models.CheckConstraint(condition=models.Q(('payment_to_us__gte', 0)), name='company_payment_positive'),
+            constraint=models.CheckConstraint(check=models.Q(('payment_to_us__gte', 0)), name='company_payment_positive'),
         ),
         migrations.AddConstraint(
             model_name='company',
-            constraint=models.CheckConstraint(condition=models.Q(('payment_per_guard__gte', 0)), name='company_payment_per_guard_positive'),
+            constraint=models.CheckConstraint(check=models.Q(('payment_per_guard__gte', 0)), name='company_payment_per_guard_positive'),
         ),
         migrations.AddConstraint(
             model_name='company',
-            constraint=models.CheckConstraint(condition=models.Q(models.Q(('status', 'active'), ('status', 'terminated'), ('status', 'reactivated'), _connector='OR')), name='company_status_valid'),
+            constraint=models.CheckConstraint(check=models.Q(models.Q(('status', 'active'), ('status', 'terminated'), ('status', 'reactivated'), _connector='OR')), name='company_status_valid'),
         ),
         migrations.AddIndex(
             model_name='attendance',
@@ -788,23 +788,23 @@ class Migration(migrations.Migration):
         ),
         migrations.AddConstraint(
             model_name='payment',
-            constraint=models.CheckConstraint(condition=models.Q(('base_salary__gte', 0)), name='payment_base_salary_positive'),
+            constraint=models.CheckConstraint(check=models.Q(('base_salary__gte', 0)), name='payment_base_salary_positive'),
         ),
         migrations.AddConstraint(
             model_name='payment',
-            constraint=models.CheckConstraint(condition=models.Q(('total_deductions__gte', 0)), name='payment_deductions_positive'),
+            constraint=models.CheckConstraint(check=models.Q(('total_deductions__gte', 0)), name='payment_deductions_positive'),
         ),
         migrations.AddConstraint(
             model_name='payment',
-            constraint=models.CheckConstraint(condition=models.Q(('net_amount__gte', 0)), name='payment_net_amount_positive'),
+            constraint=models.CheckConstraint(check=models.Q(('net_amount__gte', 0)), name='payment_net_amount_positive'),
         ),
         migrations.AddConstraint(
             model_name='payment',
-            constraint=models.CheckConstraint(condition=models.Q(models.Q(('status', 'pending'), ('status', 'processing'), ('status', 'completed'), ('status', 'failed'), ('status', 'pending_paystack_otp'), ('status', 'pending_hr'), ('status', 'cancelled'), _connector='OR')), name='payment_status_valid'),
+            constraint=models.CheckConstraint(check=models.Q(models.Q(('status', 'pending'), ('status', 'processing'), ('status', 'completed'), ('status', 'failed'), ('status', 'pending_paystack_otp'), ('status', 'pending_hr'), ('status', 'cancelled'), _connector='OR')), name='payment_status_valid'),
         ),
         migrations.AddConstraint(
             model_name='payment',
-            constraint=models.CheckConstraint(condition=models.Q(('is_partial', False), ('amount_paid__lt', models.F('net_amount')), _connector='OR'), name='partial_payment_consistency'),
+            constraint=models.CheckConstraint(check=models.Q(('is_partial', False), ('amount_paid__lt', models.F('net_amount')), _connector='OR'), name='partial_payment_consistency'),
         ),
         migrations.AddIndex(
             model_name='sackedemployee',

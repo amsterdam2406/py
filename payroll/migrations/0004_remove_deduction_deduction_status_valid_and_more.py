@@ -57,18 +57,18 @@ class Migration(migrations.Migration):
         ),
         migrations.AddConstraint(
             model_name='deduction',
-            constraint=models.CheckConstraint(condition=models.Q(('amount_paid__gte', 0)), name='deduction_amount_paid_positive'),
+            constraint=models.CheckConstraint(check=models.Q(('amount_paid__gte', 0)), name='deduction_amount_paid_positive'),
         ),
         migrations.AddConstraint(
             model_name='deduction',
-            constraint=models.CheckConstraint(condition=models.Q(('remaining_balance__gte', 0)), name='deduction_remaining_balance_positive'),
+            constraint=models.CheckConstraint(check=models.Q(('remaining_balance__gte', 0)), name='deduction_remaining_balance_positive'),
         ),
         migrations.AddConstraint(
             model_name='deduction',
-            constraint=models.CheckConstraint(condition=models.Q(('amount_paid__lte', models.F('amount'))), name='deduction_amount_paid_not_over_amount'),
+            constraint=models.CheckConstraint(check=models.Q(('amount_paid__lte', models.F('amount'))), name='deduction_amount_paid_not_over_amount'),
         ),
         migrations.AddConstraint(
             model_name='deduction',
-            constraint=models.CheckConstraint(condition=models.Q(models.Q(('status', 'pending'), ('status', 'partial'), ('status', 'settled'), ('status', 'applied'), ('status', 'cancelled'), ('status', 'terminated'), ('status', 'pending_hr'), _connector='OR')), name='deduction_status_valid'),
+            constraint=models.CheckConstraint(check=models.Q(models.Q(('status', 'pending'), ('status', 'partial'), ('status', 'settled'), ('status', 'applied'), ('status', 'cancelled'), ('status', 'terminated'), ('status', 'pending_hr'), _connector='OR')), name='deduction_status_valid'),
         ),
     ]

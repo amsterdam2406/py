@@ -234,7 +234,7 @@ class Migration(migrations.Migration):
         migrations.AddConstraint(
             model_name='payment',
             constraint=models.CheckConstraint(
-                condition=(
+                check=(
                     (
                         models.Q(is_partial=True) &
                         models.Q(amount_paid__isnull=False) &
