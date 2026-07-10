@@ -10,7 +10,6 @@ from datetime import timedelta
 import importlib
 import dj_database_url
 import socket
-from django.core.exceptions import ImproperlyConfigured
 
 # Force IPv4 for Supabase (Render has IPv6 issues)
 _original_getaddrinfo = socket.getaddrinfo
@@ -396,21 +395,6 @@ RESEND_EMAIL_MAX_QUEUED_TASKS = config('RESEND_EMAIL_MAX_QUEUED_TASKS', default=
 DEFAULT_FROM_EMAIL = f"{RESEND_SENDER_NAME} <{RESEND_SENDER_EMAIL}>"
 INTERNAL_PAYMENT_OTP_EXPIRY_SECONDS = config('INTERNAL_PAYMENT_OTP_EXPIRY_SECONDS', default=60, cast=int)
 PAYSTACK_TRANSFER_OTP_ENABLED = config('PAYSTACK_TRANSFER_OTP_ENABLED', default=False, cast=bool)
-
-if EMAIL_BACKEND == 'payroll.email_backend.ResendEmailBackend':
-    _is_validation_command = len(sys.argv) > 1 and sys.argv[1] in {'check', 'test', 'makemigrations', 'shell'}
-    missing_resend_settings = [
-        name for name, value in {
-            'RESEND_API_KEY': RESEND_API_KEY,
-            'RESEND_SENDER_EMAIL': RESEND_SENDER_EMAIL,
-        }.items()
-        if not str(value or '').strip()
-    ]
-    if missing_resend_settings and not _is_validation_command:
-        raise ImproperlyConfigured(
-            "Resend email configuration is incomplete. Missing required environment variable(s): "
-            + ", ".join(missing_resend_settings)
-        )
 
 
 # ============================================
