@@ -508,7 +508,6 @@ class PaymentSerializer(serializers.ModelSerializer):
             'paystack_transfer_code',
             'paystack_otp_required',
             'paystack_last_status',
-            'paystack_last_response',
             'failure_reason',
             'status',
             'payment_date',

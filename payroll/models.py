@@ -307,8 +307,8 @@ class User(AbstractUser):
 
     objects = UserManager()
 
-    USERNAME_FIELD = 'email'
-    REQUIRED_FIELDS = ['full_name']
+    USERNAME_FIELD = 'username'
+    REQUIRED_FIELDS = ['email', 'full_name']
 
     # Admin permission flags
     is_company_admin = models.BooleanField(default=False)
@@ -343,7 +343,7 @@ class User(AbstractUser):
 
     def save(self, *args, **kwargs):
         if not self.username:
-            base = self.email.split('@')[0]
+            base = self.email.split('@')[0] if self.email else (self.full_name or 'user')
             self.username = f"{base[:20]}_{uuid.uuid4().hex[:6]}"[:30]
         super().save(*args, **kwargs)
 

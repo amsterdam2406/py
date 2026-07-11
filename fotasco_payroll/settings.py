@@ -291,7 +291,7 @@ AUTH_PASSWORD_VALIDATORS = [
 ]
 
 AUTHENTICATION_BACKENDS = [
-    'payroll.authentication.EmailOrUsernameBackend',
+    'payroll.authentication.UsernameOrEmployeeIDBackend',
 ]
 
 AUTH_USER_MODEL = 'payroll.User'

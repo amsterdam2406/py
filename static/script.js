@@ -3696,54 +3696,43 @@ async function viewPaymentDetail(paymentId) {
   const content = document.getElementById("paymentDetailContent");
   if (!content) return;
 
-  const paystackResponse = payment.paystack_last_response
-    ? `<pre class="code-block">${escapeHtml(JSON.stringify(payment.paystack_last_response, null, 2))}</pre>`
-    : '<span class="text-muted">No Paystack response recorded</span>';
-
   content.innerHTML = `
     <div class="detail-grid">
-      <div class="detail-section">
-        <h4>Payment Status</h4>
-        <table class="detail-table">
-          <tr><td><strong>Status</strong></td><td>${escapeHtml(formatPaymentStatus(payment.status))}</td></tr>
-          <tr><td><strong>Paid Amount</strong></td><td>${formatCurrency(payment.amount_paid || payment.net_amount || 0)}</td></tr>
-          <tr><td><strong>Partial</strong></td><td>${payment.is_partial ? "Yes" : "No"}</td></tr>
-          <tr><td><strong>Remaining Balance</strong></td><td>${formatCurrency(payment.remaining_balance || 0)}</td></tr>
-          <tr><td><strong>Failure Reason</strong></td><td>${escapeHtml(payment.failure_reason || "-")}</td></tr>
-        </table>
-      </div>
-      <div class="detail-section">
-        <h4>Approval & Processing</h4>
-        <table class="detail-table">
-          <tr><td><strong>HR Approved</strong></td><td>${payment.hr_approved ? "Yes" : "No"}</td></tr>
-          <tr><td><strong>Approved By</strong></td><td>${escapeHtml(payment.hr_approved_by_name || "-")}</td></tr>
-          <tr><td><strong>Processed By</strong></td><td>${escapeHtml(payment.processed_by_name || "-")}</td></tr>
-          <tr><td><strong>Created</strong></td><td>${formatDateTime(payment.created_at)}</td></tr>
-          <tr><td><strong>Updated</strong></td><td>${formatDateTime(payment.updated_at)}</td></tr>
-        </table>
-      </div>
-      <div class="detail-section">
-        <h4>Recipient</h4>
-        <table class="detail-table">
-          <tr><td><strong>Employee</strong></td><td>${escapeHtml(payment.employee_name || "-")} (${escapeHtml(payment.employee_id || "-")})</td></tr>
-          <tr><td><strong>Account Name</strong></td><td>${escapeHtml(payment.recipient_name || "-")}</td></tr>
-          <tr><td><strong>Bank Account</strong></td><td>${escapeHtml(payment.bank_account || "-")}</td></tr>
-          <tr><td><strong>Method</strong></td><td>${escapeHtml(payment.payment_method || "-")}</td></tr>
-        </table>
-      </div>
       <div class="detail-section">
         <h4>Transaction</h4>
         <table class="detail-table">
           <tr><td><strong>Reference</strong></td><td>${escapeHtml(payment.transaction_reference || "-")}</td></tr>
-          <tr><td><strong>Paystack Ref</strong></td><td>${escapeHtml(payment.paystack_reference || "-")}</td></tr>
+          <tr><td><strong>Status</strong></td><td>${escapeHtml(formatPaymentStatus(payment.status))}</td></tr>
+          <tr><td><strong>Amount</strong></td><td>${formatCurrency(payment.amount_paid ?? payment.net_amount ?? 0)}</td></tr>
+          <tr><td><strong>Payment Date</strong></td><td>${formatDate(payment.payment_date || payment.created_at)}</td></tr>
+          <tr><td><strong>Recorded</strong></td><td>${formatDateTime(payment.created_at)}</td></tr>
+          <tr><td><strong>Updated</strong></td><td>${formatDateTime(payment.updated_at)}</td></tr>
           <tr><td><strong>Transfer Code</strong></td><td>${escapeHtml(payment.paystack_transfer_code || "-")}</td></tr>
-          <tr><td><strong>Paystack Status</strong></td><td>${escapeHtml(payment.paystack_last_status || "-")}</td></tr>
+          <tr><td><strong>Gateway Status</strong></td><td>${escapeHtml(payment.paystack_last_status || "-")}</td></tr>
+          <tr><td><strong>Failure Reason</strong></td><td>${escapeHtml(payment.failure_reason || "-")}</td></tr>
         </table>
       </div>
-    </div>
-    <div class="detail-section">
-      <h4>Paystack Response</h4>
-      ${paystackResponse}
+      <div class="detail-section">
+        <h4>Payment Party</h4>
+        <table class="detail-table">
+          <tr><td><strong>Employee</strong></td><td>${escapeHtml(payment.employee_name || "-")} (${escapeHtml(payment.employee_id || "-")})</td></tr>
+          <tr><td><strong>Recipient</strong></td><td>${escapeHtml(payment.recipient_name || "-")}</td></tr>
+          <tr><td><strong>Bank</strong></td><td>${escapeHtml(payment.bank_account || "-")}</td></tr>
+          <tr><td><strong>Method</strong></td><td>${escapeHtml(payment.payment_method || "-")}</td></tr>
+          <tr><td><strong>Processed By</strong></td><td>${escapeHtml(payment.processed_by_name || "-")}</td></tr>
+          <tr><td><strong>Approved By</strong></td><td>${escapeHtml(payment.hr_approved_by_name || "-")}</td></tr>
+          <tr><td><strong>HR Approved</strong></td><td>${payment.hr_approved ? "Yes" : "No"}</td></tr>
+        </table>
+      </div>
+      <div class="detail-section">
+        <h4>Balance</h4>
+        <table class="detail-table">
+          <tr><td><strong>Paid Amount</strong></td><td>${formatCurrency(payment.amount_paid ?? payment.net_amount ?? 0)}</td></tr>
+          <tr><td><strong>Remaining Balance</strong></td><td>${formatCurrency(payment.remaining_balance || 0)}</td></tr>
+          <tr><td><strong>Partial</strong></td><td>${payment.is_partial ? "Yes" : "No"}</td></tr>
+          <tr><td><strong>Previous Balance</strong></td><td>${formatCurrency(payment.previous_balance || 0)}</td></tr>
+        </table>
+      </div>
     </div>
   `;
   openModal("paymentDetailModal");
