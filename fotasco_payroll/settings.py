@@ -95,10 +95,10 @@ STATIC_ROOT = os.path.join(BASE_DIR, 'staticfiles')
 WHITENOISE_MAX_AGE = 31536000
 
 ALLOWED_HOSTS = [
-    'fot-pyroll.onrender.com',
-    '.onrender.com',
-    'localhost',
-    '127.0.0.1',
+    'payroll.fotascosecurityservices.info',
+    # 'localhost',
+    # '127.0.0.1',
+    # 'fot-pyroll.onrender.com',
 ]
 
 # Application definition
@@ -125,9 +125,6 @@ INSTALLED_APPS = [
     'django_celery_beat',
 ]
 
-# Cloudinary is used for uploaded media only. Do not add cloudinary or
-# cloudinary_storage to INSTALLED_APPS here because their management commands can
-# override Django's collectstatic command and break WhiteNoise static handling.
 
 MIDDLEWARE = [
     'simple_history.middleware.HistoryRequestMiddleware',
@@ -353,7 +350,6 @@ PASSWORD_RESET_TIMEOUT = 86400
 # ============================================
 
 CORS_ALLOWED_ORIGINS = [
-    "https://fot-pyroll.onrender.com",
 ]
 
 CSRF_TRUSTED_ORIGINS = [
