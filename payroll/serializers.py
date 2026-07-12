@@ -51,15 +51,15 @@ def _name_tokens(value):
 def _verify_employee_bank_account(full_name, account_number, bank_code, submitted_holder=None):
     result = PaystackAPI().verify_account(account_number, bank_code)
     verified_name = (result.get('data') or {}).get('account_name') if isinstance(result.get('data'), dict) else None
-
-    # PRODUCTION: If Paystack is rate-limiting, don't block saving the employee.
-    # Fallback to the submitted holder name so the user can proceed.
-    if result.get('error_code') == 'rate_limited':
-        return submitted_holder
-
+    error_code = (result.get('error_code') or '').lower() if result else ''
+    message = (result.get('message') or '').strip() if result else ''
+    if error_code == 'rate_limited' or error_code in {'verification_unavailable', 'network_error', 'timeout'}:
+        raise serializers.ValidationError({
+            'account_holder': 'Bank verification is temporarily unavailable. Please try again shortly.'
+        })
     if not result.get('status') or not verified_name:
         raise serializers.ValidationError({
-            'account_holder': result.get('message') or 'Bank account could not be verified with Paystack.'
+            'account_holder': message or 'Bank account could not be verified with Paystack.'
         })
 
     employee_tokens = _name_tokens(full_name)

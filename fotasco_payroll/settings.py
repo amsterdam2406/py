@@ -10,6 +10,7 @@ from datetime import timedelta
 import importlib
 import dj_database_url
 import socket
+from django.core.exceptions import ImproperlyConfigured
 
 # Force IPv4 for Supabase (Render has IPv6 issues)
 _original_getaddrinfo = socket.getaddrinfo
@@ -35,6 +36,13 @@ def _safe_debug_bool(value):
     return False
 
 DEBUG = config('DEBUG', default=False, cast=_safe_debug_bool)
+
+
+def _env_csv(value):
+    raw = str(value or '').strip()
+    if not raw:
+        return []
+    return [item.strip() for item in raw.split(',') if item.strip()]
 
 # ==================
 # CLOUDINARY SETUP (Safe)
@@ -94,12 +102,7 @@ STATIC_ROOT = os.path.join(BASE_DIR, 'staticfiles')
 
 WHITENOISE_MAX_AGE = 31536000
 
-ALLOWED_HOSTS = [
-    'payroll.fotascosecurityservices.info',
-    # 'localhost',
-    # '127.0.0.1',
-    # 'fot-pyroll.onrender.com',
-]
+ALLOWED_HOSTS = _env_csv(config('ALLOWED_HOSTS', default=''))
 
 # Application definition
 INSTALLED_APPS = [
@@ -187,12 +190,15 @@ if DATABASE_URL:
         "connect_timeout": 10,
     }
 else:
-    DATABASES = {
-        "default": {
-            "ENGINE": "django.db.backends.sqlite3",
-            "NAME": BASE_DIR / "db.sqlite3",
+    if DEBUG:
+        DATABASES = {
+            "default": {
+                "ENGINE": "django.db.backends.sqlite3",
+                "NAME": BASE_DIR / "db.sqlite3",
+            }
         }
-    }
+    else:
+        raise ImproperlyConfigured("DATABASE_URL is required when DEBUG=False.")
 
 if len(sys.argv) > 1 and sys.argv[1] == 'test':
     TEST_DATABASE_URL = config("TEST_DATABASE_URL", default=None)
@@ -224,11 +230,14 @@ if REDIS_URL and 'localhost' not in REDIS_URL and '127.0.0.1' not in REDIS_URL:
         }
     }
 else:
-    CACHES = {
-        "default": {
-            "BACKEND": "django.core.cache.backends.locmem.LocMemCache",
+    if DEBUG:
+        CACHES = {
+            "default": {
+                "BACKEND": "django.core.cache.backends.locmem.LocMemCache",
+            }
         }
-    }
+    else:
+        raise ImproperlyConfigured("REDIS_URL is required when DEBUG=False.")
 
 CELERY_BROKER_URL = REDIS_URL
 CELERY_RESULT_BACKEND = REDIS_URL
@@ -350,10 +359,11 @@ PASSWORD_RESET_TIMEOUT = 86400
 # ============================================
 
 CORS_ALLOWED_ORIGINS = [
+    origin for origin in _env_csv(config('CORS_ALLOWED_ORIGINS', default=''))
 ]
 
 CSRF_TRUSTED_ORIGINS = [
-    'https://fot-pyroll.onrender.com',
+    origin for origin in _env_csv(config('CSRF_TRUSTED_ORIGINS', default=''))
 ]
 
 CORS_ALLOW_CREDENTIALS = True
@@ -384,6 +394,22 @@ RESEND_EMAIL_MAX_QUEUED_TASKS = config('RESEND_EMAIL_MAX_QUEUED_TASKS', default=
 DEFAULT_FROM_EMAIL = f"{RESEND_SENDER_NAME} <{RESEND_SENDER_EMAIL}>"
 INTERNAL_PAYMENT_OTP_EXPIRY_SECONDS = config('INTERNAL_PAYMENT_OTP_EXPIRY_SECONDS', default=60, cast=int)
 PAYSTACK_TRANSFER_OTP_ENABLED = config('PAYSTACK_TRANSFER_OTP_ENABLED', default=False, cast=bool)
+
+SENTRY_DSN = config('SENTRY_DSN', default='')
+if not DEBUG and SENTRY_DSN:
+    try:
+        import sentry_sdk
+        from sentry_sdk.integrations.django import DjangoIntegration
+
+        sentry_sdk.init(
+            dsn=SENTRY_DSN,
+            integrations=[DjangoIntegration()],
+            environment=config('SENTRY_ENVIRONMENT', default='production'),
+            send_default_pii=False,
+            traces_sample_rate=config('SENTRY_TRACES_SAMPLE_RATE', default=0.0, cast=float),
+        )
+    except Exception as exc:
+        raise ImproperlyConfigured(f"Failed to initialize Sentry: {exc}") from exc
 
 
 # ============================================

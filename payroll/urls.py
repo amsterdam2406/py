@@ -45,6 +45,7 @@ urlpatterns = [
     path('next-employee-id/', auth_views.get_next_employee_id, name='next_employee_id'),
     path('payments/verify-payment/<str:reference>/', views.verify_payment_status, name='verify_payment_status'),
     path('api/payments/verify-payment/<str:reference>/', views.verify_payment_status, name='api_verify_payment_status'),
+    path('health/', views.public_health_check, name='public_health_check'),
     path('health-check/', views.system_health_check, name='health_check'),
     path('api/private-media/<path:path>/', views.private_media, name='private_media'),
 

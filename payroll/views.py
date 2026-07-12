@@ -186,6 +186,31 @@ def _can_access_employee_data(user, employee):
     )
 
 
+def _dashboard_employee_queryset(user, location=None):
+    if not user or not user.is_authenticated:
+        return Employee.objects.none()
+
+    if user.is_superuser:
+        qs = Employee.objects.all()
+    elif (
+        getattr(user, 'role', None) == 'admin'
+        or getattr(user, 'is_hr_admin', False)
+        or getattr(user, 'is_employee_admin', False)
+        or getattr(user, 'is_payment_admin', False)
+    ):
+        qs = Employee.objects.filter(status__in=['active', 'pending'])
+    elif getattr(user, 'role', None) in ['staff', 'guard']:
+        employee = getattr(user, 'employee_profile', None)
+        qs = Employee.objects.filter(id=employee.id) if employee else Employee.objects.none()
+    else:
+        employee = getattr(user, 'employee_profile', None)
+        qs = Employee.objects.filter(id=employee.id) if employee else Employee.objects.none()
+
+    if location:
+        qs = qs.filter(location=location)
+    return qs
+
+
 def _employee_queryset_for_export(user):
     if _is_org_export_admin(user):
         return Employee.objects.all().order_by('id')
@@ -243,6 +268,12 @@ def _can_access_private_media(user, storage_name):
         return True
 
     return False
+
+
+@api_view(['GET'])
+@permission_classes([AllowAny])
+def public_health_check(request):
+    return Response({'status': 'ok'}, status=status.HTTP_200_OK)
 
 
 def _verify_paystack_signature(request, *, context):
@@ -1342,10 +1373,27 @@ class EmployeeViewSet(viewsets.ModelViewSet):
     filterset_fields = ['type', 'status', 'location']
     search_fields = ['name', 'employee_id', 'email']
 
+    def _employee_scope_queryset(self):
+        user = self.request.user
+        if not user or not user.is_authenticated:
+            return Employee.objects.none()
+        if user.is_superuser:
+            return Employee.objects.all().order_by('-created_at')
+        if getattr(user, 'role', None) == 'admin' or getattr(user, 'is_hr_admin', False) or getattr(user, 'is_employee_admin', False):
+            return Employee.objects.filter(status__in=['active', 'pending']).order_by('-created_at')
+        employee = getattr(user, 'employee_profile', None)
+        if employee:
+            return Employee.objects.filter(pk=employee.pk).order_by('-created_at')
+        return Employee.objects.none()
+
     def get_permissions(self):
         user = self.request.user
         if self.action == 'create':
             return [IsAuthenticated(), CanCreateEmployee()]
+        if self.action == 'dashboard_stats':
+            return [IsAuthenticated()]
+        if self.action == 'net_salary':
+            return [IsAuthenticated()]
         if user.is_authenticated and user.role in ['staff', 'guard']:
             if self.action in ['list', 'retrieve']:
                 return [IsAuthenticated()]
@@ -1376,12 +1424,7 @@ class EmployeeViewSet(viewsets.ModelViewSet):
         )
 
     def get_queryset(self):
-        user = self.request.user
-        if user.is_superuser or user.role == 'admin' or getattr(user, 'is_hr_admin', False) or getattr(user, 'is_employee_admin', False):
-            if self.action == 'retrieve':
-                return Employee.objects.all().order_by('-created_at')
-            return Employee.objects.filter(status__in=['active', 'pending']).order_by('-created_at')
-        return Employee.objects.filter(user=user).order_by('-created_at')
+        return self._employee_scope_queryset()
 
     def create(self, request, *args, **kwargs):
         logger.info("Employee create requested by user_id=%s", getattr(request.user, "id", None))
@@ -1573,41 +1616,31 @@ class EmployeeViewSet(viewsets.ModelViewSet):
     @action(detail=False, methods=['get'], permission_classes=[IsAuthenticated])
     def dashboard_stats(self, request):
         """Get dashboard statistics"""
-        # Unified logic: Stats only count 'active' employees. Sacked/Resigned IDs remain locked.
-        active_qs = Employee.objects.filter(status='active')
-        
-        # Location filtering
         location = request.query_params.get('location')
-        if location:
-            active_qs = active_qs.filter(location=location)
+        accessible_employees = _dashboard_employee_queryset(request.user, location=location)
+        active_qs = accessible_employees.filter(status='active')
 
         total_staff = active_qs.filter(type='staff').count()
         total_guards = active_qs.filter(type='guard').count()
         total_self_registered = active_qs.filter(is_self_registered=True).count()
         total_active_employees = active_qs.count()
-        pending_approvals_qs = Employee.objects.filter(status='pending')
-        if location:
-            pending_approvals_qs = pending_approvals_qs.filter(location=location)
-        pending_approvals = pending_approvals_qs.count()
+        pending_approvals = accessible_employees.filter(status='pending').count()
         approved_users = active_qs.filter(user__is_active=True).count()
 
         # Calculate exact financial totals for the current month
         today = timezone.now().date()
         deduction_qs = Deduction.objects.filter(
+            employee__in=accessible_employees,
             status='applied',
             date__year=today.year,
             date__month=today.month,
         )
-        if location:
-            deduction_qs = deduction_qs.filter(employee__location=location)
-        
+
         # Added safety for aggregation
         deduction_agg = deduction_qs.aggregate(total=Sum('amount'))
         total_deductions = float(deduction_agg['total'] or 0)
 
-        deduction_status_qs = Deduction.objects.all()
-        if location:
-            deduction_status_qs = deduction_status_qs.filter(employee__location=location)
+        deduction_status_qs = Deduction.objects.filter(employee__in=accessible_employees)
         deduction_status_counts = {
             'pending': deduction_status_qs.filter(status__in=['pending', 'pending_hr']).count(),
             'partial': 0,
@@ -1615,9 +1648,7 @@ class EmployeeViewSet(viewsets.ModelViewSet):
         }
 
         # Attendance today
-        attendance_qs = Attendance.objects.filter(date=today)
-        if location:
-            attendance_qs = attendance_qs.filter(employee__location=location)
+        attendance_qs = Attendance.objects.filter(employee__in=accessible_employees, date=today)
             
         attendance_stats = {
             'present': attendance_qs.filter(status='present').count(),
@@ -1627,11 +1658,10 @@ class EmployeeViewSet(viewsets.ModelViewSet):
 
         current_month = timezone.now().strftime('%Y-%m')
         payment_qs = Payment.objects.filter(
+            employee__in=accessible_employees,
             payment_month=current_month,
             status='completed'
         )
-        if location:
-            payment_qs = payment_qs.filter(employee__location=location)
             
         # FIX: Display ONLY actual money paid (Sum of amount_paid)
         payment_agg = payment_qs.aggregate(total=Sum('amount_paid'))
@@ -1652,15 +1682,15 @@ class EmployeeViewSet(viewsets.ModelViewSet):
             month_str = target_date.strftime('%b')
             month_key = target_date.strftime('%Y-%m')
             
-            summary_payment_qs = Payment.objects.filter(payment_month=month_key, status='completed')
-            if location:
-                summary_payment_qs = summary_payment_qs.filter(employee__location=location)
+            summary_payment_qs = Payment.objects.filter(
+                employee__in=accessible_employees,
+                payment_month=month_key,
+                status='completed',
+            )
             amount = summary_payment_qs.aggregate(Sum('amount_paid'))['amount_paid__sum'] or 0
             salary_summary.append({'month': month_str, 'amount': float(amount)})
 
-        recent_payments_qs = Payment.objects.all()
-        if location:
-            recent_payments_qs = recent_payments_qs.filter(employee__location=location)
+        recent_payments_qs = Payment.objects.filter(employee__in=accessible_employees)
 
         return Response({
             'total_staff': total_staff,
@@ -1675,7 +1705,7 @@ class EmployeeViewSet(viewsets.ModelViewSet):
             'payment_count': payment_count_this_month,
             'attendance_today': attendance_stats,
             'salary_summary': salary_summary,
-            'recent_employees': EmployeeSerializer(active_qs.order_by('-created_at')[:5], many=True, context={'request': request}).data,
+            'recent_employees': EmployeeSerializer(accessible_employees.order_by('-created_at')[:5], many=True, context={'request': request}).data,
             'recent_payments': PaymentSerializer(recent_payments_qs.order_by('-created_at')[:5], many=True, context={'request': request}).data
         })
 
@@ -2259,28 +2289,21 @@ class PaymentViewSet(viewsets.ModelViewSet):
         )
         resolve_result = paystack.verify_account(str(account_number), bank_code_str)
         if resolve_result.get('status') is False:
-            # Preserve structured rate-limit information.
             retry_after = resolve_result.get('retry_after')
-            error_code = resolve_result.get('error_code')
-
+            error_code = (resolve_result.get('error_code') or '').lower()
             msg = resolve_result.get('message') or 'Account could not be resolved.'
-            if error_code == 'rate_limited' or resolve_result.get('error_code') == 'rate_limited':
-                logger.warning(
-                    "Paystack account resolve rate-limited during payment; trying recipient creation fallback employee=%s retry_after=%s",
-                    employee.id,
-                    retry_after,
-                )
-            else:
-                logger.warning(
-                    "Paystack account resolve failed employee_id=%s bank_name=%s bank_code=%s account=%s error_code=%s message=%s",
-                    employee.id,
-                    getattr(employee, 'bank_name', ''),
-                    bank_code_str,
-                    masked_account,
-                    error_code,
-                    msg,
-                )
-                raise ValueError("We couldn't verify the employee's bank account details. Please confirm the account number and selected bank before trying again.")
+            logger.warning(
+                "Paystack account resolve failed employee_id=%s bank_name=%s bank_code=%s account=%s error_code=%s message=%s",
+                employee.id,
+                getattr(employee, 'bank_name', ''),
+                bank_code_str,
+                masked_account,
+                error_code,
+                msg,
+            )
+            if error_code in {'rate_limited', 'verification_unavailable', 'network_error', 'timeout'} or resolve_result.get('temporary') or retry_after:
+                raise ValueError("We couldn't verify the employee's bank account right now. Please try again shortly.")
+            raise ValueError("We couldn't verify the employee's bank account details. Please confirm the account number and selected bank before trying again.")
 
 
         # Optional: you can enforce account_holder match here if desired
