@@ -10,6 +10,7 @@ from django.utils.translation import gettext_lazy as _
 from .managers import UserManager
 import importlib
 from django.contrib.auth.hashers import make_password, check_password
+from django.utils.crypto import constant_time_compare, salted_hmac
 from simple_history.models import HistoricalRecords
 
 if importlib.util.find_spec("simple_history.models") is not None:
@@ -1750,10 +1751,7 @@ class OTP(TimeStampedModel):
     """OTP Model for payment verification and secure operations."""
 
     email = models.EmailField(db_index=True)
-    code = models.CharField(
-        max_length=6,
-        validators=[RegexValidator(r'^\d{6}$', _('OTP must be a 6-digit number.'))]
-    )
+    code = models.CharField(max_length=128)
     reference = models.CharField(max_length=100, db_index=True)
     is_used = models.BooleanField(default=False)
     expires_at = models.DateTimeField()
@@ -1785,7 +1783,21 @@ class OTP(TimeStampedModel):
         return self.attempt_count >= self.max_attempts
     
     def set_code(self, raw_code):
-        self.code = make_password(raw_code)
+        self.code = self.hash_code(raw_code)
+
+    @staticmethod
+    def hash_code(raw_code):
+        return salted_hmac('payroll.verification_code', str(raw_code or '').strip()).hexdigest()
+
+    @classmethod
+    def verify_hashed_code(cls, stored_code, input_code):
+        input_code = str(input_code or '').strip()
+        stored_code = str(stored_code or '')
+        if not input_code or not stored_code:
+            return False
+        if len(stored_code) == 6 and stored_code.isdigit():
+            return constant_time_compare(stored_code, input_code)
+        return constant_time_compare(stored_code, cls.hash_code(input_code))
     
     def verify(self, input_code):
         if self.has_expired():
@@ -1794,7 +1806,7 @@ class OTP(TimeStampedModel):
             return False, 'already_used'
         if self.attempt_count >= self.max_attempts:
             return False, 'max_attempts_exceeded'
-        if not check_password(input_code, self.code):  # <-- use check_password
+        if not self.verify_hashed_code(self.code, input_code):
             max_reached = self.increment_attempt()
             return False, 'max_attempts_exceeded' if max_reached else 'invalid'
         self.is_used = True
@@ -1816,10 +1828,9 @@ class ExportToken(TimeStampedModel):
     filters = models.JSONField(default=dict)
     expires_at = models.DateTimeField()
     otp_code = models.CharField(
-        max_length=6,
+        max_length=128,
         blank=True,
         null=True,
-        validators=[RegexValidator(r'^\d{6}$', _('OTP must be a 6-digit number.'))]
     )
     is_2fa_verified = models.BooleanField(default=False)
     is_used = models.BooleanField(default=False)
@@ -1846,6 +1857,8 @@ class ExportToken(TimeStampedModel):
         if self.is_2fa_verified:
             return False, 'already_verified'
         if not self.otp_code:
+            return False, 'invalid'
+        if not OTP.verify_hashed_code(self.otp_code, code):
             return False, 'invalid'
         self.is_2fa_verified = True
         self.save(update_fields=['is_2fa_verified'])

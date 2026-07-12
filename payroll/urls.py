@@ -46,6 +46,7 @@ urlpatterns = [
     path('payments/verify-payment/<str:reference>/', views.verify_payment_status, name='verify_payment_status'),
     path('api/payments/verify-payment/<str:reference>/', views.verify_payment_status, name='api_verify_payment_status'),
     path('health-check/', views.system_health_check, name='health_check'),
+    path('api/private-media/<path:path>/', views.private_media, name='private_media'),
 
     # === MISSING ENDPOINTS ADDED ===
     # Attendance Actions

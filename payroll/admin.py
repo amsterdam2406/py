@@ -5,6 +5,7 @@ from django.core.cache import cache
 from django.contrib.auth.forms import AuthenticationForm
 from django import forms
 from django.db.models import ProtectedError, RestrictedError
+from django.urls import reverse
 from .models import (
     User, Employee, Attendance, Deduction, 
     Payment, Company, SackedEmployee, Notification, 
@@ -14,6 +15,14 @@ from .models import (
 from .paystack import PaystackAccountResolutionService
 from .services import paystack_recipient_fingerprint_key
 from django.utils.html import format_html
+from urllib.parse import quote
+
+
+def private_media_admin_url(file_field):
+    name = getattr(file_field, 'name', '')
+    if not name:
+        return ''
+    return reverse('private_media', kwargs={'path': quote(name)})
 
 # ─────────────────────────────────────────────
 # USER ADMIN (SAFE DELETE)
@@ -225,13 +234,13 @@ class AttendanceAdmin(admin.ModelAdmin):
     
     def clock_in_photo_url(self, obj):
         if obj.clock_in_photo:
-            return format_html('<a href="{}" target="_blank">View</a>', obj.clock_in_photo.url)
+            return format_html('<a href="{}" target="_blank">View</a>', private_media_admin_url(obj.clock_in_photo))
         return "-"
     clock_in_photo_url.short_description = 'Clock In Photo'
 
     def clock_out_photo_url(self, obj):
         if obj.clock_out_photo:
-            return format_html('<a href="{}" target="_blank">View</a>', obj.clock_out_photo.url)
+            return format_html('<a href="{}" target="_blank">View</a>', private_media_admin_url(obj.clock_out_photo))
         return "-"
     clock_out_photo_url.short_description = 'Clock Out Photo'
 
@@ -359,7 +368,7 @@ class EmployeeRequestAttachmentAdmin(admin.ModelAdmin):
     
     def file_url(self, obj):
         if obj.file:
-            return format_html('<a href="{}" target="_blank">Download</a>', obj.file.url)
+            return format_html('<a href="{}" target="_blank">Download</a>', private_media_admin_url(obj.file))
         return "-"
     file_url.short_description = 'File'
 

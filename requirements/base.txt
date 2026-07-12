@@ -48,6 +48,6 @@ sqlparse==0.5.5
 packaging==26.2
 typing_extensions==4.15.0
 tzdata==2026.2
-six==1.17.
+six==1.17.0
 
 sentry-sdk

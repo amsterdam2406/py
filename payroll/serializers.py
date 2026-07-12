@@ -1,5 +1,6 @@
 import logging
 from decimal import Decimal
+from urllib.parse import quote
 
 from rest_framework import serializers
 from .models import (
@@ -29,6 +30,15 @@ from .paystack import PaystackAPI
 
 User = get_user_model()
 logger = logging.getLogger(__name__)
+
+
+def private_media_url(file_field):
+    if not file_field:
+        return None
+    name = getattr(file_field, 'name', '')
+    if not name:
+        return None
+    return f"/api/private-media/{quote(name)}"
 
 
 def _name_tokens(value):
@@ -348,6 +358,8 @@ class AttendanceSerializer(serializers.ModelSerializer):
     clock_out_display = serializers.SerializerMethodField()
     clock_in_photo_base64 = serializers.CharField(write_only=True, required=False, allow_blank=True)
     clock_out_photo_base64 = serializers.CharField(write_only=True, required=False, allow_blank=True)
+    clock_in_photo = serializers.SerializerMethodField()
+    clock_out_photo = serializers.SerializerMethodField()
     
     class Meta:
         model = Attendance
@@ -368,6 +380,12 @@ class AttendanceSerializer(serializers.ModelSerializer):
 
     def get_clock_out_display(self, obj):
         return obj.clock_out_timestamp.strftime('%Y-%m-%d %H:%M:%S') if obj.clock_out_timestamp else None
+
+    def get_clock_in_photo(self, obj):
+        return private_media_url(obj.clock_in_photo)
+
+    def get_clock_out_photo(self, obj):
+        return private_media_url(obj.clock_out_photo)
 
     def validate(self, attrs):
         employee = attrs.get('employee')
@@ -690,20 +708,33 @@ class ExportTokenSerializer(serializers.ModelSerializer):
         return value
 
 class EmployeeRequestAttachmentSerializer(serializers.ModelSerializer):
+    file = serializers.SerializerMethodField()
+
     class Meta:
         model = EmployeeRequestAttachment
         fields = '__all__'
+
+    def get_file(self, obj):
+        return private_media_url(obj.file)
 
 class EmployeeRequestSerializer(serializers.ModelSerializer):
     employee_name = serializers.CharField(source='employee.name', read_only=True)
     employee_id = serializers.CharField(source='employee.employee_id', read_only=True)
     action_by_name = serializers.CharField(source='action_by.username', read_only=True)
     attachments = EmployeeRequestAttachmentSerializer(many=True, read_only=True)
+    proof_photo = serializers.SerializerMethodField()
+    receipt_file = serializers.SerializerMethodField()
 
     class Meta:
         model = EmployeeRequest
         fields = '__all__'
         read_only_fields = ['id', 'employee', 'status', 'decline_reason', 'action_by', 'created_at', 'updated_at', 'attachments']
+
+    def get_proof_photo(self, obj):
+        return private_media_url(obj.proof_photo)
+
+    def get_receipt_file(self, obj):
+        return private_media_url(obj.receipt_file)
 
 
 class EmployeeSalaryAdjustmentSerializer(serializers.ModelSerializer):

@@ -76,7 +76,7 @@ MEDIA_ROOT = os.path.join(BASE_DIR, 'media')
 if CLOUDINARY_CLOUD_NAME and CLOUDINARY_API_KEY and CLOUDINARY_API_SECRET:
     STORAGES = {
         "staticfiles": {"BACKEND": "whitenoise.storage.CompressedManifestStaticFilesStorage"},
-        "default": {"BACKEND": "cloudinary_storage.storage.MediaCloudinaryStorage"},
+        "default": {"BACKEND": "payroll.storage.PrivateMediaCloudinaryStorage"},
     }
 else:
     STORAGES = {

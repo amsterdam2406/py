@@ -14,6 +14,7 @@ import uuid
 import zipfile
 from datetime import datetime, timedelta
 from decimal import Decimal, InvalidOperation
+from urllib.parse import quote
 from django.contrib.auth import get_user_model
 from django.conf import settings
 from django.core.exceptions import ValidationError
@@ -23,7 +24,7 @@ from django.utils.encoding import force_bytes, force_str
 from django.db import transaction
 from django.db.models import Q, Sum
 from django.core.cache import cache
-from django.http import HttpResponse, JsonResponse
+from django.http import FileResponse, Http404, HttpResponse, JsonResponse
 from django.shortcuts import render
 from django.template.loader import render_to_string
 from django.utils.html import escape
@@ -33,7 +34,8 @@ from django.views.decorators.http import require_http_methods
 from django.core.exceptions import PermissionDenied
 import requests
 from rest_framework import serializers, status, viewsets
-from rest_framework.authentication import BasicAuthentication, SessionAuthentication
+from django.core.files.storage import default_storage
+from rest_framework.authentication import SessionAuthentication
 from rest_framework.decorators import action, api_view, permission_classes, throttle_classes
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
@@ -111,13 +113,20 @@ from .permissions import (
     IsAdmin, CanCreateEmployee, IsSackAdmin, IsPayrollAdmin, IsHRAdmin,
     IsDeductionAdmin, CanEditNotification, CanViewAndEditCompany, IsRequestAdmin
 )
-from payroll.throttles import AttendanceThrottle, PaymentThrottle, BulkPaymentThrottle, ExportThrottle
+from payroll.throttles import AttendanceThrottle, PaymentThrottle, BulkPaymentThrottle, ExportThrottle, BankVerifyThrottle
 from .utils import log_audit, get_client_ip
 
 User = get_user_model()
 logger = logging.getLogger(__name__)
 
 PAYSTACK_IPS = ['52.31.139.75', '52.49.173.169', '52.214.14.220']
+
+
+def _private_media_url(file_field):
+    name = getattr(file_field, 'name', '')
+    if not name:
+        return None
+    return f"/api/private-media/{quote(name)}"
 
 
 def _is_payroll_data_admin(user):
@@ -133,6 +142,39 @@ def _is_payroll_data_admin(user):
     )
 
 
+def _is_super_admin(user):
+    return bool(user and user.is_authenticated and user.is_superuser)
+
+
+def _is_org_export_admin(user):
+    return bool(
+        user
+        and user.is_authenticated
+        and (
+            user.is_superuser
+            or (
+                getattr(user, 'role', None) == 'admin'
+                and getattr(user, 'is_hr_admin', False)
+                and getattr(user, 'is_payment_admin', False)
+                and getattr(user, 'is_employee_admin', False)
+            )
+        )
+    )
+
+
+def _can_manage_employee_leave(user, employee):
+    if not user or not user.is_authenticated or not employee:
+        return False
+    if getattr(employee, 'user_id', None) == user.id:
+        return True
+    return bool(
+        user.is_superuser
+        or getattr(user, 'role', None) == 'admin'
+        or getattr(user, 'is_hr_admin', False)
+        or getattr(user, 'is_employee_admin', False)
+    )
+
+
 def _can_access_employee_data(user, employee):
     if _is_payroll_data_admin(user):
         return True
@@ -142,6 +184,22 @@ def _can_access_employee_data(user, employee):
         and employee
         and getattr(employee, 'user_id', None) == user.id
     )
+
+
+def _employee_queryset_for_export(user):
+    if _is_org_export_admin(user):
+        return Employee.objects.all().order_by('id')
+    if user and user.is_authenticated and (getattr(user, 'role', None) == 'admin' or getattr(user, 'is_hr_admin', False) or getattr(user, 'is_employee_admin', False)):
+        return Employee.objects.filter(status__in=['active', 'pending']).order_by('id')
+    return Employee.objects.filter(user=user).order_by('id')
+
+
+def _payment_queryset_for_export(user):
+    if _is_org_export_admin(user):
+        return Payment.objects.all().order_by('-payment_date')
+    if user and user.is_authenticated and (getattr(user, 'role', None) == 'admin' or getattr(user, 'is_payment_admin', False) or getattr(user, 'is_hr_admin', False)):
+        return Payment.objects.filter(employee__status__in=['active', 'pending']).order_by('-payment_date')
+    return Payment.objects.filter(employee__user=user).order_by('-payment_date')
 
 
 def _can_access_payment_data(user, payment):
@@ -157,6 +215,34 @@ def _can_access_notification_data(user, notification):
         and notification
         and getattr(notification, 'user_id', None) == user.id
     )
+
+
+def _can_access_private_media(user, storage_name):
+    if not user or not user.is_authenticated or not storage_name:
+        return False
+
+    if _is_payroll_data_admin(user) or getattr(user, 'is_employee_admin', False) or getattr(user, 'is_request_admin', False):
+        return True
+
+    attendance = Attendance.objects.filter(
+        Q(clock_in_photo=storage_name) | Q(clock_out_photo=storage_name)
+    ).select_related('employee').first()
+    if attendance and _can_access_employee_data(user, attendance.employee):
+        return True
+
+    request_obj = EmployeeRequest.objects.filter(
+        Q(proof_photo=storage_name) | Q(receipt_file=storage_name)
+    ).select_related('employee').first()
+    if request_obj and _can_access_employee_data(user, request_obj.employee):
+        return True
+
+    attachment = EmployeeRequestAttachment.objects.filter(
+        file=storage_name
+    ).select_related('request__employee').first()
+    if attachment and _can_access_employee_data(user, attachment.request.employee):
+        return True
+
+    return False
 
 
 def _verify_paystack_signature(request, *, context):
@@ -647,7 +733,7 @@ def paystack_banks(request):
 
 class PaystackVerifyAccountView(APIView):
     permission_classes = [AllowAny]
-    throttle_classes = []
+    throttle_classes = [BankVerifyThrottle]
 
     def post(self, request):
         serializer = PaystackResolveAccountSerializer(data=request.data)
@@ -669,7 +755,7 @@ class PaystackVerifyAccountView(APIView):
 
 @api_view(['GET'])
 @permission_classes([AllowAny])
-@throttle_classes([])
+@throttle_classes([BankVerifyThrottle])
 def paystack_resolve_account(request):
     serializer = PaystackResolveAccountSerializer(data=request.query_params)
     serializer.is_valid(raise_exception=True)
@@ -712,6 +798,20 @@ def clear_paystack_cache(request):
     except Exception as e:
         logger.error(f"Failed to clear cache: {e}")
         return Response({'status': False, 'message': str(e)}, status=500)
+
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def private_media(request, path):
+    """Serve sensitive uploaded files only after object-level permission checks."""
+    storage_name = str(path or '').lstrip('/\\')
+    if '..' in storage_name.replace('\\', '/').split('/'):
+        raise Http404
+    if not _can_access_private_media(request.user, storage_name):
+        raise Http404
+    if not default_storage.exists(storage_name):
+        raise Http404
+    return FileResponse(default_storage.open(storage_name, 'rb'))
 
 def draw_watermark(canvas, doc):
     """Draw low-opacity logo watermark on PDF"""
@@ -1198,8 +1298,6 @@ class UserViewSet(viewsets.ModelViewSet):
     serializer_class = UserSerializer
 
     def get_permissions(self):
-        if self.action == "export_csv":
-            return [AllowAny()]
         if self.action == "create":
             return [IsAdmin()]
         if self.request.user.is_authenticated:
@@ -1238,7 +1336,7 @@ class UserViewSet(viewsets.ModelViewSet):
 # ─────────────────────────────────────────
 
 class EmployeeViewSet(viewsets.ModelViewSet):
-    authentication_classes = [JWTAuthentication, SessionAuthentication, BasicAuthentication]
+    authentication_classes = [JWTAuthentication, SessionAuthentication]
     queryset = Employee.objects.all().order_by('-created_at')
     serializer_class = EmployeeSerializer
     filterset_fields = ['type', 'status', 'location']
@@ -1600,8 +1698,12 @@ class EmployeeViewSet(viewsets.ModelViewSet):
             return Response({'error': 'Invalid password'}, status=status.HTTP_403_FORBIDDEN)
 
         user = request.user
-        if not (user.is_superuser or user.role == 'admin'):
-            return Response({'error': 'Insufficient permissions'}, status=status.HTTP_403_FORBIDDEN)
+        if not _is_org_export_admin(user):
+            employee = getattr(user, 'employee_profile', None)
+            if not employee:
+                return Response({'error': 'Insufficient permissions'}, status=status.HTTP_403_FORBIDDEN)
+            filters = dict(filters or {})
+            filters['employee_id'] = str(employee.id)
 
         token = secrets.token_urlsafe(32)
         otp = ''.join(random.choices(string.digits, k=6))
@@ -1612,7 +1714,7 @@ class EmployeeViewSet(viewsets.ModelViewSet):
             data_type='employees',
             filters=filters,
             expires_at=timezone.now() + timezone.timedelta(minutes=10),
-            otp_code=otp
+            otp_code=OTP.hash_code(otp)
         )
 
         try:
@@ -1632,7 +1734,7 @@ class EmployeeViewSet(viewsets.ModelViewSet):
         return Response({'token': token, '2fa_required': True})
 
     @action(detail=False, methods=['get'], permission_classes=[IsAuthenticated],
-            authentication_classes=[JWTAuthentication, SessionAuthentication, BasicAuthentication])
+            authentication_classes=[JWTAuthentication, SessionAuthentication])
     def export_csv(self, request):
         """Export employee data as CSV using token"""
         token = request.query_params.get('token')
@@ -1647,9 +1749,11 @@ class EmployeeViewSet(viewsets.ModelViewSet):
             export_token.is_used = True
             export_token.save()
 
-            queryset = Employee.objects.all()
+            queryset = _employee_queryset_for_export(request.user)
             filters = export_token.filters
 
+            if filters.get('employee_id'):
+                queryset = queryset.filter(id=filters['employee_id'])
             if filters.get('type'):
                 queryset = queryset.filter(type=filters['type'])
             if filters.get('status'):
@@ -1703,11 +1807,18 @@ class EmployeeViewSet(viewsets.ModelViewSet):
         token = request.data.get('token')
         otp = request.data.get('otp')
         try:
-            export_token = ExportToken.objects.get(token=token, user=request.user, otp_code=otp)
+            export_token = ExportToken.objects.get(token=token, user=request.user)
             if export_token.is_expired():
                 return Response({'error': 'Token expired'}, status=400)
-            export_token.is_2fa_verified = True
-            export_token.save()
+            attempt_key = f"export_2fa_attempts:{request.user.id}:{token}"
+            attempts = cache.get(attempt_key, 0)
+            if attempts >= 3:
+                return Response({'error': 'Maximum verification attempts reached'}, status=400)
+            verified, _reason = export_token.verify_2fa(otp)
+            if not verified:
+                cache.set(attempt_key, attempts + 1, 600)
+                return Response({'error': 'Invalid verification code'}, status=400)
+            cache.delete(attempt_key)
             return Response({'success': True})
         except ExportToken.DoesNotExist:
             return Response({'error': 'Invalid verification code'}, status=400)
@@ -1867,7 +1978,7 @@ class AttendanceViewSet(viewsets.ModelViewSet):
             return Response({
                 'message': 'Clocked in successfully',
                 'status': 'present',
-                'photo_url': attendance.clock_in_photo.url if attendance.clock_in_photo else None,
+                'photo_url': _private_media_url(attendance.clock_in_photo),
             })
         except Employee.DoesNotExist:
             return Response({'error': 'Employee profile not found'}, status=status.HTTP_404_NOT_FOUND)
@@ -1925,7 +2036,7 @@ class AttendanceViewSet(viewsets.ModelViewSet):
             logger.info(f"{request.user.username} clocked out with photo")
             return Response({
                 'message': 'Clocked out successfully',
-                'photo_url': attendance.clock_out_photo.url if attendance.clock_out_photo else None,
+                'photo_url': _private_media_url(attendance.clock_out_photo),
             })
         except Employee.DoesNotExist:
             return Response({'error': 'Employee profile not found'}, status=status.HTTP_404_NOT_FOUND)
@@ -1954,6 +2065,9 @@ class AttendanceViewSet(viewsets.ModelViewSet):
             employee = Employee.objects.get(id=employee_id)
         except Employee.DoesNotExist:
             return Response({'error': 'Employee not found'}, status=status.HTTP_404_NOT_FOUND)
+
+        if not _can_manage_employee_leave(request.user, employee):
+            return Response({'error': 'You do not have permission to manage leave for this employee'}, status=status.HTTP_403_FORBIDDEN)
 
         try:
             start = datetime.strptime(start_date, '%Y-%m-%d').date()
@@ -2000,7 +2114,7 @@ class AttendanceViewSet(viewsets.ModelViewSet):
 # ─────────────────────────────────────────
 
 class PaymentViewSet(viewsets.ModelViewSet):
-    authentication_classes = [JWTAuthentication, SessionAuthentication, BasicAuthentication]
+    authentication_classes = [JWTAuthentication, SessionAuthentication]
     queryset = Payment.objects.all().order_by('id')
     serializer_class = PaymentSerializer
     filterset_fields = ['employee', 'status', 'payment_date']
@@ -2249,7 +2363,7 @@ class PaymentViewSet(viewsets.ModelViewSet):
         OTP.objects.filter(reference=reference, email=user.email, is_used=False).update(is_used=True)
         OTP.objects.create(
             email=user.email,
-            code=otp_code,
+            code=OTP.hash_code(otp_code),
             reference=reference,
             expires_at=timezone.now() + timezone.timedelta(seconds=expiry_seconds),
         )
@@ -2258,7 +2372,7 @@ class PaymentViewSet(viewsets.ModelViewSet):
             OTP.objects.filter(
                 reference=reference,
                 email=user.email,
-                code=otp_code,
+                code=OTP.hash_code(otp_code),
                 is_used=False,
             ).update(is_used=True)
 
@@ -2331,7 +2445,7 @@ class PaymentViewSet(viewsets.ModelViewSet):
                 return False, 'OTP has expired. Please request a new code.'
             if otp_obj.attempt_count >= otp_obj.max_attempts:
                 return False, 'Maximum OTP attempts reached. Please request a new OTP.'
-            if otp_obj.code != str(otp_code).strip():
+            if not OTP.verify_hashed_code(otp_obj.code, otp_code):
                 otp_obj.increment_attempt()
                 return False, 'Invalid OTP.'
 
@@ -3524,6 +3638,8 @@ class PaymentViewSet(viewsets.ModelViewSet):
         partials_list = request.data.get('partials', []) or []
         partials_map = {str(p.get('employee_id')): p for p in partials_list if p and p.get('employee_id')}
         employees = Employee.objects.filter(id__in=ids)
+        if not _is_org_export_admin(request.user):
+            employees = employees.filter(status__in=['active', 'pending'])
         total = Decimal('0')
         count = 0
         for e in employees:
@@ -3547,7 +3663,7 @@ class PaymentViewSet(viewsets.ModelViewSet):
             count += 1
         return Response({'total_amount': float(total), 'count': count})
 
-    @action(detail=False, methods=['post'], permission_classes=[IsAuthenticated, IsPayrollAdmin])
+    @action(detail=False, methods=['post'], permission_classes=[IsAuthenticated])
     def request_payslip_export(self, request):
         """Request a secure token for PDF payslip download"""
         password = request.data.get('password')
@@ -3556,6 +3672,13 @@ class PaymentViewSet(viewsets.ModelViewSet):
 
         if not request.user.check_password(password):
             return Response({'error': 'Invalid password'}, status=status.HTTP_403_FORBIDDEN)
+
+        try:
+            employee = Employee.objects.get(id=employee_id)
+        except Employee.DoesNotExist:
+            return Response({'error': 'Employee not found'}, status=status.HTTP_404_NOT_FOUND)
+        if not _can_access_employee_data(request.user, employee):
+            return Response({'error': 'Employee not found'}, status=status.HTTP_404_NOT_FOUND)
 
         token = secrets.token_urlsafe(32)
         ExportToken.objects.create(
@@ -3662,12 +3785,18 @@ class PaymentViewSet(viewsets.ModelViewSet):
         except Exception as e:
             return Response({'error': str(e)}, status=400)
 
-    @action(detail=True, methods=['post'], permission_classes=[IsAuthenticated, IsPayrollAdmin])
+    @action(detail=True, methods=['post'], permission_classes=[IsAuthenticated])
     def request_receipt_export(self, request, pk=None):
         """Securely request a token for a payment receipt"""
         password = request.data.get('password')
         if not request.user.check_password(password):
             return Response({'error': 'Invalid password'}, status=status.HTTP_403_FORBIDDEN)
+        try:
+            payment = Payment.objects.select_related('employee').get(id=pk)
+        except Payment.DoesNotExist:
+            return Response({'error': 'Payment not found'}, status=status.HTTP_404_NOT_FOUND)
+        if not _can_access_payment_data(request.user, payment):
+            return Response({'error': 'Payment not found'}, status=status.HTTP_404_NOT_FOUND)
 
         token = secrets.token_urlsafe(32)
         ExportToken.objects.create(
@@ -3717,25 +3846,36 @@ class PaymentViewSet(viewsets.ModelViewSet):
             logger.error(f"Receipt Generation Error: {e}")
             return Response({'error': str(e)}, status=400)
 
-    @action(detail=False, methods=['post'], permission_classes=[IsAuthenticated, IsPayrollAdmin])
+    @action(detail=False, methods=['post'], permission_classes=[IsAuthenticated])
     def request_export(self, request):
         """Securely request an export token for payments"""
         password = request.data.get('password')
         if not password or not request.user.check_password(password):
             return Response({'error': 'Invalid password'}, status=status.HTTP_403_FORBIDDEN)
+        filters = request.data.get('filters', {}) or {}
+        if not _is_org_export_admin(request.user) and not (
+            getattr(request.user, 'role', None) == 'admin'
+            or getattr(request.user, 'is_payment_admin', False)
+            or getattr(request.user, 'is_hr_admin', False)
+        ):
+            employee = getattr(request.user, 'employee_profile', None)
+            if not employee:
+                return Response({'error': 'Insufficient permissions'}, status=status.HTTP_403_FORBIDDEN)
+            filters = dict(filters)
+            filters['employee_id'] = str(employee.id)
         
         token = secrets.token_urlsafe(32)
         export_token = ExportToken.objects.create(
             user=request.user,
             token=token,
             data_type='payment',
-            filters=request.data.get('filters', {}),
+            filters=filters,
             expires_at=timezone.now() + timezone.timedelta(minutes=10)
         )
         return Response({'token': token, 'expires_at': export_token.expires_at})
 
     @action(detail=False, methods=['get'], permission_classes=[IsAuthenticated],
-            authentication_classes=[JWTAuthentication, SessionAuthentication, BasicAuthentication])
+            authentication_classes=[JWTAuthentication, SessionAuthentication])
     def export_csv(self, request):
         """Stream the CSV file from the server using the token"""
         token = request.query_params.get('token')
@@ -3758,8 +3898,14 @@ class PaymentViewSet(viewsets.ModelViewSet):
                 'Outstanding Balance', 'Payment Method', 'Reference', 'Status'
             ])
 
-            queryset = Payment.objects.all().order_by('-payment_date')
-            # Apply optional filters from token if needed
+            queryset = _payment_queryset_for_export(request.user)
+            filters = export_token.filters or {}
+            if filters.get('employee_id'):
+                queryset = queryset.filter(employee_id=filters['employee_id'])
+            if filters.get('status'):
+                queryset = queryset.filter(status=filters['status'])
+            if filters.get('payment_month'):
+                queryset = queryset.filter(payment_month=filters['payment_month'])
             
             for p in queryset:
                 writer.writerow([
@@ -4360,7 +4506,7 @@ def system_health_check(request):
 class EmployeeSalaryAdjustmentViewSet(viewsets.ModelViewSet):
     queryset = EmployeeSalaryAdjustment.objects.all().order_by('-date_added')
     serializer_class = EmployeeSalaryAdjustmentSerializer
-    authentication_classes = [JWTAuthentication, SessionAuthentication, BasicAuthentication]
+    authentication_classes = [JWTAuthentication, SessionAuthentication]
     permission_classes = [IsAuthenticated, IsPayrollAdmin]
     filterset_fields = ['employee', 'status', 'type', 'date_added']
     search_fields = ['employee__name', 'employee__employee_id', 'reason']
