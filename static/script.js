@@ -26,6 +26,8 @@ const AppState = {
   companies: [],
   deductions: [],
   payments: [],
+  requests: [],
+  sackedEmployees: [],
   clientPayments: [],
   notifications: [],
   reminders: [],
@@ -132,29 +134,55 @@ function escapeHtml(text) {
   return div.innerHTML;
 }
 
+function normalizeSearchValue(value) {
+  return String(value || "").toLowerCase().trim();
+}
+
+function employeeMatchesSearch(employee, query) {
+  const normalized = normalizeSearchValue(query);
+  if (!normalized) return true;
+  const fields = [
+    employee?.name,
+    employee?.employee_id,
+    employee?.email,
+    employee?.location,
+    employee?.type,
+    employee?.status,
+    employee?.first_name,
+    employee?.last_name,
+    employee?.user_full_name,
+  ];
+  return fields.some((field) => normalizeSearchValue(field).includes(normalized));
+}
+
 async function searchEmployees(query) {
-    if (!query || query.length < 2) return;
-    const res = await apiRequest(`/api/employees/?search=${encodeURIComponent(query)}`, 'GET');
-    if (res) renderEmployeeTable(res.results || res);
+  const searchInput = document.getElementById("employeeSearch");
+  if (searchInput) searchInput.value = query || "";
+  const res = await apiRequest(buildUrl("/api/employees/", query ? { search: query } : {}));
+  if (res.success) {
+    AppState.employees = res.data?.results || res.data || [];
+    renderEmployees(AppState.employees);
+  }
 }
 async function searchPayments(query) {
-    if (!query || query.length < 2) return;
-    const res = await apiRequest(`/api/payments/?search=${encodeURIComponent(query)}`, 'GET');
-    if (res) renderPaymentTable(res.results || res);
+  const searchInput = document.getElementById("paymentSearch");
+  if (searchInput) searchInput.value = query || "";
+  populatePaymentsTable();
 }
 async function searchDeductions(query) {
-    if (!query || query.length < 2) return;
-    const res = await apiRequest(`/api/deductions/?search=${encodeURIComponent(query)}`, 'GET');
-    if (res) renderDeductionTable(res.results || res);
+  const searchInput = document.getElementById("deductionSearch");
+  if (searchInput) searchInput.value = query || "";
+  await loadDeductions();
 }
 async function filterRequests(status) {
-    const res = await apiRequest(`/api/requests/?status=${status}`, 'GET');
-    if (res) renderRequestTable(res.results || res);
+  const filter = document.getElementById("requestFilter");
+  if (filter) filter.value = status || "";
+  await loadRequests();
 }
 async function searchCompanies(query) {
-    if (!query || query.length < 2) return;
-    const res = await apiRequest(`/api/companies/?search=${encodeURIComponent(query)}`, 'GET');
-    if (res) renderCompanyTable(res.results || res);
+  const searchInput = document.getElementById("companySearch");
+  if (searchInput) searchInput.value = query || "";
+  await loadCompanies();
 }
 function togglePartialPayment() {
     const cb = document.getElementById('isPartialPayment');
@@ -2218,7 +2246,7 @@ async function loadEmployees(page = 1) {
 // ADDED: EMPLOYEE DETAIL VIEW
 // ==========================================
 
-async function viewEmployeeDetail(employeeId) {
+async function viewEmployeeDetail(employeeId, sackedRecordId = null) {
   let employee = AppState.employees.find((e) => idsMatch(e.id, employeeId));
   if (!employee) {
     const detailRes = await apiRequest(`/api/employees/${employeeId}/`);
@@ -2232,6 +2260,10 @@ async function viewEmployeeDetail(employeeId) {
 
   const content = document.getElementById("employeeDetailContent");
   if (!content) return;
+
+  const sackedRecord = sackedRecordId
+    ? AppState.sackedEmployees.find((record) => idsMatch(record.id, sackedRecordId))
+    : AppState.sackedEmployees.find((record) => idsMatch(record.employee, employeeId));
 
   showLoading(); // Global spinner for modal content loading
   const res = await apiRequest(`/api/employees/${employeeId}/net_salary/`);
@@ -2280,6 +2312,18 @@ async function viewEmployeeDetail(employeeId) {
                     <tr><td><strong>Outstanding Balance:</strong></td><td class="text-success font-bold">${formatCurrency(d?.outstanding_balance ?? 0)}</td></tr>
                 </table>
             </div>
+            ${sackedRecord ? `
+            <div class="detail-section">
+                <h4>Separation Details</h4>
+                <table class="detail-table">
+                    <tr><td><strong>Date Sacked:</strong></td><td>${escapeHtml(sackedRecord.date_sacked || "N/A")}</td></tr>
+                    <tr><td><strong>Sack Reason:</strong></td><td>${escapeHtml(sackedRecord.offense || "N/A")}</td></tr>
+                    <tr><td><strong>Action By:</strong></td><td>${escapeHtml(sackedRecord.terminated_by_name || "N/A")}</td></tr>
+                </table>
+                <div style="margin-top: 12px;">
+                    <button type="button" class="btn btn-success" onclick="reinstateEmployee('${sackedRecord.id}')">Reinstate</button>
+                </div>
+            </div>` : ""}
         </div>
     `;
 
@@ -2750,15 +2794,29 @@ function renderCompanies(list) {
     document.getElementById("companiesTableBody");
   if (!tbody) return;
 
+  const query = normalizeSearchValue(document.getElementById("companySearch")?.value);
+  const statusFilter = normalizeSearchValue(document.getElementById("companyStatusFilter")?.value);
+  const filtered = (list || []).filter((company) => {
+    const matchesQuery =
+      !query ||
+      normalizeSearchValue(company.name).includes(query) ||
+      normalizeSearchValue(company.email).includes(query) ||
+      normalizeSearchValue(company.phone).includes(query) ||
+      normalizeSearchValue(company.location).includes(query) ||
+      normalizeSearchValue(company.status).includes(query);
+    const matchesStatus = !statusFilter || normalizeSearchValue(company.status) === statusFilter;
+    return matchesQuery && matchesStatus;
+  });
+
   tbody.innerHTML = "";
 
-  if (!list.length) {
+  if (!filtered.length) {
     tbody.innerHTML =
       '<tr><td colspan="12" class="text-center">No companies found</td></tr>';
     return;
   }
 
-  list.forEach((company) => {
+  filtered.forEach((company) => {
     const guardsCount = Array.isArray(company.assigned_guards)
       ? company.assigned_guards.length
       : company.guards_count || 0;
@@ -3081,15 +3139,29 @@ function renderDeductions(list) {
     document.getElementById("deductionsTableBody");
   if (!tbody) return;
 
+  const query = normalizeSearchValue(document.getElementById("deductionSearch")?.value);
+  const statusFilter = normalizeSearchValue(document.getElementById("deductionStatusFilter")?.value);
+  const filtered = (list || []).filter((ded) => {
+    const displayStatus = ded.display_status || (ded.status === "applied" ? "settled" : ded.status || "pending");
+    const matchesQuery =
+      !query ||
+      normalizeSearchValue(ded.employee_name).includes(query) ||
+      normalizeSearchValue(ded.employee_id || ded.employee).includes(query) ||
+      normalizeSearchValue(ded.reason).includes(query) ||
+      normalizeSearchValue(displayStatus).includes(query);
+    const matchesStatus = !statusFilter || normalizeSearchValue(displayStatus) === statusFilter;
+    return matchesQuery && matchesStatus;
+  });
+
   tbody.innerHTML = "";
 
-  if (!list.length) {
+  if (!filtered.length) {
     tbody.innerHTML =
       '<tr><td colspan="7" class="text-center">No deductions found</td></tr>';
     return;
   }
 
-  list.forEach((ded) => {
+  filtered.forEach((ded) => {
     const row = document.createElement("tr");
     const displayStatus = ded.display_status || (ded.status === "applied" ? "settled" : ded.status || "pending");
     const statusLabel = displayStatus === "settled"
@@ -4568,20 +4640,33 @@ async function loadSackedEmployees() {
     if (!res.success) throw new Error(res.message);
 
     const list = res.data?.results || res.data || [];
+    AppState.sackedEmployees = list;
     const tbody =
       AppState.elements.sackedTbody ||
       document.getElementById("sackedTableBody");
     if (!tbody) return;
 
+    const query = normalizeSearchValue(document.getElementById("sackedSearch")?.value);
+    const filtered = list.filter((record) => {
+      if (!query) return true;
+      return (
+        normalizeSearchValue(record.employee_id).includes(query) ||
+        normalizeSearchValue(record.employee_name).includes(query) ||
+        normalizeSearchValue(record.employee_type).includes(query) ||
+        normalizeSearchValue(record.offense).includes(query) ||
+        normalizeSearchValue(record.terminated_by_name).includes(query)
+      );
+    });
+
     tbody.innerHTML = "";
 
-    if (!list.length) {
+    if (!filtered.length) {
       tbody.innerHTML =
         '<tr><td colspan="7" class="text-center">No sacked employees found</td></tr>';
       return;
     }
 
-    list.forEach((record) => {
+    filtered.forEach((record) => {
       const row = document.createElement("tr");
       row.innerHTML = `
                 <td>${escapeHtml(record.employee_id || "-")}</td>
@@ -4591,7 +4676,7 @@ async function loadSackedEmployees() {
                 <td>${escapeHtml(record.offense || "-")}</td>
                 <td>${escapeHtml(record.terminated_by_name || "-")}</td>
                 <td>
-                    <button type="button" class="btn btn-sm btn-info" onclick="viewEmployeeDetail('${record.employee}')">
+                    <button type="button" class="btn btn-sm btn-info" onclick="viewEmployeeDetail('${record.employee}', '${record.id}')">
                         <i class="fas fa-eye"></i> View
                     </button>
                     <button type="button" onclick="reinstateEmployee('${record.id}')" class="btn btn-sm btn-success">Reinstate</button>
@@ -4929,6 +5014,8 @@ async function completeReminder(reminderId) {
 // ==========================================
 
 function showIndividualPaymentModal() {
+  const searchInput = document.getElementById("paymentEmployeeSearch");
+  if (searchInput) searchInput.value = "";
   populateEmployeeSelect("paymentEmployee");
   document.getElementById("paymentPreview").style.display = "none";
   openModal("individualPaymentModal");
@@ -4945,6 +5032,8 @@ async function goToPaymentsForEmployee(employeeId) {
 }
 
 function showBulkPaymentModal() {
+  const searchInput = document.getElementById("bulkPaymentSearch");
+  if (searchInput) searchInput.value = "";
   populateBulkTable();
   openModal("bulkPaymentModal");
 }
@@ -5196,15 +5285,11 @@ function updateRecentActivity(recentEmployees = [], recentPayments = []) {
 }
 
 function updateUIAfterEmployeeLoad() {
-  [
-    "clockEmployee",
-    "deductionEmployee",
-    "paymentEmployee",
-    "payslipEmployee",
-    "leaveEmployee",
-  ].forEach((id) => {
-    populateEmployeeSelect(id);
-  });
+  populateEmployeeSelect("clockEmployee");
+  populateEmployeeSelect("deductionEmployee");
+  populateEmployeeSelect("leaveEmployee");
+  populateEmployeeSelect("paymentEmployee", document.getElementById("paymentEmployeeSearch")?.value || "");
+  populateEmployeeSelect("payslipEmployee", document.getElementById("payslipSearch")?.value || "");
   updateDashboardStats();
   populatePaymentsTable();
 }
@@ -5218,14 +5303,17 @@ async function fetchPaystackBalance() {
   }
 }
 
-function populateEmployeeSelect(selectId) {
+function populateEmployeeSelect(selectId, searchQuery = "") {
   const select = document.getElementById(selectId);
   if (!select) return;
 
   const currentValue = select.value;
   select.innerHTML = '<option value="">Select Employee</option>';
 
-  AppState.employees.forEach((emp) => {
+  const normalizedQuery = normalizeSearchValue(searchQuery);
+  AppState.employees
+    .filter((emp) => employeeMatchesSearch(emp, normalizedQuery))
+    .forEach((emp) => {
     const option = document.createElement("option");
     option.value = emp.id;
     option.textContent = `${escapeHtml(emp.name)} (${escapeHtml(emp.employee_id || "No ID")})`;
@@ -5299,9 +5387,11 @@ function populateBulkTable() {
     return;
   }
 
-  const activeEmployees = AppState.employees.filter(
-    (e) => e.status === "active" || !e.status,
-  );
+  const query = normalizeSearchValue(document.getElementById("bulkPaymentSearch")?.value);
+  const activeEmployees = AppState.employees.filter((e) => {
+    const isActive = e.status === "active" || !e.status;
+    return isActive && employeeMatchesSearch(e, query);
+  });
   const currentMonth = new Date().toISOString().slice(0, 7); // YYYY-MM
 
   activeEmployees.forEach((emp) => {
@@ -5627,9 +5717,17 @@ function populatePaymentsTable() {
     return;
   }
 
-  const activeEmployees = AppState.employees.filter(
-    (e) => e.status === "active" || !e.status,
-  );
+  const query = normalizeSearchValue(document.getElementById("paymentSearch")?.value);
+  const statusFilter = normalizeSearchValue(document.getElementById("paymentStatusFilter")?.value);
+  const activeEmployees = AppState.employees.filter((e) => {
+    const isActive = e.status === "active" || !e.status;
+    if (!isActive || !employeeMatchesSearch(e, query)) return false;
+    const currentPayment = (AppState.payments || []).find(
+      (p) => idsMatch(p.employee, e.id) && p.payment_month === new Date().toISOString().slice(0, 7),
+    );
+    const currentStatus = normalizeSearchValue(currentPayment?.status || (e.salary_breakdown?.outstanding_balance > 0 ? "unpaid" : "paid"));
+    return !statusFilter || currentStatus === statusFilter;
+  });
   const currentMonth = new Date().toISOString().slice(0, 7);
 
   activeEmployees.forEach((emp) => {
@@ -6194,11 +6292,14 @@ async function confirmExport(e) {
       return; // hideLoading called in finally
     }
 
+    hideLoading(btn);
+
     // Handle 2FA if required
     if (res.data && res.data["2fa_required"]) {
       const otp = await appPrompt("A verification code has been sent to your email. Enter it to continue:", "", "Verification Code");
       if (!otp) return; // User cancelled
 
+      showLoading(btn);
       const vRes = await apiRequest("/api/employees/verify_2fa/", {
         method: "POST",
         body: { token: res.data.token, otp },
@@ -6209,6 +6310,7 @@ async function confirmExport(e) {
         return;
       }
 
+      hideLoading(btn);
       await finishDownload(res.data.token, type, modal, url, downloadFilename);
       return;
     }
@@ -6315,7 +6417,7 @@ async function confirmExport(e) {
 // ==========================================
 
 function filterHistory() {
-  const search = document.getElementById("historySearch")?.value.toLowerCase();
+  const search = normalizeSearchValue(document.getElementById("historySearch")?.value);
   const fromDate = document.getElementById("historyDateFrom")?.value;
   const toDate = document.getElementById("historyDateTo")?.value;
 
@@ -6324,8 +6426,11 @@ function filterHistory() {
   if (search) {
     filtered = filtered.filter(
       (p) =>
-        (p.employee_name || "").toLowerCase().includes(search) ||
-        (p.employee_id || "").toLowerCase().includes(search),
+        normalizeSearchValue(p.employee_name).includes(search) ||
+        normalizeSearchValue(p.employee_id || p.employee).includes(search) ||
+        normalizeSearchValue(p.bank_account).includes(search) ||
+        normalizeSearchValue(p.transaction_reference).includes(search) ||
+        normalizeSearchValue(p.status).includes(search),
     );
   }
 
@@ -6344,7 +6449,7 @@ function filterHistory() {
   tbody.innerHTML = "";
   if (!filtered.length) {
     tbody.innerHTML =
-      '<tr><td colspan="12" class="text-center">No companies found</td></tr>';
+      '<tr><td colspan="12" class="text-center">No payment history found</td></tr>';
     return;
   }
 
@@ -6456,7 +6561,7 @@ function initEmployeeSearch() {
 
   const filterEmployees = () => {
     // Fixed: Debounce filterEmployees
-    const query = searchInput?.value.toLowerCase() || "";
+    const query = searchInput?.value || "";
     const type = typeFilter?.value || "all";
 
     let filtered = AppState.employees;
@@ -6468,9 +6573,9 @@ function initEmployeeSearch() {
     if (query) {
       filtered = filtered.filter(
         (emp) =>
-          (emp.name || "").toLowerCase().includes(query) ||
-          (emp.employee_id || "").toLowerCase().includes(query) ||
-          (emp.location || "").toLowerCase().includes(query),
+          employeeMatchesSearch(emp, query) ||
+          normalizeSearchValue(emp.user?.first_name).includes(normalizeSearchValue(query)) ||
+          normalizeSearchValue(emp.user?.last_name).includes(normalizeSearchValue(query)),
       );
     }
 
@@ -6663,10 +6768,23 @@ async function loadRequests() {
   const res = await apiRequest("/api/requests/"); // No spinner here, caller manages
   if (res.success) {
     const list = res.data?.results || res.data || [];
-    tbody.innerHTML = list.length
+    AppState.requests = list;
+    const query = normalizeSearchValue(document.getElementById("requestSearch")?.value);
+    const statusFilter = normalizeSearchValue(document.getElementById("requestFilter")?.value);
+    const filtered = list.filter((req) => {
+      const matchesQuery =
+        !query ||
+        normalizeSearchValue(req.employee_name).includes(query) ||
+        normalizeSearchValue(req.request_type).includes(query) ||
+        normalizeSearchValue(req.status).includes(query) ||
+        normalizeSearchValue(req.description).includes(query);
+      const matchesStatus = !statusFilter || normalizeSearchValue(req.status) === statusFilter;
+      return matchesQuery && matchesStatus;
+    });
+    tbody.innerHTML = filtered.length
       ? ""
       : '<tr><td colspan="8">No requests found</td></tr>';
-    list.forEach((req) => {
+    filtered.forEach((req) => {
       const isAdmin =
         AppState.currentUser?.is_superuser ||
         AppState.currentUser?.is_request_admin;

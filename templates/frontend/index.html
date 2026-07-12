@@ -212,6 +212,9 @@
                         <i class="fas fa-plus"></i> New Request
                     </button>
                 </div>
+                <div class="filter-bar">
+                    <input type="text" id="requestSearch" placeholder="Search requests..." class="search-input" oninput="loadRequests()">
+                </div>
                 <div class="table-responsive">
                     <table class="data-table">
                         <thead>
@@ -337,6 +340,17 @@
                             <button onclick="showAddDeductionModal()" class="btn btn-primary">
                                 <i class="fas fa-plus"></i> Add Deduction
                             </button>
+                        </div>
+                        <div class="filter-bar">
+                            <input type="text" id="deductionSearch" placeholder="Search deductions..." class="search-input" oninput="renderDeductions(AppState.deductions)">
+                            <select id="deductionStatusFilter" class="filter-select" onchange="renderDeductions(AppState.deductions)">
+                                <option value="">All Status</option>
+                                <option value="pending">Pending</option>
+                                <option value="applied">Applied</option>
+                                <option value="settled">Settled</option>
+                                <option value="cancelled">Cancelled</option>
+                                <option value="terminated">Terminated</option>
+                            </select>
                         </div>
 
                         <div class="table-responsive">
@@ -476,6 +490,20 @@
                                 </button>
                             </div>
                         </div>
+                        <div class="filter-bar">
+                            <input type="text" id="paymentSearch" placeholder="Search payments..." class="search-input" oninput="populatePaymentsTable()">
+                            <select id="paymentStatusFilter" class="filter-select" onchange="populatePaymentsTable()">
+                                <option value="">All Status</option>
+                                <option value="paid">Paid</option>
+                                <option value="unpaid">Unpaid</option>
+                                <option value="partial">Partial</option>
+                                <option value="pending">Pending</option>
+                                <option value="processing">Processing</option>
+                                <option value="pending_paystack_otp">Awaiting OTP</option>
+                                <option value="pending_hr">Awaiting HR</option>
+                                <option value="failed">Failed</option>
+                            </select>
+                        </div>
 
                         <div class="payment-summary">
                             <div class="summary-card">
@@ -549,6 +577,10 @@
 
                         <div class="payslip-generator">
                             <div class="form-group">
+                                <label for="payslipSearch">Search Employee</label>
+                                <input type="text" id="payslipSearch" class="form-control" placeholder="Search by name or ID" oninput="populateEmployeeSelect('payslipEmployee', this.value)">
+                            </div>
+                            <div class="form-group">
                                 <label for="payslipEmployee">Select Employee</label>
                                 <select id="payslipEmployee" class="form-control"></select>
                             </div>
@@ -578,6 +610,15 @@
                             <button onclick="openModal('addCompanyModal')" class="btn btn-primary">
                                 <i class="fas fa-plus"></i> Add Company
                             </button>
+                        </div>
+                        <div class="filter-bar">
+                            <input type="text" id="companySearch" placeholder="Search companies..." class="search-input" oninput="renderCompanies(AppState.companies)">
+                            <select id="companyStatusFilter" class="filter-select" onchange="renderCompanies(AppState.companies)">
+                                <option value="">All Status</option>
+                                <option value="active">Active</option>
+                                <option value="terminated">Terminated</option>
+                                <option value="renewed">Renewed</option>
+                            </select>
                         </div>
 
                         <div class="table-responsive">
@@ -712,9 +753,9 @@
                             </button>
                         </div>
                         <div class="filter-bar">
-                            <input type="text" id="historySearch" placeholder="Search by employee..." class="search-input">
-                            <input type="date" id="historyDateFrom" class="form-control">
-                            <input type="date" id="historyDateTo" class="form-control">
+                            <input type="text" id="historySearch" placeholder="Search by employee..." class="search-input" oninput="filterHistory()">
+                            <input type="date" id="historyDateFrom" class="form-control" onchange="filterHistory()">
+                            <input type="date" id="historyDateTo" class="form-control" onchange="filterHistory()">
                             <button onclick="filterHistory()" class="btn btn-secondary">Filter</button>
                         </div>
                         <div class="table-responsive">
@@ -739,10 +780,13 @@
                 <!-- Sacked Employees Section -->
                 <div id="admin-controls-sacked">
                     <section class="content-section" id="sacked">
-                        <div class="section-header">
-                            <h2><i class="fas fa-user-slash"></i> Sacked/Resigned Employees Archive</h2>
-                        </div>
-                        <div class="table-responsive">
+                <div class="section-header">
+                    <h2><i class="fas fa-user-slash"></i> Sacked/Resigned Employees Archive</h2>
+                </div>
+                <div class="filter-bar">
+                    <input type="text" id="sackedSearch" placeholder="Search sacked employees..." class="search-input" oninput="loadSackedEmployees()">
+                </div>
+                <div class="table-responsive">
                             <table class="data-table">
                                 <thead>
                                     <tr>
@@ -1065,6 +1109,10 @@
                 </div>
                 <form id="individualPaymentForm">
                     <div class="form-group">
+                        <label for="paymentEmployeeSearch">Search Employee</label>
+                        <input type="text" id="paymentEmployeeSearch" class="form-control" placeholder="Search by name or ID" oninput="populateEmployeeSelect('paymentEmployee', this.value)">
+                    </div>
+                    <div class="form-group">
                         <label for="paymentEmployee">Select Employee</label>
                         <select id="paymentEmployee" class="form-control" required onchange="updatePaymentPreview()"></select>
                     </div>
@@ -1190,6 +1238,10 @@
                             <label style="margin-top:8px;">Default Reason</label>
                             <input type="text" id="bulkDefaultPartialReason" class="form-control" placeholder="Reason for partial payments">
                         </div>
+                    </div>
+                    <div class="form-group">
+                        <label for="bulkPaymentSearch">Search Employees</label>
+                        <input type="text" id="bulkPaymentSearch" class="form-control" placeholder="Search by name or ID" oninput="populateBulkTable()">
                     </div>
                     <div class="table-responsive">
                         <table class="data-table">

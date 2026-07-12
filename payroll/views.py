@@ -1371,7 +1371,7 @@ class EmployeeViewSet(viewsets.ModelViewSet):
     queryset = Employee.objects.all().order_by('-created_at')
     serializer_class = EmployeeSerializer
     filterset_fields = ['type', 'status', 'location']
-    search_fields = ['name', 'employee_id', 'email']
+    search_fields = ['name', 'employee_id', 'email', 'user__first_name', 'user__last_name', 'user__username']
 
     def _employee_scope_queryset(self):
         user = self.request.user
@@ -2148,6 +2148,14 @@ class PaymentViewSet(viewsets.ModelViewSet):
     queryset = Payment.objects.all().order_by('id')
     serializer_class = PaymentSerializer
     filterset_fields = ['employee', 'status', 'payment_date']
+    search_fields = [
+        'employee__name',
+        'employee__employee_id',
+        'employee__email',
+        'transaction_reference',
+        'paystack_reference',
+        'status',
+    ]
     throttle_classes = [PaymentThrottle]
 
     def _internal_otp_expiry_seconds(self):
@@ -3980,6 +3988,7 @@ class DeductionViewSet(viewsets.ModelViewSet):
     queryset = Deduction.objects.all().order_by('id')
     serializer_class = DeductionSerializer
     filterset_fields = ["employee", "status", "date"]
+    search_fields = ['employee__name', 'employee__employee_id', 'employee__email', 'reason', 'status']
 
     def get_permissions(self):
         if self.action in ["create", "update", "partial_update", "destroy"]:
@@ -4145,6 +4154,8 @@ class DeductionViewSet(viewsets.ModelViewSet):
 class SackedEmployeeViewSet(viewsets.ModelViewSet):
     queryset = SackedEmployee.objects.all().order_by('id')
     serializer_class = SackedEmployeeSerializer
+    filterset_fields = ['employee', 'date_sacked', 'terminated_by']
+    search_fields = ['employee__name', 'employee__employee_id', 'employee__email', 'offense', 'terminated_by__username']
 
     def get_permissions(self):
         if self.action in ['create', 'update', 'partial_update', 'destroy']:
@@ -4353,6 +4364,14 @@ class EmployeeRequestViewSet(viewsets.ModelViewSet):
     queryset = EmployeeRequest.objects.all().order_by('-created_at')
     serializer_class = EmployeeRequestSerializer
     filterset_fields = ['employee', 'request_type', 'status']
+    search_fields = [
+        'employee__name',
+        'employee__employee_id',
+        'employee__email',
+        'request_type',
+        'status',
+        'description',
+    ]
 
     def get_permissions(self):
         if self.action == 'create':
