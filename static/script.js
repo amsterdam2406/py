@@ -73,6 +73,7 @@ const AppState = {
   pendingRefreshTimer: null,
   lastSectionRefresh: {},
   sectionRefreshInFlight: new Map(),
+  privateMediaObjectUrls: new Map(),
 
   elements: {
     tbody: null,
@@ -1227,6 +1228,16 @@ async function apiRequest(url, options = {}) {
       };
     }
 
+    if (response.ok && options.responseType === "blob") {
+      const blob = await response.blob();
+
+      if (shouldRefreshAfterMutation(url, fetchOptions.method)) {
+        scheduleVisibleSectionRefresh("data change");
+      }
+
+      return { success: true, status: response.status, data: blob };
+    }
+
     const data = await response.json().catch(() => ({}));
 
     if (!response.ok) {
@@ -1265,6 +1276,27 @@ async function apiRequest(url, options = {}) {
       message: friendlyToastMessage(err.message || "Request failed. Please try again."),
     };
   }
+}
+
+function clearPrivateMediaObjectUrls() {
+  for (const objectUrl of AppState.privateMediaObjectUrls.values()) {
+    URL.revokeObjectURL(objectUrl);
+  }
+  AppState.privateMediaObjectUrls.clear();
+}
+
+async function getPrivateMediaObjectUrl(mediaPath) {
+  if (!mediaPath) return null;
+
+  const cached = AppState.privateMediaObjectUrls.get(mediaPath);
+  if (cached) return cached;
+
+  const res = await apiRequest(mediaPath, { responseType: "blob" });
+  if (!res.success || !res.data) return null;
+
+  const objectUrl = URL.createObjectURL(res.data);
+  AppState.privateMediaObjectUrls.set(mediaPath, objectUrl);
+  return objectUrl;
 }
 
 /**
@@ -3378,6 +3410,7 @@ async function loadAttendance() {
     if (!tbody) return;
 
     tbody.innerHTML = "";
+    clearPrivateMediaObjectUrls();
 
     if (!list.length) {
       tbody.innerHTML =
@@ -3385,11 +3418,14 @@ async function loadAttendance() {
       updateAttendanceStats(0, 0, 0);
       return;
     }
-    list.forEach((att) => {
+
+    const photoUrls = await Promise.all(
+      list.map((att) => (att.clock_in_photo ? getPrivateMediaObjectUrl(att.clock_in_photo) : null)),
+    );
+
+    list.forEach((att, index) => {
       const row = document.createElement("tr");
-      const photoUrl = att.clock_in_photo
-        ? att.clock_in_photo.replace(/^\/media\//, "/media/")
-        : null;
+      const photoUrl = photoUrls[index];
 
       const statusText =
         att.status === "leave" && att.leave_start && att.leave_end
@@ -4080,26 +4116,24 @@ async function initiateIndividualPayment(empId) {
     );
 
     if (existingPayment) {
-        const status = existingPayment.status;
-        if (outstanding <= 0) {
-            showToast("Salary already paid for this month", "info");
-            return;
-        }
-        if (['processing', 'pending', 'pending_hr'].includes(status)) {
-            showToast(`Payment already ${status}. Checking status...`, "info");
-            startPaymentStatusPolling(existingPayment.transaction_reference);
-            return;
-        }
-        if (status !== 'failed') {
-            showToast(`Payment already initiated (${status}). Cannot re-initiate.`, "warning");
-            if (status === 'pending_paystack_otp') {
-                showPaystackOtpModal(
-                    existingPayment.transaction_reference,
-                    existingPayment.paystack_transfer_code || '',
-                );
-            }
-            return;
-        }
+      const status = existingPayment.status;
+      if (outstanding <= 0) {
+        showToast("Salary already paid for this month", "info");
+        return;
+      }
+      if (['processing', 'pending', 'pending_hr'].includes(status)) {
+        showToast(`Payment already ${status}. Checking status...`, "info");
+        startPaymentStatusPolling(existingPayment.transaction_reference);
+        return;
+      }
+      if (status === 'pending_paystack_otp') {
+        showToast(`Payment already initiated (${status}). Cannot re-initiate.`, "warning");
+        showPaystackOtpModal(
+            existingPayment.transaction_reference,
+            existingPayment.paystack_transfer_code || '',
+        );
+        return;
+      }
     }
 
     const btn = document.querySelector(
