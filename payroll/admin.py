@@ -58,7 +58,7 @@ class UserAdmin(BaseUserAdmin):
         ('Role & Permissions', {
             'fields': (
                 'role',
-                'is_company_admin', 'is_employee_admin',
+                'is_company_admin', 'is_employee_admin', 'is_attendance_admin',
                 'is_payment_admin', 'is_deduction_admin',
                 'is_hr_admin', 'is_request_admin',
                 'is_notification_admin', 'is_password_admin',

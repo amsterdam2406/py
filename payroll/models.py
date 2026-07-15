@@ -315,6 +315,7 @@ class User(AbstractUser):
     is_company_admin = models.BooleanField(default=False)
     is_notification_admin = models.BooleanField(default=False)
     is_employee_admin = models.BooleanField(default=False)
+    is_attendance_admin = models.BooleanField(default=False)
     is_payment_admin = models.BooleanField(default=False)
     is_deduction_admin = models.BooleanField(default=False)
     is_password_admin = models.BooleanField(default=False)
@@ -357,6 +358,7 @@ class User(AbstractUser):
             self.is_payment_admin,
             self.is_deduction_admin,
             self.is_employee_admin,
+            self.is_attendance_admin,
             self.is_request_admin,
             self.is_hr_admin,
             self.is_notification_admin,

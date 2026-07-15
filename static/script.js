@@ -2165,56 +2165,71 @@ function applyRolePermissions(user) {
   // Mapping backend flags to UI visibility
   const backendUiPermissions =
     user.ui_permissions || user.navigation?.ui_permissions || {};
+  const uiAllowed = (id, fallback = false) =>
+    Object.prototype.hasOwnProperty.call(backendUiPermissions, id)
+      ? Boolean(backendUiPermissions[id])
+      : Boolean(fallback);
   const permissions = [
     {
       id: "admin-controls-employee",
-      allowed:
-        user.is_superuser || user.is_employee_admin,
+      allowed: uiAllowed("admin-controls-employee", user.is_superuser || user.is_employee_admin),
     },
     {
       id: "admin-controls-sacked",
-      allowed:
-        user.is_superuser || user.is_employee_admin,
+      allowed: uiAllowed("admin-controls-sacked", user.is_superuser || user.is_employee_admin),
     },
     {
       id: "admin-controls-companies",
-      allowed:
-        user.is_superuser || user.is_company_admin,
+      allowed: uiAllowed("admin-controls-companies", user.is_superuser || user.is_company_admin),
     },
-    { id: "accounts", allowed: user.is_superuser },
+    { id: "accounts", allowed: uiAllowed("accounts", user.is_superuser) },
     {
       id: "requests-admin-view",
-      allowed:
-        user.is_superuser || user.is_request_admin,
+      allowed: uiAllowed("requests-admin-view", user.is_superuser || user.is_request_admin),
     },
     {
       id: "payments",
-      allowed:
-        user.is_superuser || user.is_payment_admin,
+      allowed: uiAllowed("payments", user.is_superuser || user.is_payment_admin),
     },
     {
       id: "deductions-section",
-      allowed:
-        user.is_superuser || user.is_deduction_admin,
+      allowed: uiAllowed("deductions-section", user.is_superuser || user.is_deduction_admin),
     },
     {
       id: "hr-admin-view",  // Add this ID to your HTML for HR-specific sections
-      allowed: user.is_superuser || user.is_hr_admin,
+      allowed: uiAllowed("hr-admin-view", user.is_superuser || user.is_hr_admin),
     },
     {
       id: "payment-approval-buttons",  // For approve/reject payment buttons
-      allowed: user.is_superuser || user.is_hr_admin,
+      allowed: uiAllowed("payment-approval-buttons", user.is_superuser || user.is_hr_admin),
     },
   ];
 
   permissions.forEach(({ id, allowed }) => {
     const element = document.getElementById(id);
-    const backendAllowed =
-      Object.prototype.hasOwnProperty.call(backendUiPermissions, id)
-        ? backendUiPermissions[id]
-        : allowed;
-    if (element) element.style.display = backendAllowed ? "" : "none";
+    if (element) element.style.display = allowed ? "" : "none";
   });
+
+  const showCompanyStats = uiAllowed("dashboard-company-stats", user.is_superuser);
+  const showPaymentStats = uiAllowed("dashboard-payment-stats", user.is_superuser || user.is_payment_admin);
+  const showDeductionStats = uiAllowed("dashboard-deduction-stats", user.is_superuser || user.is_deduction_admin);
+  const showRecentActivity = uiAllowed("dashboard-recent-activity", user.is_superuser);
+  const hasPersonalEmployeeProfile = Boolean(user.employee_id);
+  const dashboardStaffCard = document.getElementById("dashboardStaffCard");
+  const dashboardGuardsCard = document.getElementById("dashboardGuardsCard");
+  const dashboardPaymentsCard = document.getElementById("dashboardPaymentsCard");
+  const dashboardDeductionsCard = document.getElementById("dashboardDeductionsCard");
+  const recentActivity = document.getElementById("dashboardRecentActivity");
+  if (dashboardStaffCard) dashboardStaffCard.style.display = showCompanyStats ? "" : "none";
+  if (dashboardGuardsCard) dashboardGuardsCard.style.display = showCompanyStats ? "" : "none";
+  if (dashboardPaymentsCard) dashboardPaymentsCard.style.display = showPaymentStats || (!showCompanyStats && hasPersonalEmployeeProfile) ? "" : "none";
+  if (dashboardDeductionsCard) dashboardDeductionsCard.style.display = showDeductionStats || (!showCompanyStats && hasPersonalEmployeeProfile) ? "" : "none";
+  if (recentActivity) recentActivity.style.display = showRecentActivity ? "" : "none";
+
+  const totalPaymentsLabel = document.getElementById("totalPaymentsLabel");
+  const totalDeductionsLabel = document.getElementById("totalDeductionsLabel");
+  if (totalPaymentsLabel) totalPaymentsLabel.textContent = showCompanyStats ? "Total Payments" : "My Total Payments";
+  if (totalDeductionsLabel) totalDeductionsLabel.textContent = showCompanyStats ? "Total Deductions" : "My Total Deductions";
 
   const requestButton = document.getElementById("makeRequestBtn");
   if (requestButton) {
@@ -2231,7 +2246,7 @@ function getAllowedSectionsForUser(user) {
   if (Array.isArray(user.navigation?.allowed_sections) && user.navigation.allowed_sections.length) {
     return new Set(user.navigation.allowed_sections);
   }
-  if (user.is_superuser || user.role === "admin") {
+  if (user.is_superuser) {
     return new Set([
       "dashboard", "employees", "attendance", "deductions", "iou-management",
       "bonus-management", "payments", "payslips", "companies", "accounts",
@@ -2276,6 +2291,23 @@ function applyNavigationPermissions(user) {
 
 async function loadEmployees(page = 1) {
   try {
+    const canViewEmployeeDirectory = Boolean(
+      AppState.currentUser?.ui_permissions?.["admin-controls-employee"] ||
+      AppState.currentUser?.navigation?.ui_permissions?.["admin-controls-employee"] ||
+      AppState.currentUser?.is_superuser ||
+      AppState.currentUser?.is_hr_admin ||
+      AppState.currentUser?.is_payment_admin ||
+      AppState.currentUser?.is_attendance_admin
+    );
+
+    if (!canViewEmployeeDirectory) {
+      const own = await apiRequest("/api/employees/me/");
+      if (!own.success) throw new Error(own.message);
+      AppState.employees = own.data ? [own.data] : [];
+      updateUIAfterEmployeeLoad();
+      return true;
+    }
+
     const res = await apiRequest(buildUrl("/api/employees/", { page })); // No spinner here, caller manages
     if (!res.success) throw new Error(res.message);
 
@@ -2496,9 +2528,12 @@ function renderEmployees(list = []) {
     return;
   }
 
-  const isAdmin =
-    AppState.currentUser?.is_superuser ||
-    AppState.currentUser?.role === "admin";
+  const employeeUiPermissions =
+    AppState.currentUser?.ui_permissions ||
+    AppState.currentUser?.navigation?.ui_permissions ||
+    {};
+  const canManageEmployees = Boolean(employeeUiPermissions["admin-controls-employee"]);
+  const canManagePayments = Boolean(employeeUiPermissions.payments);
 
   list.forEach((emp) => {
     if (!emp) return;
@@ -2506,7 +2541,7 @@ function renderEmployees(list = []) {
     const isPending = emp.status === "pending"; // Fixed: Only pending employees can be bulk approved
 
     row.innerHTML = `
-            <td>${isPending && isAdmin ? `<input type="checkbox" class="employee-checkbox" value="${emp.id}">` : ""}</td>
+            <td>${isPending && canManageEmployees ? `<input type="checkbox" class="employee-checkbox" value="${emp.id}">` : ""}</td>
             <td>${escapeHtml(emp.employee_id ?? emp.id ?? "-")}</td>
             <td>${escapeHtml(emp.name ?? "-")}</td>
             <td>${escapeHtml(emp.type ?? "-")}</td>
@@ -2520,23 +2555,25 @@ function renderEmployees(list = []) {
                 </button>
                 ${
                   emp.status === "pending"
-                    ? `
+                    ? canManageEmployees ? `
                     <button type="button" class="btn btn-sm btn-success" onclick="approveEmployee('${emp.id}')">
                         <i class="fas fa-user-check"></i> Approve
                     </button>
                     <button type="button" class="btn btn-sm btn-outline-info" onclick="resendConfirmationMail('${emp.id}')">
                         <i class="fas fa-envelope"></i> Resend Mail
                     </button>
-                `
-                    : `
+                ` : ""
+                    : canManagePayments ? `
                 <button type="button" class="btn btn-sm btn-outline-success" onclick="goToPaymentsForEmployee('${emp.id}')">
                     <i class="fas fa-money-bill-wave"></i> Go to Payments
                 </button>
-                `
+                ` : ""
                 }
+                ${canManageEmployees ? `
                 <button type="button" class="btn btn-sm btn-info" onclick="resignEmployee('${emp.id}')">Resign</button>
                 <button type="button" class="btn btn-sm btn-warning" onclick="showSackEmployeeModal('${emp.id}')">Sack</button>
                 <button type="button" class="btn btn-sm btn-danger" onclick="handleDelete('${emp.id}')">Delete</button>
+                ` : ""}
             </td>
         `;
     tableBody.appendChild(row);
@@ -4917,10 +4954,11 @@ async function viewNotificationDetail(notificationId) {
 
 async function exportNotificationHistory() {
   let password = "";
-  const isAdmin =
-    AppState.currentUser?.is_superuser ||
-    AppState.currentUser?.role === "admin" ||
-    AppState.currentUser?.is_notification_admin;
+  const notificationUiPermissions =
+    AppState.currentUser?.ui_permissions ||
+    AppState.currentUser?.navigation?.ui_permissions ||
+    {};
+  const isAdmin = Boolean(notificationUiPermissions["admin-controls-notifications"]);
   if (!isAdmin) {
     password = await appPrompt("Enter your password to download your notification history:", "", "Export Notifications");
     if (!password) return;
@@ -6834,9 +6872,11 @@ async function loadRequests() {
       ? ""
       : '<tr><td colspan="8">No requests found</td></tr>';
     filtered.forEach((req) => {
-      const isAdmin =
-        AppState.currentUser?.is_superuser ||
-        AppState.currentUser?.is_request_admin;
+      const requestUiPermissions =
+        AppState.currentUser?.ui_permissions ||
+        AppState.currentUser?.navigation?.ui_permissions ||
+        {};
+      const isAdmin = Boolean(requestUiPermissions["requests-admin-view"]);
       const hasAttachments = req.attachments && req.attachments.length > 0;
 
       const row = document.createElement("tr");

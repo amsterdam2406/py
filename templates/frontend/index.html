@@ -154,7 +154,7 @@
                 </div>
                 
                 <div class="stats-grid">
-                    <div class="stat-card">
+                    <div class="stat-card" id="dashboardStaffCard">
                         <div class="stat-icon bg-blue">
                             <i class="fas fa-users"></i>
                         </div>
@@ -163,7 +163,7 @@
                             <p>Total Staff</p>
                         </div>
                     </div>
-                    <div class="stat-card">
+                    <div class="stat-card" id="dashboardGuardsCard">
                         <div class="stat-icon bg-green">
                             <i class="fas fa-user-shield"></i>
                         </div>
@@ -172,27 +172,27 @@
                             <p>Total Guards</p>
                         </div>
                     </div>
-                    <div class="stat-card">
+                    <div class="stat-card" id="dashboardPaymentsCard">
                         <div class="stat-icon bg-orange">
                             <i class="fas fa-money-bill"></i>
                         </div>
                         <div class="stat-info">
                             <h3 id="totalPayments">₦0</h3>
-                            <p>Total Payments</p>
+                            <p id="totalPaymentsLabel">Total Payments</p>
                         </div>
                     </div>
-                    <div class="stat-card">
+                    <div class="stat-card" id="dashboardDeductionsCard">
                         <div class="stat-icon bg-red">
                             <i class="fas fa-minus-circle"></i>
                         </div>
                         <div class="stat-info">
                             <h3 id="totalDeductions">₦0</h3>
-                            <p>Total Deductions</p>
+                            <p id="totalDeductionsLabel">Total Deductions</p>
                         </div>
                     </div>
                 </div>
 
-                <div class="recent-activity">
+                <div class="recent-activity" id="dashboardRecentActivity">
                     <h3>Recent Activity</h3>
                     <div id="recentActivityList" class="activity-list"></div>
                 </div>

@@ -17,6 +17,17 @@ def _is_default_shared_email(value):
 
 
 from .services import compute_total_salary_payable
+from .permissions import (
+    has_attendance_permission,
+    has_company_permission,
+    has_deduction_permission,
+    has_employee_permission,
+    has_hr_permission,
+    has_notification_permission,
+    has_payroll_permission,
+    has_request_permission,
+    is_super_admin,
+)
 
 from django.contrib.auth import get_user_model
 import base64
@@ -42,40 +53,15 @@ def private_media_url(file_field):
 
 
 def _is_payroll_admin(user):
-    return bool(
-        user
-        and user.is_authenticated
-        and (
-            user.is_superuser
-            or getattr(user, 'role', None) == 'admin'
-            or getattr(user, 'is_payment_admin', False)
-            or getattr(user, 'is_hr_admin', False)
-        )
-    )
+    return has_payroll_permission(user) or has_hr_permission(user)
 
 
 def _is_employee_module_admin(user):
-    return bool(
-        user
-        and user.is_authenticated
-        and (
-            user.is_superuser
-            or getattr(user, 'role', None) == 'admin'
-            or getattr(user, 'is_employee_admin', False)
-        )
-    )
+    return has_employee_permission(user)
 
 
 def _is_company_module_admin(user):
-    return bool(
-        user
-        and user.is_authenticated
-        and (
-            user.is_superuser
-            or getattr(user, 'role', None) == 'admin'
-            or getattr(user, 'is_company_admin', False)
-        )
-    )
+    return has_company_permission(user)
 
 
 def _navigation_allowed_sections(user):
@@ -83,36 +69,29 @@ def _navigation_allowed_sections(user):
     if not user or not user.is_authenticated:
         return base
 
-    if getattr(user, 'role', None) == 'admin' or user.is_superuser:
+    if is_super_admin(user):
         sections = ['dashboard']
         sections.extend([
             'employees', 'deductions', 'iou-management', 'bonus-management',
-            'payments', 'companies', 'accounts', 'sacked',
+            'payments', 'companies', 'accounts', 'sacked', 'attendance',
+            'payslips', 'history', 'requests', 'notifications', 'reminders',
         ])
         return sorted(set(sections), key=sections.index)
-
-    if _is_company_module_admin(user) and not (
-        _is_employee_module_admin(user)
-        or getattr(user, 'is_deduction_admin', False)
-        or getattr(user, 'is_payment_admin', False)
-        or getattr(user, 'is_hr_admin', False)
-        or getattr(user, 'is_request_admin', False)
-        or getattr(user, 'is_notification_admin', False)
-    ):
-        return ['dashboard', 'companies']
 
     sections = list(base)
     if _is_employee_module_admin(user):
         sections.extend(['employees', 'sacked', 'accounts'])
-    if getattr(user, 'is_deduction_admin', False):
+    if has_attendance_permission(user):
+        sections.append('attendance')
+    if has_deduction_permission(user):
         sections.append('deductions')
-    if getattr(user, 'is_payment_admin', False) or getattr(user, 'is_hr_admin', False):
+    if has_payroll_permission(user) or has_hr_permission(user):
         sections.extend(['payments', 'iou-management', 'bonus-management'])
     if _is_company_module_admin(user):
         sections.append('companies')
-    if getattr(user, 'is_request_admin', False):
+    if has_request_permission(user):
         sections.append('requests')
-    if getattr(user, 'is_notification_admin', False):
+    if has_notification_permission(user):
         sections.append('notifications')
 
     return sorted(set(sections), key=sections.index)
@@ -123,12 +102,18 @@ def _navigation_ui_permissions(user):
         'admin-controls-employee': _is_employee_module_admin(user),
         'admin-controls-sacked': _is_employee_module_admin(user),
         'admin-controls-companies': _is_company_module_admin(user),
-        'accounts': bool(user and user.is_authenticated and (user.is_superuser or getattr(user, 'role', None) == 'admin' or getattr(user, 'is_employee_admin', False))),
-        'requests-admin-view': bool(user and user.is_authenticated and (user.is_superuser or getattr(user, 'is_request_admin', False))),
-        'payments': bool(user and user.is_authenticated and (user.is_superuser or getattr(user, 'role', None) == 'admin' or getattr(user, 'is_payment_admin', False) or getattr(user, 'is_hr_admin', False))),
-        'deductions-section': bool(user and user.is_authenticated and (user.is_superuser or getattr(user, 'role', None) == 'admin' or getattr(user, 'is_deduction_admin', False))),
-        'hr-admin-view': bool(user and user.is_authenticated and (user.is_superuser or getattr(user, 'is_hr_admin', False))),
-        'payment-approval-buttons': bool(user and user.is_authenticated and (user.is_superuser or getattr(user, 'is_hr_admin', False))),
+        'accounts': _is_employee_module_admin(user),
+        'requests-admin-view': has_request_permission(user),
+        'admin-controls-notifications': has_notification_permission(user),
+        'payments': has_payroll_permission(user) or has_hr_permission(user),
+        'deductions-section': has_deduction_permission(user),
+        'hr-admin-view': has_hr_permission(user),
+        'payment-approval-buttons': has_hr_permission(user),
+        'attendance-admin-view': has_attendance_permission(user),
+        'dashboard-company-stats': is_super_admin(user) or _is_employee_module_admin(user) or has_payroll_permission(user) or has_hr_permission(user),
+        'dashboard-payment-stats': is_super_admin(user) or has_payroll_permission(user) or has_hr_permission(user),
+        'dashboard-deduction-stats': is_super_admin(user) or has_deduction_permission(user) or has_hr_permission(user),
+        'dashboard-recent-activity': is_super_admin(user) or _is_employee_module_admin(user) or has_payroll_permission(user) or has_hr_permission(user),
     }
 
 
@@ -198,7 +183,8 @@ class UserSerializer(serializers.ModelSerializer):
         fields = [
             'id', 'username', 'email', 'role', 'phone', 'employee_id', 'name',
             'is_company_admin', 'is_notification_admin', 'is_payment_admin',
-            'is_deduction_admin', 'is_employee_admin', 'is_request_admin', 'is_hr_admin',
+            'is_deduction_admin', 'is_employee_admin', 'is_attendance_admin',
+            'is_request_admin', 'is_hr_admin',
             'first_name', 'last_name',
             'is_superuser', 'is_staff', 'is_active',
             'date_joined', 'last_login', 'groups', 'user_permissions',
@@ -217,6 +203,7 @@ class UserSerializer(serializers.ModelSerializer):
             'is_payment_admin',
             'is_deduction_admin',
             'is_employee_admin',
+            'is_attendance_admin',
             'is_request_admin',
             'is_hr_admin',
             'date_joined',

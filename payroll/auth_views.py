@@ -32,6 +32,7 @@ from rest_framework.views import APIView
 from .serializers import UserSerializer
 from .throttles import LoginThrottle
 from .paystack import PaystackAPI
+from .permissions import has_employee_permission, is_super_admin
 import re
 from django.contrib.auth.hashers import check_password
 from .utils import log_audit
@@ -281,17 +282,17 @@ def register_view(request):
             status=status.HTTP_400_BAD_REQUEST
         )
     
-    if current_user.is_superuser:
+    if is_super_admin(current_user):
         pass
     else:
-        if current_user.role == 'admin' and role == 'admin':
+        if role == 'admin':
             return Response(
-                {'error': 'Admin users cannot create other admin users'},
+                {'error': 'Only the Super Admin can create admin users'},
                 status=status.HTTP_403_FORBIDDEN
             )
-        if current_user.role in ['staff', 'guard']:
+        if not has_employee_permission(current_user):
             return Response(
-                {'error': 'Only admin users can create new users'},
+                {'error': 'You do not have permission to create employee accounts'},
                 status=status.HTTP_403_FORBIDDEN
             )
     
@@ -702,7 +703,12 @@ def send_registration_notifications(employee, request):
 
     try:
         # Admin Alert
-        admins = User.objects.filter(Q(is_superuser=True) | Q(role='admin'))
+        admins = User.objects.filter(
+            Q(is_superuser=True) |
+            Q(is_employee_admin=True) |
+            Q(is_hr_admin=True) |
+            Q(is_payment_admin=True)
+        )
         admin_emails = [a.email for a in admins if a.email]
         site_url = request.build_absolute_uri('/')
 

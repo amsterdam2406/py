@@ -112,7 +112,10 @@ from .image_utils import compress_and_validate_image
 from .permissions import (
     IsAdmin, CanCreateEmployee, IsSackAdmin, IsPayrollAdmin, IsHRAdmin,
     IsDeductionAdmin, CanEditNotification, CanViewAndEditCompany, IsRequestAdmin,
-    IsAttendanceAdmin
+    IsAttendanceAdmin, has_attendance_permission, has_company_permission,
+    has_deduction_permission, has_employee_permission, has_hr_permission,
+    has_notification_permission, has_payroll_permission, has_request_permission,
+    is_super_admin
 )
 from payroll.throttles import AttendanceThrottle, PaymentThrottle, BulkPaymentThrottle, ExportThrottle, BankVerifyThrottle
 from .utils import log_audit, get_client_ip
@@ -131,49 +134,19 @@ def _private_media_url(file_field):
 
 
 def _is_payroll_data_admin(user):
-    return bool(
-        user
-        and user.is_authenticated
-        and (
-            user.is_superuser
-            or getattr(user, 'role', None) == 'admin'
-            or getattr(user, 'is_payment_admin', False)
-            or getattr(user, 'is_hr_admin', False)
-        )
-    )
+    return has_payroll_permission(user) or has_hr_permission(user)
 
 
 def _is_attendance_admin(user):
-    return bool(
-        user
-        and user.is_authenticated
-        and (
-            user.is_superuser
-            or getattr(user, 'role', None) == 'admin'
-            or getattr(user, 'is_hr_admin', False)
-            or getattr(user, 'is_employee_admin', False)
-        )
-    )
+    return has_attendance_permission(user)
 
 
 def _is_super_admin(user):
-    return bool(user and user.is_authenticated and user.is_superuser)
+    return is_super_admin(user)
 
 
 def _is_org_export_admin(user):
-    return bool(
-        user
-        and user.is_authenticated
-        and (
-            user.is_superuser
-            or (
-                getattr(user, 'role', None) == 'admin'
-                and getattr(user, 'is_hr_admin', False)
-                and getattr(user, 'is_payment_admin', False)
-                and getattr(user, 'is_employee_admin', False)
-            )
-        )
-    )
+    return is_super_admin(user)
 
 
 def _can_manage_employee_leave(user, employee):
@@ -181,7 +154,7 @@ def _can_manage_employee_leave(user, employee):
 
 
 def _can_access_employee_data(user, employee):
-    if _is_payroll_data_admin(user):
+    if is_super_admin(user) or _is_payroll_data_admin(user):
         return True
     return bool(
         user
@@ -195,14 +168,9 @@ def _dashboard_employee_queryset(user, location=None):
     if not user or not user.is_authenticated:
         return Employee.objects.none()
 
-    if user.is_superuser:
+    if is_super_admin(user):
         qs = Employee.objects.all()
-    elif (
-        getattr(user, 'role', None) == 'admin'
-        or getattr(user, 'is_hr_admin', False)
-        or getattr(user, 'is_employee_admin', False)
-        or getattr(user, 'is_payment_admin', False)
-    ):
+    elif has_employee_permission(user) or has_hr_permission(user) or has_payroll_permission(user):
         qs = Employee.objects.filter(status__in=['active', 'pending'])
     elif getattr(user, 'is_company_admin', False):
         employee = getattr(user, 'employee_profile', None)
@@ -222,7 +190,7 @@ def _dashboard_employee_queryset(user, location=None):
 def _employee_queryset_for_export(user):
     if _is_org_export_admin(user):
         return Employee.objects.all().order_by('id')
-    if user and user.is_authenticated and (getattr(user, 'role', None) == 'admin' or getattr(user, 'is_hr_admin', False) or getattr(user, 'is_employee_admin', False)):
+    if has_employee_permission(user) or has_hr_permission(user):
         return Employee.objects.filter(status__in=['active', 'pending']).order_by('id')
     return Employee.objects.filter(user=user).order_by('id')
 
@@ -230,7 +198,7 @@ def _employee_queryset_for_export(user):
 def _payment_queryset_for_export(user):
     if _is_org_export_admin(user):
         return Payment.objects.all().order_by('-payment_date')
-    if user and user.is_authenticated and (getattr(user, 'role', None) == 'admin' or getattr(user, 'is_payment_admin', False) or getattr(user, 'is_hr_admin', False)):
+    if has_payroll_permission(user) or has_hr_permission(user):
         return Payment.objects.filter(employee__status__in=['active', 'pending']).order_by('-payment_date')
     return Payment.objects.filter(employee__user=user).order_by('-payment_date')
 
@@ -240,7 +208,7 @@ def _can_access_payment_data(user, payment):
 
 
 def _can_access_notification_data(user, notification):
-    if _is_payroll_data_admin(user):
+    if is_super_admin(user):
         return True
     return bool(
         user
@@ -254,7 +222,12 @@ def _can_access_private_media(user, storage_name):
     if not user or not user.is_authenticated or not storage_name:
         return False
 
-    if _is_payroll_data_admin(user) or getattr(user, 'is_employee_admin', False) or getattr(user, 'is_request_admin', False):
+    if (
+        _is_payroll_data_admin(user)
+        or has_employee_permission(user)
+        or has_request_permission(user)
+        or has_attendance_permission(user)
+    ):
         return True
 
     attendance = Attendance.objects.filter(
@@ -276,6 +249,16 @@ def _can_access_private_media(user, storage_name):
         return True
 
     return False
+
+
+def _get_scoped_object_or_403(model, scoped_queryset, pk, message='You do not have permission to access this resource.'):
+    try:
+        obj = model.objects.get(pk=pk)
+    except (model.DoesNotExist, ValidationError, ValueError, TypeError):
+        raise Http404
+    if not scoped_queryset.filter(pk=obj.pk).exists():
+        raise PermissionDenied(message)
+    return obj
 
 
 @api_view(['GET'])
@@ -1338,16 +1321,18 @@ class UserViewSet(viewsets.ModelViewSet):
 
     def get_permissions(self):
         if self.action == "create":
-            return [IsAdmin()]
+            return [IsAuthenticated(), CanCreateEmployee()]
+        if self.action in ["update", "partial_update", "destroy"]:
+            return [IsAuthenticated(), CanCreateEmployee()]
         if self.request.user.is_authenticated:
             if self.request.user.role in ['staff', 'guard']:
                 if self.action in ['list', 'retrieve']:
                     return [IsAuthenticated()]
-                return [IsAdmin()]
+                return [IsAuthenticated(), CanCreateEmployee()]
         return [IsAuthenticated()]
 
     def destroy(self, request, *args, **kwargs):
-        if not (request.user.is_superuser or getattr(request.user, "is_employee_admin", False)):
+        if not has_employee_permission(request.user):
             return Response(
                 {"error": "Only admins can delete users"},
                 status=status.HTTP_403_FORBIDDEN
@@ -1356,11 +1341,9 @@ class UserViewSet(viewsets.ModelViewSet):
 
     def get_queryset(self):
         user = self.request.user
-        if user.is_superuser:
+        if is_super_admin(user):
             return User.objects.all().order_by('id')
-        if user.role == 'admin':
-            return User.objects.filter(role__in=['staff', 'guard']).order_by('id')
-        if getattr(user, 'is_hr_admin', False):
+        if has_employee_permission(user) or has_hr_permission(user):
             return User.objects.all().order_by('id')
         return User.objects.filter(id=user.id).order_by('id')
 
@@ -1385,9 +1368,9 @@ class EmployeeViewSet(viewsets.ModelViewSet):
         user = self.request.user
         if not user or not user.is_authenticated:
             return Employee.objects.none()
-        if user.is_superuser:
+        if is_super_admin(user):
             return Employee.objects.all().order_by('-created_at')
-        if getattr(user, 'role', None) == 'admin' or getattr(user, 'is_hr_admin', False) or getattr(user, 'is_employee_admin', False):
+        if has_employee_permission(user) or has_hr_permission(user):
             return Employee.objects.filter(status__in=['active', 'pending']).order_by('-created_at')
         employee = getattr(user, 'employee_profile', None)
         if employee:
@@ -1407,13 +1390,13 @@ class EmployeeViewSet(viewsets.ModelViewSet):
         if self.action in ['destroy', 'terminate', 'resign']:
             return [IsAuthenticated(), IsSackAdmin()]
         if self.action in ['approve', 'bulk_approve', 'bulk_update_bank_codes', 'resend_confirmation']:
-            return [IsAuthenticated(), IsAdmin()]
+            return [IsAuthenticated(), CanCreateEmployee()]
         if self.action in ['update', 'partial_update']:
-            return [IsAuthenticated(), IsAdmin()]
+            return [IsAuthenticated(), CanCreateEmployee()]
         if user.is_authenticated and user.role in ['staff', 'guard']:
             if self.action in ['list', 'retrieve']:
                 return [IsAuthenticated()]
-            return [IsAdmin()]
+            return [IsAuthenticated(), CanCreateEmployee()]
         return [IsAuthenticated()]
 
     def destroy(self, request, *args, **kwargs):
@@ -1441,6 +1424,32 @@ class EmployeeViewSet(viewsets.ModelViewSet):
 
     def get_queryset(self):
         return self._employee_scope_queryset()
+
+    def get_object(self):
+        obj = _get_scoped_object_or_403(
+            Employee,
+            self._employee_scope_queryset(),
+            self.kwargs.get(self.lookup_url_kwarg or self.lookup_field),
+            'You do not have permission to access this employee.'
+        )
+        self.check_object_permissions(self.request, obj)
+        return obj
+
+    def list(self, request, *args, **kwargs):
+        user = request.user
+        can_view_directory = (
+            is_super_admin(user)
+            or has_employee_permission(user)
+            or has_hr_permission(user)
+            or has_payroll_permission(user)
+            or has_attendance_permission(user)
+        )
+        if not can_view_directory:
+            return Response(
+                {'detail': 'You do not have permission to access the employee directory.'},
+                status=status.HTTP_403_FORBIDDEN
+            )
+        return super().list(request, *args, **kwargs)
 
     def create(self, request, *args, **kwargs):
         logger.info("Employee create requested by user_id=%s", getattr(request.user, "id", None))
@@ -1543,7 +1552,7 @@ class EmployeeViewSet(viewsets.ModelViewSet):
         logger.info(f"Admin {request.user.username} approved resignation for {employee.name}")
         return Response({'message': 'Resignation processed successfully'})
 
-    @action(detail=True, methods=['post'], permission_classes=[IsAdmin])
+    @action(detail=True, methods=['post'], permission_classes=[IsAuthenticated, CanCreateEmployee])
     def resend_confirmation(self, request, pk=None):
         """Resend registration HTML emails to admin and employee"""
         employee = self.get_object()
@@ -1557,7 +1566,7 @@ class EmployeeViewSet(viewsets.ModelViewSet):
         )
         return Response({'message': 'Confirmation emails resent successfully'})
 
-    @action(detail=True, methods=['post'], permission_classes=[IsAdmin])
+    @action(detail=True, methods=['post'], permission_classes=[IsAuthenticated, CanCreateEmployee])
     def approve(self, request, pk=None):
         """Approve a self-registered employee"""
         employee = self.get_object()
@@ -1593,7 +1602,7 @@ class EmployeeViewSet(viewsets.ModelViewSet):
         logger.info(f"Admin {request.user.username} approved employee {employee.employee_id}")
         return Response({'message': 'Employee approved and account activated successfully'})
 
-    @action(detail=False, methods=['post'], permission_classes=[IsAdmin])
+    @action(detail=False, methods=['post'], permission_classes=[IsAuthenticated, CanCreateEmployee])
     def bulk_approve(self, request):
         """Approve multiple self-registered employees at once"""
         ids = request.data.get('ids', [])
@@ -1618,7 +1627,7 @@ class EmployeeViewSet(viewsets.ModelViewSet):
                 )
         return Response({'message': f'Successfully approved {count} employees'})
 
-    @action(detail=False, methods=['post'], permission_classes=[IsAdmin])
+    @action(detail=False, methods=['post'], permission_classes=[IsAuthenticated, CanCreateEmployee])
     def bulk_update_bank_codes(self, request):
         """
         Iterate through all active and pending employees and attempt 
@@ -1747,7 +1756,12 @@ class EmployeeViewSet(viewsets.ModelViewSet):
     @action(detail=True, methods=['get'], permission_classes=[IsAuthenticated])
     def net_salary(self, request, pk=None):
         """Get specific net salary for an employee after applied deductions this month"""
-        employee = self.get_object()
+        try:
+            employee = Employee.objects.get(pk=pk)
+        except Employee.DoesNotExist:
+            return Response({'error': 'Employee not found'}, status=status.HTTP_404_NOT_FOUND)
+        if not self._employee_scope_queryset().filter(pk=employee.pk).exists():
+            return Response({'error': 'You do not have permission to access this employee.'}, status=status.HTTP_403_FORBIDDEN)
         month_key = timezone.now().strftime('%Y-%m')
         data = compute_total_salary_payable(employee, month_key)
         # Convert Decimals to float for JSON serialization
@@ -1903,13 +1917,23 @@ class AttendanceViewSet(viewsets.ModelViewSet):
         user = self.request.user
         if not user.is_authenticated:
             return Attendance.objects.none()
-        if user.is_superuser or user.role == 'admin' or getattr(user, 'is_hr_admin', False) or getattr(user, 'is_employee_admin', False):
+        if is_super_admin(user) or has_attendance_permission(user):
             return Attendance.objects.all().order_by('id')
         try:
             employee = Employee.objects.get(user=user)
             return Attendance.objects.filter(employee=employee).order_by('id')
         except Employee.DoesNotExist:
             return Attendance.objects.none()
+
+    def get_object(self):
+        obj = _get_scoped_object_or_403(
+            Attendance,
+            self.get_queryset(),
+            self.kwargs.get(self.lookup_url_kwarg or self.lookup_field),
+            'You do not have permission to access this attendance record.'
+        )
+        self.check_object_permissions(self.request, obj)
+        return obj
 
     def get_permissions(self):
         if self.action in ['create', 'update', 'partial_update', 'destroy', 'mark_leave']:
@@ -1928,10 +1952,8 @@ class AttendanceViewSet(viewsets.ModelViewSet):
     def _get_employee(self, request):
         employee_id = request.data.get('employee_id') or request.data.get('employee')
         can_select_employee = (
-            request.user.is_superuser
-            or request.user.role == 'admin'
-            or getattr(request.user, 'is_employee_admin', False)
-            or getattr(request.user, 'is_hr_admin', False)
+            is_super_admin(request.user)
+            or has_attendance_permission(request.user)
         )
         if can_select_employee:
             if employee_id:
@@ -2259,11 +2281,21 @@ class PaymentViewSet(viewsets.ModelViewSet):
 
     def get_queryset(self):
         user = self.request.user
-        if user.is_superuser or user.role == 'admin' or getattr(user, 'is_hr_admin', False):
+        if is_super_admin(user) or has_hr_permission(user):
             return Payment.objects.all().order_by('id')
-        if getattr(user, 'is_payment_admin', False):
+        if has_payroll_permission(user):
             return Payment.objects.all().order_by('id')
         return Payment.objects.filter(employee__user=user).order_by('id')
+
+    def get_object(self):
+        obj = _get_scoped_object_or_403(
+            Payment,
+            self.get_queryset(),
+            self.kwargs.get(self.lookup_url_kwarg or self.lookup_field),
+            'You do not have permission to access this payment record.'
+        )
+        self.check_object_permissions(self.request, obj)
+        return obj
 
     @action(detail=False, methods=['get'], permission_classes=[IsAuthenticated, IsPayrollAdmin])
     def paystack_balance(self, request):
@@ -2777,7 +2809,7 @@ class PaymentViewSet(viewsets.ModelViewSet):
             return False, _friendly_payment_error(transfer_result)
 
 
-    @action(detail=False, methods=['post'], permission_classes=[IsAuthenticated, IsPayrollAdmin, IsAdmin])
+    @action(detail=False, methods=['post'], permission_classes=[IsAuthenticated, IsPayrollAdmin])
     def initiate_payment(self, request):
         """
         Initiate salary payment (Full or Partial)
@@ -2816,7 +2848,7 @@ class PaymentViewSet(viewsets.ModelViewSet):
 
         # RESTRICTION: Payroll admin cannot pay themselves without HR/Superuser approval
         if str(employee.user.id) == str(request.user.id):
-            if not (request.user.is_superuser or getattr(request.user, 'is_hr_admin', False)):
+            if not (is_super_admin(request.user) or has_hr_permission(request.user)):
                 return Response(
                     {'error': 'Self-payment requires HR Admin or Superuser approval'},
                     status=status.HTTP_403_FORBIDDEN
@@ -2845,7 +2877,7 @@ class PaymentViewSet(viewsets.ModelViewSet):
 
                 # Set initial status based on role
                 initial_status = 'pending'
-                if not (request.user.is_superuser or getattr(request.user, 'is_hr_admin', False) or request.user.role == 'admin'):
+                if not (is_super_admin(request.user) or has_hr_permission(request.user)):
                     initial_status = 'pending_hr'
 
                 partial_amount = request.data.get('partial_amount')
@@ -3021,7 +3053,7 @@ class PaymentViewSet(viewsets.ModelViewSet):
                 )
 
 
-            hr_users = User.objects.filter(Q(is_superuser=True) | Q(is_hr_admin=True) | Q(role='admin'))
+            hr_users = User.objects.filter(Q(is_superuser=True) | Q(is_hr_admin=True))
             for hr in hr_users:
                 Notification.objects.create(
                     user=hr,
@@ -3067,7 +3099,9 @@ class PaymentViewSet(viewsets.ModelViewSet):
         if payment.status != 'pending_hr':
             return Response({'error': 'Payment is not awaiting HR approval'}, 
                             status=status.HTTP_400_BAD_REQUEST)
-        if payment.processed_by_id == request.user.id or payment.employee.user_id == request.user.id:
+        if not is_super_admin(request.user) and (
+            payment.processed_by_id == request.user.id or payment.employee.user_id == request.user.id
+        ):
             return Response(
                 {'error': 'Separation of duties violation: you cannot approve a payment you initiated or a payment to yourself.'},
                 status=status.HTTP_403_FORBIDDEN
@@ -3926,9 +3960,7 @@ class PaymentViewSet(viewsets.ModelViewSet):
             return Response({'error': 'Invalid password'}, status=status.HTTP_403_FORBIDDEN)
         filters = request.data.get('filters', {}) or {}
         if not _is_org_export_admin(request.user) and not (
-            getattr(request.user, 'role', None) == 'admin'
-            or getattr(request.user, 'is_payment_admin', False)
-            or getattr(request.user, 'is_hr_admin', False)
+            has_payroll_permission(request.user) or has_hr_permission(request.user)
         ):
             employee = getattr(request.user, 'employee_profile', None)
             if not employee:
@@ -4038,11 +4070,19 @@ class DeductionViewSet(viewsets.ModelViewSet):
 
     def get_queryset(self):
         user = self.request.user
-        if user.is_superuser or user.role == 'admin' or getattr(user, "is_deduction_admin", False):
+        if is_super_admin(user) or has_deduction_permission(user):
             return Deduction.objects.all().order_by('id')
-        if user.role in ["staff", "guard"]:
-            return Deduction.objects.filter(employee__user=user).order_by('id')
-        return Deduction.objects.none()
+        return Deduction.objects.filter(employee__user=user).order_by('id')
+
+    def get_object(self):
+        obj = _get_scoped_object_or_403(
+            Deduction,
+            self.get_queryset(),
+            self.kwargs.get(self.lookup_url_kwarg or self.lookup_field),
+            'You do not have permission to access this deduction.'
+        )
+        self.check_object_permissions(self.request, obj)
+        return obj
 
     @action(detail=False, methods=['post'], permission_classes=[IsAuthenticated, IsDeductionAdmin])
     def bulk_approve(self, request):
@@ -4059,14 +4099,16 @@ class DeductionViewSet(viewsets.ModelViewSet):
                     date__year=year,
                     date__month=month
                 )
-                blocked_ids = list(
-                    queryset.filter(
+                blocked_ids = []
+                if not is_super_admin(request.user):
+                    blocked_ids = list(
+                        queryset.filter(
+                            Q(created_by=request.user) | Q(employee__user=request.user)
+                        ).values_list('id', flat=True)
+                    )
+                    queryset = queryset.exclude(
                         Q(created_by=request.user) | Q(employee__user=request.user)
-                    ).values_list('id', flat=True)
-                )
-                queryset = queryset.exclude(
-                    Q(created_by=request.user) | Q(employee__user=request.user)
-                )
+                    )
                 count = queryset.count()
                 queryset.update(status='applied')
             return Response({
@@ -4079,13 +4121,15 @@ class DeductionViewSet(viewsets.ModelViewSet):
     @action(detail=True, methods=['post'], permission_classes=[IsAuthenticated])
     def hr_approve(self, request, pk=None):
         """Action for HR Admin to approve a deduction awaiting clearance"""
-        if not (request.user.is_superuser or getattr(request.user, 'is_hr_admin', False)):
+        if not (is_super_admin(request.user) or has_hr_permission(request.user)):
             return Response({'error': 'Only HR Admin can approve deductions'}, status=403)
             
         deduction = self.get_object()
         if deduction.status != 'pending_hr':
             return Response({'error': 'Deduction is not awaiting HR approval'}, status=400)
-        if deduction.created_by_id == request.user.id or deduction.employee.user_id == request.user.id:
+        if not is_super_admin(request.user) and (
+            deduction.created_by_id == request.user.id or deduction.employee.user_id == request.user.id
+        ):
             return Response(
                 {'error': 'Separation of duties violation: you cannot approve a deduction you created or a deduction for yourself.'},
                 status=status.HTTP_403_FORBIDDEN
@@ -4103,7 +4147,7 @@ class DeductionViewSet(viewsets.ModelViewSet):
     def perform_create(self, serializer):
         # Determine status based on user role
         status_val = 'applied'
-        if not (self.request.user.is_superuser or getattr(self.request.user, 'is_hr_admin', False)):
+        if not (is_super_admin(self.request.user) or has_hr_permission(self.request.user)):
             status_val = 'pending_hr'
             
         deduction = serializer.save(status=status_val, created_by=self.request.user)
@@ -4143,7 +4187,7 @@ class DeductionViewSet(viewsets.ModelViewSet):
         new_status = request.data.get('status')
 
         # RESTRICTION: Admin cannot cancel their own deductions
-        if (
+        if not is_super_admin(request.user) and (
             str(deduction.employee.user.id) == str(request.user.id)
             or str(deduction.created_by_id or "") == str(request.user.id)
         ) and new_status in ['cancelled', 'terminated', 'applied']:
@@ -4207,7 +4251,7 @@ class SackedEmployeeViewSet(viewsets.ModelViewSet):
         user = self.request.user
         if not user.is_authenticated:
             return SackedEmployee.objects.none()
-        if user.is_superuser or user.role == 'admin' or getattr(user, 'is_employee_admin', False):
+        if is_super_admin(user) or has_employee_permission(user):
             return SackedEmployee.objects.all().order_by('id')
         return SackedEmployee.objects.none()
 
@@ -4245,9 +4289,19 @@ class NotificationViewSet(viewsets.ModelViewSet):
 
     def get_queryset(self):
         user = self.request.user
-        if user.is_superuser or user.role == 'admin' or getattr(user, 'is_notification_admin', False):
+        if is_super_admin(user):
             return Notification.objects.all().order_by('id')
         return Notification.objects.filter(user=user).order_by('id')
+
+    def get_object(self):
+        obj = _get_scoped_object_or_403(
+            Notification,
+            self.get_queryset(),
+            self.kwargs.get(self.lookup_url_kwarg or self.lookup_field),
+            'You do not have permission to access this notification.'
+        )
+        self.check_object_permissions(self.request, obj)
+        return obj
 
     @action(detail=False, methods=['post'])
     def mark_all_read(self, request):
@@ -4264,7 +4318,7 @@ class NotificationViewSet(viewsets.ModelViewSet):
     def export_history(self, request):
         """Export notification history. Non-admin employees must confirm password."""
         user = request.user
-        is_admin = user.is_superuser or user.role == 'admin' or getattr(user, 'is_notification_admin', False)
+        is_admin = is_super_admin(user) or has_notification_permission(user)
         if not is_admin:
             password = request.data.get('password')
             if not password or not user.check_password(password):
@@ -4297,9 +4351,19 @@ class ReminderViewSet(viewsets.ModelViewSet):
 
     def get_queryset(self):
         user = self.request.user
-        if user.is_superuser or user.role == 'admin' or getattr(user, 'is_hr_admin', False):
+        if is_super_admin(user):
             return Reminder.objects.select_related('user').all()
         return Reminder.objects.select_related('user').filter(user=user)
+
+    def get_object(self):
+        obj = _get_scoped_object_or_403(
+            Reminder,
+            self.get_queryset(),
+            self.kwargs.get(self.lookup_url_kwarg or self.lookup_field),
+            'You do not have permission to access this reminder.'
+        )
+        self.check_object_permissions(self.request, obj)
+        return obj
 
     def perform_create(self, serializer):
         reminder = serializer.save(user=self.request.user)
@@ -4345,14 +4409,10 @@ class CompanyViewSet(viewsets.ModelViewSet):
 
     def get_queryset(self):
         user = self.request.user
-        if user.is_superuser or user.role == 'admin':
+        if is_super_admin(user):
             return Company.objects.all().order_by('id')
-        if getattr(user, 'is_company_admin', False):
+        if has_company_permission(user):
             return Company.objects.all().order_by('id')
-        if user.role in ['staff', 'guard']:
-            return Company.objects.filter(
-                assigned_guards__user=user
-            ).distinct().order_by('id')
         return Company.objects.none()
 
     def create(self, request, *args, **kwargs):
@@ -4429,21 +4489,31 @@ class EmployeeRequestViewSet(viewsets.ModelViewSet):
             return [IsAuthenticated()]
         if self.action in ['approve', 'decline', 'download_attachments']:
             return [IsAuthenticated(), IsRequestAdmin()]  # Use IsRequestAdmin instead of IsAdmin
-        if self.request.user.is_superuser or getattr(self.request.user, 'is_request_admin', False):
+        if is_super_admin(self.request.user) or has_request_permission(self.request.user):
             return [IsAuthenticated()]
         if self.action in ['list', 'retrieve']:
             return [IsAuthenticated()]
-        return [IsAuthenticated(), IsAdmin()]
+        return [IsAuthenticated(), IsRequestAdmin()]
 
     def get_queryset(self):
         user = self.request.user
-        if user.is_superuser or getattr(user, 'is_request_admin', False):
+        if is_super_admin(user) or has_request_permission(user):
             return EmployeeRequest.objects.all().order_by('-created_at')
         try:
             employee = Employee.objects.get(user=user)
             return EmployeeRequest.objects.filter(employee=employee).order_by('-created_at')
         except Employee.DoesNotExist:
             return EmployeeRequest.objects.none()
+
+    def get_object(self):
+        obj = _get_scoped_object_or_403(
+            EmployeeRequest,
+            self.get_queryset(),
+            self.kwargs.get(self.lookup_url_kwarg or self.lookup_field),
+            'You do not have permission to access this request.'
+        )
+        self.check_object_permissions(self.request, obj)
+        return obj
 
     def perform_create(self, serializer):
         # Ensure employee is linked to the requesting user
@@ -4471,7 +4541,7 @@ class EmployeeRequestViewSet(viewsets.ModelViewSet):
             type='info'
         )
 
-    @action(detail=True, methods=['post'], permission_classes=[IsAuthenticated, IsAdmin])
+    @action(detail=True, methods=['post'], permission_classes=[IsAuthenticated, IsRequestAdmin])
     def approve(self, request, pk=None):
         req = self.get_object()
         if req.status != 'pending':
@@ -4486,7 +4556,7 @@ class EmployeeRequestViewSet(viewsets.ModelViewSet):
         )
         return Response({'message': 'Request approved', 'status': 'approved'})
 
-    @action(detail=True, methods=['post'], permission_classes=[IsAuthenticated, IsAdmin])
+    @action(detail=True, methods=['post'], permission_classes=[IsAuthenticated, IsRequestAdmin])
     def decline(self, request, pk=None):
         req = self.get_object()
         reason = request.data.get('reason', 'No reason provided')
@@ -4501,7 +4571,7 @@ class EmployeeRequestViewSet(viewsets.ModelViewSet):
         )
         return Response({'message': 'Request declined', 'status': 'declined'})
 
-    @action(detail=True, methods=['post'], permission_classes=[IsAuthenticated, IsAdmin])
+    @action(detail=True, methods=['post'], permission_classes=[IsAuthenticated, IsRequestAdmin])
     def download_attachments(self, request, pk=None):
         """Download all attachments for a request as a ZIP file"""
         password = request.data.get('password')
@@ -4600,15 +4670,31 @@ class EmployeeSalaryAdjustmentViewSet(viewsets.ModelViewSet):
     queryset = EmployeeSalaryAdjustment.objects.all().order_by('-date_added')
     serializer_class = EmployeeSalaryAdjustmentSerializer
     authentication_classes = [JWTAuthentication, SessionAuthentication]
-    permission_classes = [IsAuthenticated, IsPayrollAdmin]
     filterset_fields = ['employee', 'status', 'type', 'date_added']
     search_fields = ['employee__name', 'employee__employee_id', 'reason']
 
+    def get_permissions(self):
+        if self.action in ['list', 'retrieve']:
+            return [IsAuthenticated()]
+        if self.action in ['approve', 'bulk_approve']:
+            return [IsAuthenticated(), IsHRAdmin()]
+        return [IsAuthenticated(), IsPayrollAdmin()]
+
     def get_queryset(self):
         user = self.request.user
-        if user.is_superuser or user.role == 'admin' or getattr(user, 'is_payment_admin', False) or getattr(user, 'is_hr_admin', False):
+        if is_super_admin(user) or has_payroll_permission(user) or has_hr_permission(user):
             return super().get_queryset()
         return EmployeeSalaryAdjustment.objects.filter(employee__user=user)
+
+    def get_object(self):
+        obj = _get_scoped_object_or_403(
+            EmployeeSalaryAdjustment,
+            self.get_queryset(),
+            self.kwargs.get(self.lookup_url_kwarg or self.lookup_field),
+            'You do not have permission to access this salary adjustment.'
+        )
+        self.check_object_permissions(self.request, obj)
+        return obj
 
     def create(self, request, *args, **kwargs):
         serializer = self.get_serializer(data=request.data)
@@ -4633,7 +4719,9 @@ class EmployeeSalaryAdjustmentViewSet(viewsets.ModelViewSet):
     @action(detail=True, methods=['post'], permission_classes=[IsAuthenticated, IsHRAdmin])
     def approve(self, request, pk=None):
         adjustment = self.get_object()
-        if adjustment.added_by_id == request.user.id or adjustment.employee.user_id == request.user.id:
+        if not is_super_admin(request.user) and (
+            adjustment.added_by_id == request.user.id or adjustment.employee.user_id == request.user.id
+        ):
             return Response(
                 {'error': 'Separation of duties violation: you cannot approve an adjustment you created or an adjustment for yourself.'},
                 status=status.HTTP_403_FORBIDDEN
@@ -4653,14 +4741,16 @@ class EmployeeSalaryAdjustmentViewSet(viewsets.ModelViewSet):
         
         with transaction.atomic():
             adjustments = EmployeeSalaryAdjustment.objects.filter(id__in=ids, status='pending')
-            blocked_ids = list(
-                adjustments.filter(
+            blocked_ids = []
+            if not is_super_admin(request.user):
+                blocked_ids = list(
+                    adjustments.filter(
+                        Q(added_by=request.user) | Q(employee__user=request.user)
+                    ).values_list('id', flat=True)
+                )
+                adjustments = adjustments.exclude(
                     Q(added_by=request.user) | Q(employee__user=request.user)
-                ).values_list('id', flat=True)
-            )
-            adjustments = adjustments.exclude(
-                Q(added_by=request.user) | Q(employee__user=request.user)
-            )
+                )
             approved_ids = list(adjustments.values_list('id', flat=True))
             count = adjustments.count()
             adjustments.update(
@@ -4680,7 +4770,7 @@ class EmployeeSalaryAdjustmentViewSet(viewsets.ModelViewSet):
 class ClientMonthlyPaymentViewSet(viewsets.ModelViewSet):
     queryset = ClientMonthlyPayment.objects.all().order_by('-month_key')
     serializer_class = ClientMonthlyPaymentSerializer
-    permission_classes = [IsAuthenticated, IsAdmin]
+    permission_classes = [IsAuthenticated, CanViewAndEditCompany]
     filterset_fields = ['client', 'status', 'month_key']
 
     @staticmethod
@@ -4718,18 +4808,31 @@ class ClientMonthlyPaymentViewSet(viewsets.ModelViewSet):
 
 class EmployeeBalanceLedgerViewSet(viewsets.ReadOnlyModelViewSet):
     serializer_class = EmployeeBalanceLedgerSerializer
-    permission_classes = [IsAuthenticated, IsPayrollAdmin]
+    permission_classes = [IsAuthenticated]
     filterset_fields = ['employee', 'month_key']
     search_fields = ['employee__employee_id', 'employee__name', 'employee__email']
     ordering_fields = ['month_key', 'outstanding_balance', 'created_at']
     ordering = ['-month_key', 'employee__employee_id']
 
     def get_queryset(self):
+        user = self.request.user
         queryset = EmployeeBalanceLedger.objects.select_related('employee').order_by('-month_key', 'employee__employee_id')
+        if not (is_super_admin(user) or has_payroll_permission(user) or has_hr_permission(user)):
+            queryset = queryset.filter(employee__user=user)
         outstanding_only = self.request.query_params.get('outstanding_only')
         if str(outstanding_only).lower() in {'1', 'true', 'yes'}:
             queryset = queryset.filter(outstanding_balance__gt=0)
         return queryset
+
+    def get_object(self):
+        obj = _get_scoped_object_or_403(
+            EmployeeBalanceLedger,
+            self.get_queryset(),
+            self.kwargs.get(self.lookup_url_kwarg or self.lookup_field),
+            'You do not have permission to access this balance record.'
+        )
+        self.check_object_permissions(self.request, obj)
+        return obj
 
     def perform_update(self, serializer):
         instance = serializer.instance
