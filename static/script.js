@@ -2163,6 +2163,8 @@ function applyRolePermissions(user) {
   }
 
   // Mapping backend flags to UI visibility
+  const backendUiPermissions =
+    user.ui_permissions || user.navigation?.ui_permissions || {};
   const permissions = [
     {
       id: "admin-controls-employee",
@@ -2207,8 +2209,18 @@ function applyRolePermissions(user) {
 
   permissions.forEach(({ id, allowed }) => {
     const element = document.getElementById(id);
-    if (element) element.style.display = allowed ? "" : "none";
+    const backendAllowed =
+      Object.prototype.hasOwnProperty.call(backendUiPermissions, id)
+        ? backendUiPermissions[id]
+        : allowed;
+    if (element) element.style.display = backendAllowed ? "" : "none";
   });
+
+  const requestButton = document.getElementById("makeRequestBtn");
+  if (requestButton) {
+    const requestAllowed = getAllowedSectionsForUser(user).has("requests");
+    requestButton.style.display = requestAllowed ? "" : "none";
+  }
 
   applyNavigationPermissions(user);
 }
@@ -2216,6 +2228,9 @@ function applyRolePermissions(user) {
 function getAllowedSectionsForUser(user) {
   const base = new Set(["dashboard", "attendance", "payslips", "history", "notifications", "reminders", "requests"]);
   if (!user) return base;
+  if (Array.isArray(user.navigation?.allowed_sections) && user.navigation.allowed_sections.length) {
+    return new Set(user.navigation.allowed_sections);
+  }
   if (user.is_superuser || user.role === "admin") {
     return new Set([
       "dashboard", "employees", "attendance", "deductions", "iou-management",
@@ -7064,6 +7079,7 @@ async function loadDashboard() {
 
   showDashboardPage();
   applyRolePermissions(AppState.currentUser);
+  const allowedSections = getAllowedSectionsForUser(AppState.currentUser);
 
   let loadError = null;
 
@@ -7071,39 +7087,38 @@ async function loadDashboard() {
     showLoading();
     try {
       // Step 1: Critical data (sequential)
-      await loadEmployees();
-      await loadDeductions();
-      await loadRequests();
+      if (allowedSections.has("employees")) {
+        await loadEmployees();
+      }
+      if (allowedSections.has("deductions")) {
+        await loadDeductions();
+      }
+      if (allowedSections.has("requests")) {
+        await loadRequests();
+      }
 
       // Step 2: Medium priority (parallel but limited)
       await Promise.all([
-        loadAttendance(),
-        loadSackedEmployees(),
-        loadNotifications(),
-        loadReminders(),
+        allowedSections.has("attendance") ? loadAttendance() : Promise.resolve(false),
+        allowedSections.has("sacked") ? loadSackedEmployees() : Promise.resolve(false),
+        allowedSections.has("notifications") ? loadNotifications() : Promise.resolve(false),
+        allowedSections.has("reminders") ? loadReminders() : Promise.resolve(false),
       ]);
 
       // Step 3: Admin-only
-      if (
-        AppState.currentUser?.is_superuser ||
-        AppState.currentUser?.role === "admin" ||
-        AppState.currentUser?.is_company_admin
-      ) {
+      if (allowedSections.has("companies")) {
         await loadCompanies();
       }
 
       // Step 4: Delay heavy endpoints
-      if (
-        AppState.currentUser?.is_superuser ||
-        AppState.currentUser?.role === "admin"
-      ) {
+      if (allowedSections.has("history")) {
         setTimeout(loadPaymentHistory, 1500);
       }
 
       // Step 5: Non-critical
       setTimeout(loadNigerianBanks, 2000);
       const now = Date.now();
-      ["dashboard", "employees", "attendance", "deductions", "requests", "sacked", "notifications", "reminders"].forEach((sectionId) => {
+      Array.from(allowedSections).forEach((sectionId) => {
         AppState.lastSectionRefresh[sectionId] = now;
       });
     } catch (innerErr) {

@@ -34,6 +34,20 @@ class IsSackAdmin(BasePermission):
             getattr(user, 'is_employee_admin', False)
         )
 
+
+class IsAttendanceAdmin(BasePermission):
+    """Only superuser / admin / HR / employee admins can manage attendance records and leave."""
+    def has_permission(self, request, view):
+        user = request.user
+        if not user.is_authenticated:
+            return False
+        return (
+            user.is_superuser or
+            user.role == 'admin' or
+            getattr(user, 'is_hr_admin', False) or
+            getattr(user, 'is_employee_admin', False)
+        )
+
 class IsPayrollAdmin(BasePermission):
     """Only superuser / admin / is_payment_admin can write payments."""
     def has_permission(self, request, view):

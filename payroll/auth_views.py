@@ -112,8 +112,24 @@ class CurrentUserView(APIView):
     permission_classes = [IsAuthenticated]
 
     def get(self, request):
-        serializer = UserSerializer(request.user)
+        serializer = UserSerializer(request.user, context={'request': request})
         return Response(serializer.data)
+
+    def patch(self, request):
+        user = request.user
+        allowed_fields = {'first_name', 'last_name', 'email', 'phone'}
+        payload = {key: value for key, value in request.data.items() if key in allowed_fields}
+
+        if not payload:
+            return Response({'error': 'No editable profile fields provided.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        serializer = UserSerializer(user, data=payload, partial=True, context={'request': request})
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+        return Response(UserSerializer(user, context={'request': request}).data)
+
+    def put(self, request):
+        return self.patch(request)
 
 class CookieTokenRefreshSerializer(TokenRefreshSerializer):
     refresh = None
@@ -204,20 +220,8 @@ def login_view(request):
         response = Response({
             'access': str(refresh.access_token),
             'refresh': str(refresh),
-            'user': {
-                'id': user.id,
-                'username': user.username,
-                'email': user.email,
-                'role': user.role,
-                'employee_id': employee_id,
-                'first_name': user.first_name,
-                'last_name': user.last_name,
-                'is_superuser': user.is_superuser,
-                'is_company_admin': getattr(user, 'is_company_admin', False),
-                'is_payment_admin': getattr(user, 'is_payment_admin', False),
-                'is_deduction_admin': getattr(user, 'is_deduction_admin', False),
-                'is_employee_admin': getattr(user, 'is_employee_admin', False),
-            }
+            'user': UserSerializer(user, context={'request': request}).data,
+            'employee_id': employee_id,
         }, status=status.HTTP_200_OK)
 
         # Also set refresh token in HttpOnly cookie as backup

@@ -41,6 +41,104 @@ def private_media_url(file_field):
     return f"/api/private-media/{quote(name)}"
 
 
+def _is_payroll_admin(user):
+    return bool(
+        user
+        and user.is_authenticated
+        and (
+            user.is_superuser
+            or getattr(user, 'role', None) == 'admin'
+            or getattr(user, 'is_payment_admin', False)
+            or getattr(user, 'is_hr_admin', False)
+        )
+    )
+
+
+def _is_employee_module_admin(user):
+    return bool(
+        user
+        and user.is_authenticated
+        and (
+            user.is_superuser
+            or getattr(user, 'role', None) == 'admin'
+            or getattr(user, 'is_employee_admin', False)
+        )
+    )
+
+
+def _is_company_module_admin(user):
+    return bool(
+        user
+        and user.is_authenticated
+        and (
+            user.is_superuser
+            or getattr(user, 'role', None) == 'admin'
+            or getattr(user, 'is_company_admin', False)
+        )
+    )
+
+
+def _navigation_allowed_sections(user):
+    base = ['dashboard', 'attendance', 'payslips', 'history', 'requests', 'notifications', 'reminders']
+    if not user or not user.is_authenticated:
+        return base
+
+    if getattr(user, 'role', None) == 'admin' or user.is_superuser:
+        sections = ['dashboard']
+        sections.extend([
+            'employees', 'deductions', 'iou-management', 'bonus-management',
+            'payments', 'companies', 'accounts', 'sacked',
+        ])
+        return sorted(set(sections), key=sections.index)
+
+    if _is_company_module_admin(user) and not (
+        _is_employee_module_admin(user)
+        or getattr(user, 'is_deduction_admin', False)
+        or getattr(user, 'is_payment_admin', False)
+        or getattr(user, 'is_hr_admin', False)
+        or getattr(user, 'is_request_admin', False)
+        or getattr(user, 'is_notification_admin', False)
+    ):
+        return ['dashboard', 'companies']
+
+    sections = list(base)
+    if _is_employee_module_admin(user):
+        sections.extend(['employees', 'sacked', 'accounts'])
+    if getattr(user, 'is_deduction_admin', False):
+        sections.append('deductions')
+    if getattr(user, 'is_payment_admin', False) or getattr(user, 'is_hr_admin', False):
+        sections.extend(['payments', 'iou-management', 'bonus-management'])
+    if _is_company_module_admin(user):
+        sections.append('companies')
+    if getattr(user, 'is_request_admin', False):
+        sections.append('requests')
+    if getattr(user, 'is_notification_admin', False):
+        sections.append('notifications')
+
+    return sorted(set(sections), key=sections.index)
+
+
+def _navigation_ui_permissions(user):
+    return {
+        'admin-controls-employee': _is_employee_module_admin(user),
+        'admin-controls-sacked': _is_employee_module_admin(user),
+        'admin-controls-companies': _is_company_module_admin(user),
+        'accounts': bool(user and user.is_authenticated and (user.is_superuser or getattr(user, 'role', None) == 'admin' or getattr(user, 'is_employee_admin', False))),
+        'requests-admin-view': bool(user and user.is_authenticated and (user.is_superuser or getattr(user, 'is_request_admin', False))),
+        'payments': bool(user and user.is_authenticated and (user.is_superuser or getattr(user, 'role', None) == 'admin' or getattr(user, 'is_payment_admin', False) or getattr(user, 'is_hr_admin', False))),
+        'deductions-section': bool(user and user.is_authenticated and (user.is_superuser or getattr(user, 'role', None) == 'admin' or getattr(user, 'is_deduction_admin', False))),
+        'hr-admin-view': bool(user and user.is_authenticated and (user.is_superuser or getattr(user, 'is_hr_admin', False))),
+        'payment-approval-buttons': bool(user and user.is_authenticated and (user.is_superuser or getattr(user, 'is_hr_admin', False))),
+    }
+
+
+def _navigation_payload(user):
+    return {
+        'allowed_sections': _navigation_allowed_sections(user),
+        'ui_permissions': _navigation_ui_permissions(user),
+    }
+
+
 def _name_tokens(value):
     return {
         token for token in re.sub(r'[^a-zA-Z\s]', ' ', value or '').lower().split()
@@ -92,6 +190,8 @@ def _verify_employee_bank_account(full_name, account_number, bank_code, submitte
 class UserSerializer(serializers.ModelSerializer):
     employee_id = serializers.SerializerMethodField(read_only=True)
     name = serializers.SerializerMethodField(read_only=True)
+    navigation = serializers.SerializerMethodField(read_only=True)
+    ui_permissions = serializers.SerializerMethodField(read_only=True)
 
     class Meta:
         model = User
@@ -102,6 +202,7 @@ class UserSerializer(serializers.ModelSerializer):
             'first_name', 'last_name',
             'is_superuser', 'is_staff', 'is_active',
             'date_joined', 'last_login', 'groups', 'user_permissions',
+            'navigation', 'ui_permissions',
         ]
         read_only_fields = [
             'id',
@@ -132,6 +233,12 @@ class UserSerializer(serializers.ModelSerializer):
             return obj.employee_profile.name
         full_name = f"{obj.first_name} {obj.last_name}".strip()
         return full_name or obj.username
+
+    def get_navigation(self, obj):
+        return _navigation_payload(obj)
+
+    def get_ui_permissions(self, obj):
+        return _navigation_ui_permissions(obj)
 
     def validate_email(self, value):
         if not value or not value.strip():
@@ -356,6 +463,7 @@ class AttendanceSerializer(serializers.ModelSerializer):
     employee_id = serializers.CharField(source='employee.employee_id', read_only=True)
     clock_in_display = serializers.SerializerMethodField()
     clock_out_display = serializers.SerializerMethodField()
+    display_status = serializers.SerializerMethodField()
     clock_in_photo_base64 = serializers.CharField(write_only=True, required=False, allow_blank=True)
     clock_out_photo_base64 = serializers.CharField(write_only=True, required=False, allow_blank=True)
     clock_in_photo = serializers.SerializerMethodField()
@@ -366,13 +474,13 @@ class AttendanceSerializer(serializers.ModelSerializer):
         fields = [
             'id', 'employee', 'employee_id', 'employee_name', 'date', 'status',
             'clock_in', 'clock_out', 'clock_in_timestamp', 'clock_out_timestamp', 'clock_in_photo', 'clock_out_photo',
-            'clock_in_display', 'clock_out_display', 'clock_in_photo_base64', 'clock_out_photo_base64',
-            'clock_method', 'leave_start', 'leave_end', 'created_at', 'updated_at'
+            'clock_in_display', 'clock_out_display', 'display_status', 'clock_in_photo_base64', 'clock_out_photo_base64',
+            'clock_method', 'leave_start', 'leave_end', 'leave_reason', 'created_at', 'updated_at'
         ]
         read_only_fields = [
             'id', 'created_at', 'updated_at',
             'clock_in_timestamp', 'clock_out_timestamp', 
-            'clock_in_photo', 'clock_out_photo', 'clock_in_display', 'clock_out_display', 'status', 'clock_in_photo_base64', 'clock_out_photo_base64'
+            'clock_in_photo', 'clock_out_photo', 'clock_in_display', 'clock_out_display', 'display_status', 'status', 'clock_in_photo_base64', 'clock_out_photo_base64'
         ]
 
     def get_clock_in_display(self, obj):
@@ -386,6 +494,17 @@ class AttendanceSerializer(serializers.ModelSerializer):
 
     def get_clock_out_photo(self, obj):
         return private_media_url(obj.clock_out_photo)
+
+    def get_display_status(self, obj):
+        if obj.status == 'leave' or obj.leave_start or obj.leave_end:
+            return 'On Leave'
+        if obj.clock_in_timestamp and not obj.clock_out_timestamp:
+            return 'Clocked In'
+        if obj.clock_out_timestamp:
+            return 'Clocked Out'
+        if obj.status == 'absent':
+            return 'Absent'
+        return 'Present'
 
     def validate(self, attrs):
         employee = attrs.get('employee')

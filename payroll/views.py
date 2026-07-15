@@ -111,7 +111,8 @@ from .models import (
 from .image_utils import compress_and_validate_image
 from .permissions import (
     IsAdmin, CanCreateEmployee, IsSackAdmin, IsPayrollAdmin, IsHRAdmin,
-    IsDeductionAdmin, CanEditNotification, CanViewAndEditCompany, IsRequestAdmin
+    IsDeductionAdmin, CanEditNotification, CanViewAndEditCompany, IsRequestAdmin,
+    IsAttendanceAdmin
 )
 from payroll.throttles import AttendanceThrottle, PaymentThrottle, BulkPaymentThrottle, ExportThrottle, BankVerifyThrottle
 from .utils import log_audit, get_client_ip
@@ -142,6 +143,19 @@ def _is_payroll_data_admin(user):
     )
 
 
+def _is_attendance_admin(user):
+    return bool(
+        user
+        and user.is_authenticated
+        and (
+            user.is_superuser
+            or getattr(user, 'role', None) == 'admin'
+            or getattr(user, 'is_hr_admin', False)
+            or getattr(user, 'is_employee_admin', False)
+        )
+    )
+
+
 def _is_super_admin(user):
     return bool(user and user.is_authenticated and user.is_superuser)
 
@@ -163,16 +177,7 @@ def _is_org_export_admin(user):
 
 
 def _can_manage_employee_leave(user, employee):
-    if not user or not user.is_authenticated or not employee:
-        return False
-    if getattr(employee, 'user_id', None) == user.id:
-        return True
-    return bool(
-        user.is_superuser
-        or getattr(user, 'role', None) == 'admin'
-        or getattr(user, 'is_hr_admin', False)
-        or getattr(user, 'is_employee_admin', False)
-    )
+    return bool(user and user.is_authenticated and employee and _is_attendance_admin(user))
 
 
 def _can_access_employee_data(user, employee):
@@ -199,6 +204,9 @@ def _dashboard_employee_queryset(user, location=None):
         or getattr(user, 'is_payment_admin', False)
     ):
         qs = Employee.objects.filter(status__in=['active', 'pending'])
+    elif getattr(user, 'is_company_admin', False):
+        employee = getattr(user, 'employee_profile', None)
+        qs = Employee.objects.filter(id=employee.id) if employee else Employee.objects.none()
     elif getattr(user, 'role', None) in ['staff', 'guard']:
         employee = getattr(user, 'employee_profile', None)
         qs = Employee.objects.filter(id=employee.id) if employee else Employee.objects.none()
@@ -1394,6 +1402,14 @@ class EmployeeViewSet(viewsets.ModelViewSet):
             return [IsAuthenticated()]
         if self.action == 'net_salary':
             return [IsAuthenticated()]
+        if self.action == 'me':
+            return [IsAuthenticated()]
+        if self.action in ['destroy', 'terminate', 'resign']:
+            return [IsAuthenticated(), IsSackAdmin()]
+        if self.action in ['approve', 'bulk_approve', 'bulk_update_bank_codes', 'resend_confirmation']:
+            return [IsAuthenticated(), IsAdmin()]
+        if self.action in ['update', 'partial_update']:
+            return [IsAuthenticated(), IsAdmin()]
         if user.is_authenticated and user.role in ['staff', 'guard']:
             if self.action in ['list', 'retrieve']:
                 return [IsAuthenticated()]
@@ -1438,6 +1454,25 @@ class EmployeeViewSet(viewsets.ModelViewSet):
             self.request,
             extra={'employee_id': str(employee.id), 'employee_code': employee.employee_id}
         )
+
+    @action(detail=False, methods=['get', 'patch', 'put'], permission_classes=[IsAuthenticated])
+    def me(self, request):
+        employee = getattr(request.user, 'employee_profile', None)
+        if not employee:
+            return Response({'error': 'Employee profile not found'}, status=status.HTTP_404_NOT_FOUND)
+
+        if request.method == 'GET':
+            return Response(self.get_serializer(employee).data)
+
+        allowed_fields = {'phone', 'email', 'location'}
+        payload = {key: value for key, value in request.data.items() if key in allowed_fields}
+        if not payload:
+            return Response({'error': 'No editable profile fields provided.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        serializer = self.get_serializer(employee, data=payload, partial=True)
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+        return Response(serializer.data)
 
     def get_throttles(self):
         if self.action in ['request_export', 'export_csv']:
@@ -1868,7 +1903,7 @@ class AttendanceViewSet(viewsets.ModelViewSet):
         user = self.request.user
         if not user.is_authenticated:
             return Attendance.objects.none()
-        if user.is_superuser or user.role == 'admin':
+        if user.is_superuser or user.role == 'admin' or getattr(user, 'is_hr_admin', False) or getattr(user, 'is_employee_admin', False):
             return Attendance.objects.all().order_by('id')
         try:
             employee = Employee.objects.get(user=user)
@@ -1877,6 +1912,8 @@ class AttendanceViewSet(viewsets.ModelViewSet):
             return Attendance.objects.none()
 
     def get_permissions(self):
+        if self.action in ['create', 'update', 'partial_update', 'destroy', 'mark_leave']:
+            return [IsAuthenticated(), IsAttendanceAdmin()]
         return [IsAuthenticated()]
 
     def get_throttles(self):
@@ -1894,7 +1931,7 @@ class AttendanceViewSet(viewsets.ModelViewSet):
             request.user.is_superuser
             or request.user.role == 'admin'
             or getattr(request.user, 'is_employee_admin', False)
-            or getattr(request.user, 'is_staff', False)
+            or getattr(request.user, 'is_hr_admin', False)
         )
         if can_select_employee:
             if employee_id:
@@ -2096,9 +2133,6 @@ class AttendanceViewSet(viewsets.ModelViewSet):
         except Employee.DoesNotExist:
             return Response({'error': 'Employee not found'}, status=status.HTTP_404_NOT_FOUND)
 
-        if not _can_manage_employee_leave(request.user, employee):
-            return Response({'error': 'You do not have permission to manage leave for this employee'}, status=status.HTTP_403_FORBIDDEN)
-
         try:
             start = datetime.strptime(start_date, '%Y-%m-%d').date()
             end = datetime.strptime(end_date, '%Y-%m-%d').date()
@@ -2119,13 +2153,15 @@ class AttendanceViewSet(viewsets.ModelViewSet):
                     'clock_in': None, 
                     'clock_out': None,
                     'leave_start': start,
-                    'leave_end': end
+                    'leave_end': end,
+                    'leave_reason': reason,
                 }
             )
             if not created and not attendance.clock_in_timestamp:
                 attendance.status = 'leave'
                 attendance.leave_start = start
                 attendance.leave_end = end
+                attendance.leave_reason = reason
                 attendance.save()
 
             leave_records.append({'date': current.isoformat(), 'status': attendance.status})
@@ -2173,10 +2209,15 @@ class PaymentViewSet(viewsets.ModelViewSet):
             "verify_payment",
             "finalize_paystack_transfer",
             "submit_paystack_otp",
+            "resend_otp",
             "create",
             "update",
             "partial_update",
             "destroy",
+            "sync_processing_payments",
+            "paystack_balance",
+            "bulk_payment",
+            "bulk_preview",
         ]:
             return [IsAuthenticated(), IsPayrollAdmin()]
         if  self.action in ["hr_approve", "bulk_hr_approve"]:
@@ -3991,7 +4032,7 @@ class DeductionViewSet(viewsets.ModelViewSet):
     search_fields = ['employee__name', 'employee__employee_id', 'employee__email', 'reason', 'status']
 
     def get_permissions(self):
-        if self.action in ["create", "update", "partial_update", "destroy"]:
+        if self.action in ["create", "update", "partial_update", "destroy", "bulk_approve", "update_status", "hr_approve"]:
             return [IsAuthenticated(), IsDeductionAdmin()]
         return [IsAuthenticated()]
 
@@ -4160,7 +4201,15 @@ class SackedEmployeeViewSet(viewsets.ModelViewSet):
     def get_permissions(self):
         if self.action in ['create', 'update', 'partial_update', 'destroy']:
             return [IsAuthenticated(), IsSackAdmin()]
-        return [IsAuthenticated()]
+        return [IsAuthenticated(), IsSackAdmin()]
+
+    def get_queryset(self):
+        user = self.request.user
+        if not user.is_authenticated:
+            return SackedEmployee.objects.none()
+        if user.is_superuser or user.role == 'admin' or getattr(user, 'is_employee_admin', False):
+            return SackedEmployee.objects.all().order_by('id')
+        return SackedEmployee.objects.none()
 
     @action(detail=True, methods=['post'], permission_classes=[IsAuthenticated, IsSackAdmin])
     def reinstate(self, request, pk=None):
@@ -4297,6 +4346,8 @@ class CompanyViewSet(viewsets.ModelViewSet):
     def get_queryset(self):
         user = self.request.user
         if user.is_superuser or user.role == 'admin':
+            return Company.objects.all().order_by('id')
+        if getattr(user, 'is_company_admin', False):
             return Company.objects.all().order_by('id')
         if user.role in ['staff', 'guard']:
             return Company.objects.filter(

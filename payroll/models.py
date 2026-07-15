@@ -660,6 +660,7 @@ class Attendance(TimeStampedModel):
 
     leave_start = models.DateField(blank=True, null=True)
     leave_end = models.DateField(blank=True, null=True)
+    leave_reason = models.TextField(blank=True, null=True)
     status = models.CharField(
         max_length=10,
         choices=AttendanceStatus.choices,
